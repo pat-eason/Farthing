@@ -249,6 +249,22 @@ const AGG_COLUMNS: &str = "
     COALESCE(SUM(r.event_type = 'api_request'), 0),
     COALESCE(SUM(r.event_type = 'api_request' AND r.cost_usd IS NULL), 0)";
 
+/// The 5m/1h cache-creation split sums (transcript-exclusive: SUM over
+/// all-NULL columns is NULL, so otel-only selections read as "no split").
+/// Both covering indexes carry these columns, so the scans stay index-only.
+const SPLIT_COLUMNS: &str = "
+    SUM(r.cache_creation_5m_tokens),
+    SUM(r.cache_creation_1h_tokens)";
+
+/// [`SPLIT_COLUMNS`] with aliases, for the inner per-session stage.
+const SPLIT_COLUMNS_ALIASED: &str = "
+    SUM(r.cache_creation_5m_tokens) AS cc_5m,
+    SUM(r.cache_creation_1h_tokens) AS cc_1h";
+
+/// Re-summing of [`SPLIT_COLUMNS_ALIASED`] in the outer stage (SUM skips
+/// NULL inner groups, so an all-NULL selection still reads as NULL).
+const SPLIT_COLUMNS_RESUMMED: &str = "SUM(g.cc_5m), SUM(g.cc_1h)";
+
 /// [`AGG_COLUMNS`] with aliases, for use as the inner per-session stage of
 /// the two-stage rollups.
 const AGG_COLUMNS_ALIASED: &str = "
@@ -330,9 +346,7 @@ pub fn summary_for(
     let filter = facets.filter(true, now);
     let (start_ms, end_ms) = facets.range.resolve(now);
     let sql = format!(
-        "SELECT {AGG_COLUMNS},
-            SUM(r.cache_creation_5m_tokens),
-            SUM(r.cache_creation_1h_tokens),
+        "SELECT {AGG_COLUMNS}, {SPLIT_COLUMNS},
             COALESCE(SUM(r.event_type = 'api_error'), 0),
             COUNT(DISTINCT r.session_id)
          {FACET_FROM} {}",
@@ -392,6 +406,11 @@ pub struct SeriesPoint {
     pub key: Option<String>,
     #[serde(flatten)]
     pub totals: Aggregates,
+    /// 5m/1h cache-creation split; `None` when no matching row carries it
+    /// (the split is transcript-exclusive — same semantics as
+    /// [`UsageSummary`], so the 5.5 cache chart can stack it per day).
+    pub cache_creation_5m_tokens: Option<i64>,
+    pub cache_creation_1h_tokens: Option<i64>,
 }
 
 /// Local-midnight bucket boundaries covering `[start_ms, end_ms)`, first
@@ -475,23 +494,25 @@ pub fn series_for(
     let boundaries = day_boundaries(start_ms, end_ms);
     match group_by {
         SeriesGroupBy::None => {
-            let sql = format!("SELECT {AGG_COLUMNS} {FACET_FROM} {where_clause}");
+            let sql = format!("SELECT {AGG_COLUMNS}, {SPLIT_COLUMNS} {FACET_FROM} {where_clause}");
             let mut stmt = conn.prepare(&sql)?;
             for window in boundaries.windows(2) {
                 let params = bucket_params(window, &filter.params);
-                let totals = stmt.query_row(rusqlite::params_from_iter(params), |row| {
-                    Aggregates::from_row(row, 0)
+                let point = stmt.query_row(rusqlite::params_from_iter(params), |row| {
+                    Ok(SeriesPoint {
+                        bucket_start_ms: window[0],
+                        key: None,
+                        totals: Aggregates::from_row(row, 0)?,
+                        cache_creation_5m_tokens: row.get(7)?,
+                        cache_creation_1h_tokens: row.get(8)?,
+                    })
                 })?;
-                points.push(SeriesPoint {
-                    bucket_start_ms: window[0],
-                    key: None,
-                    totals,
-                });
+                points.push(point);
             }
         }
         SeriesGroupBy::Model => {
             let sql = format!(
-                "SELECT r.model, {AGG_COLUMNS} {FACET_FROM} {where_clause}
+                "SELECT r.model, {AGG_COLUMNS}, {SPLIT_COLUMNS} {FACET_FROM} {where_clause}
                  GROUP BY r.model ORDER BY r.model"
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -502,6 +523,8 @@ pub fn series_for(
                         bucket_start_ms: window[0],
                         key: row.get(0)?,
                         totals: Aggregates::from_row(row, 1)?,
+                        cache_creation_5m_tokens: row.get(8)?,
+                        cache_creation_1h_tokens: row.get(9)?,
                     })
                 })?;
                 for point in rows {
@@ -515,9 +538,10 @@ pub fn series_for(
             // the cwd key. A per-request join here measured ~60ms per
             // bucket at 1M rows (1.8s for a month of buckets).
             let sql = format!(
-                "SELECT s.cwd, {AGG_COLUMNS_RESUMMED}
+                "SELECT s.cwd, {AGG_COLUMNS_RESUMMED}, {SPLIT_COLUMNS_RESUMMED}
                  FROM (
-                     SELECT r.session_id AS session_id, {AGG_COLUMNS_ALIASED}
+                     SELECT r.session_id AS session_id, {AGG_COLUMNS_ALIASED},
+                         {SPLIT_COLUMNS_ALIASED}
                      {FACET_FROM} {where_clause}
                      GROUP BY r.session_id
                  ) g
@@ -532,6 +556,8 @@ pub fn series_for(
                         bucket_start_ms: window[0],
                         key: row.get(0)?,
                         totals: Aggregates::from_row(row, 1)?,
+                        cache_creation_5m_tokens: row.get(8)?,
+                        cache_creation_1h_tokens: row.get(9)?,
                     })
                 })?;
                 for point in rows {
@@ -1375,7 +1401,89 @@ mod tests {
             )
             .unwrap();
             assert_eq!(point.totals, window.totals);
+            assert_eq!(
+                point.cache_creation_5m_tokens,
+                window.cache_creation_5m_tokens
+            );
+            assert_eq!(
+                point.cache_creation_1h_tokens,
+                window.cache_creation_1h_tokens
+            );
         }
+    }
+
+    #[test]
+    fn series_carries_the_cache_creation_split_per_bucket() {
+        let (_dir, db) = fixture_db();
+        let series = series_for(&db, &facets(full_window()), SeriesGroupBy::None, now()).unwrap();
+        // Day 0: only r1 carries the split (30/10). Day 1 has no rows and
+        // day 2's only row (r4) has no split: both read None, not zero.
+        let splits: Vec<(Option<i64>, Option<i64>)> = series
+            .iter()
+            .map(|p| (p.cache_creation_5m_tokens, p.cache_creation_1h_tokens))
+            .collect();
+        assert_eq!(
+            splits,
+            vec![(Some(30), Some(10)), (None, None), (None, None)]
+        );
+
+        // Grouped series carry the split per key: on day 0 only the sonnet
+        // points (r1) have it.
+        let grouped = series_for(&db, &facets(full_window()), SeriesGroupBy::Model, now()).unwrap();
+        let day0: Vec<(Option<&str>, Option<i64>, Option<i64>)> = grouped
+            .iter()
+            .filter(|p| p.bucket_start_ms == T)
+            .map(|p| {
+                (
+                    p.key.as_deref(),
+                    p.cache_creation_5m_tokens,
+                    p.cache_creation_1h_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(
+            day0,
+            vec![
+                (None, None, None),
+                (Some("opus"), None, None),
+                (Some("sonnet"), Some(30), Some(10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn series_point_serializes_flat_for_frontend() {
+        let point = SeriesPoint {
+            bucket_start_ms: 42,
+            key: Some("sonnet".into()),
+            totals: Aggregates {
+                cost_usd: 1.5,
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_read_tokens: 3,
+                cache_creation_tokens: 4,
+                requests: 5,
+                unpriced_requests: 0,
+            },
+            cache_creation_5m_tokens: Some(3),
+            cache_creation_1h_tokens: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&point).unwrap(),
+            serde_json::json!({
+                "bucket_start_ms": 42,
+                "key": "sonnet",
+                "cost_usd": 1.5,
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "cache_read_tokens": 3,
+                "cache_creation_tokens": 4,
+                "requests": 5,
+                "unpriced_requests": 0,
+                "cache_creation_5m_tokens": 3,
+                "cache_creation_1h_tokens": null,
+            })
+        );
     }
 
     #[test]
