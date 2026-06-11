@@ -2,19 +2,31 @@
   // Popover content (tasks 4.2/4.3): today's cost (API-equivalent), token
   // split, session count, 7/30-day cost sparkline, and top 3 projects by
   // cost. The window is created hidden at startup and toggled by the tray
-  // icon (task 4.1); data refreshes on focus (every open) and on a short
-  // poll while the page lives. Task 4.4 swaps the poll for ingest-event
-  // push.
+  // icon (task 4.1); data refreshes on focus (every open) and on the
+  // backend's ingest push event while the page lives (task 4.4), so values
+  // update live without reopening. A paused badge + resume button reflect
+  // the capture pause state.
   import { tick } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { getDailyCosts, getTodayMetrics, type DailyCost, type TodayMetrics } from "$lib/metrics";
+  import {
+    getCaptureStatus,
+    setCapturePaused,
+    INGESTED_EVENT,
+    PAUSED_CHANGED_EVENT,
+    type CaptureStatus,
+  } from "$lib/capture";
   import Sparkline from "$lib/Sparkline.svelte";
 
-  const REFRESH_INTERVAL_MS = 5_000;
+  /** Trailing debounce for ingest-push refreshes: one batched export can
+   * store many rows but should trigger a single refetch. */
+  const INGEST_REFRESH_DEBOUNCE_MS = 200;
   const SPARKLINE_RANGES = [7, 30] as const;
 
   let metrics: TodayMetrics | undefined = $state();
   let dailyCosts: DailyCost[] | undefined = $state();
   let sparklineDays: (typeof SPARKLINE_RANGES)[number] = $state(7);
+  let paused = $state(false);
   let errorMessage = $state("");
   /** Fetch + DOM update time of the last refresh (dev render budget check). */
   let renderMs = $state(0);
@@ -26,6 +38,22 @@
       errorMessage = "";
       await tick();
       renderMs = performance.now() - started;
+    } catch (err) {
+      errorMessage = String(err);
+    }
+  }
+
+  async function refreshPaused() {
+    try {
+      paused = (await getCaptureStatus()).paused;
+    } catch (err) {
+      errorMessage = String(err);
+    }
+  }
+
+  async function resume() {
+    try {
+      paused = (await setCapturePaused(false)).paused;
     } catch (err) {
       errorMessage = String(err);
     }
@@ -71,14 +99,30 @@
 
   $effect(() => {
     void refresh();
+    void refreshPaused();
     // The popover window is shown/hidden, never reloaded: refresh whenever
-    // it regains focus (tray click) plus a poll for the time it stays open.
-    const timer = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
-    const onFocus = () => void refresh();
+    // it regains focus (tray click), and live whenever the backend pushes
+    // an ingest event (debounced; replaces the task-4.2 poll).
+    const onFocus = () => {
+      void refresh();
+      void refreshPaused();
+    };
     window.addEventListener("focus", onFocus);
+
+    let ingestTimer: ReturnType<typeof setTimeout> | undefined;
+    const unlistenIngested = listen(INGESTED_EVENT, () => {
+      clearTimeout(ingestTimer);
+      ingestTimer = setTimeout(() => void refresh(), INGEST_REFRESH_DEBOUNCE_MS);
+    });
+    const unlistenPaused = listen<CaptureStatus>(PAUSED_CHANGED_EVENT, (event) => {
+      paused = event.payload.paused;
+    });
+
     return () => {
-      clearInterval(timer);
       window.removeEventListener("focus", onFocus);
+      clearTimeout(ingestTimer);
+      void unlistenIngested.then((unlisten) => unlisten());
+      void unlistenPaused.then((unlisten) => unlisten());
     };
   });
 </script>
@@ -90,6 +134,13 @@
       <span class="muted">{dayLabel(metrics.day_start_ms)}</span>
     {/if}
   </header>
+
+  {#if paused}
+    <div class="paused-banner" role="status">
+      <span class="paused-badge">Capture paused</span>
+      <button type="button" class="resume-button" onclick={() => void resume()}> Resume </button>
+    </div>
+  {/if}
 
   {#if errorMessage}
     <p class="error">{errorMessage}</p>
@@ -230,6 +281,37 @@
   .error {
     color: #b42318;
     line-height: 1.4;
+  }
+
+  .paused-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: 6px;
+    background: rgba(255, 159, 10, 0.16);
+  }
+
+  .paused-badge {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #93530a;
+  }
+
+  .resume-button {
+    appearance: none;
+    border: none;
+    margin: 0;
+    padding: 0.15rem 0.55rem;
+    border-radius: 5px;
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #fff;
+    background: #0a84ff;
+    cursor: pointer;
   }
 
   .cost {
@@ -394,6 +476,18 @@
 
     .range-toggle button.active {
       color: #fff;
+      background: #409cff;
+    }
+
+    .paused-banner {
+      background: rgba(255, 159, 10, 0.22);
+    }
+
+    .paused-badge {
+      color: #ffb55c;
+    }
+
+    .resume-button {
       background: #409cff;
     }
   }

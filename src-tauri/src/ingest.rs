@@ -30,13 +30,22 @@
 //! See `tests/fixtures/README.md` for the captured payload these rules were
 //! derived from.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::db::Db;
+
+/// Event emitted to the frontend after a `/v1/logs` export stores at least
+/// one row (task 4.4 live updates); payload is the number of rows stored.
+/// The popover listens and refetches its metrics, replacing a poll.
+pub const INGESTED_EVENT: &str = "ingest:stored";
+
+/// Callback invoked (with the stored-row count) after an export stores
+/// rows. Wired to a Tauri event emit in `lib.rs`; absent in tests/examples.
+pub type IngestNotifier = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Counters for ingest health, shared between the receiver task and the
 /// `ingest_stats` command. Monotonic except `last_event_ms`.
@@ -91,12 +100,18 @@ impl IngestStats {
     }
 }
 
-/// Everything the `/v1/logs` handler needs: the shared database handle and
-/// the shared counters. Cloned into the axum router as its state.
+/// Everything the receiver handlers need: the shared database handle, the
+/// shared counters, the capture-pause flag, and the new-data notifier.
+/// Cloned into the axum router as its state.
 #[derive(Clone)]
 pub struct IngestState {
     pub db: Arc<Mutex<Db>>,
     pub stats: Arc<IngestStats>,
+    /// Capture pause (task 4.4): while `true` the receiver returns success
+    /// but discards instead of storing. Shared with `capture::CaptureState`.
+    paused: Arc<AtomicBool>,
+    /// Invoked after an export stores rows; `None` outside the Tauri shell.
+    notify: Option<IngestNotifier>,
 }
 
 impl IngestState {
@@ -104,6 +119,32 @@ impl IngestState {
         Self {
             db,
             stats: Arc::new(IngestStats::default()),
+            paused: Arc::new(AtomicBool::new(false)),
+            notify: None,
+        }
+    }
+
+    /// Share the capture-pause flag (instead of the private default).
+    pub fn with_pause_flag(mut self, paused: Arc<AtomicBool>) -> Self {
+        self.paused = paused;
+        self
+    }
+
+    /// Attach the stored-rows notifier (the Rust→frontend event push).
+    pub fn with_notifier(mut self, notify: IngestNotifier) -> Self {
+        self.notify = Some(notify);
+        self
+    }
+
+    /// Is capture paused right now? Checked per request by the receiver.
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Fire the notifier (if any) for `stored` newly written rows.
+    pub fn notify_stored(&self, stored: u64) {
+        if let Some(notify) = &self.notify {
+            notify(stored);
         }
     }
 }
@@ -134,10 +175,12 @@ struct RequestRow {
 
 /// Walk an OTLP logs payload and ingest every storable record. Never fails:
 /// per-record problems are tallied in `stats`, unknown shapes are skipped.
-pub fn ingest_logs(state: &IngestState, payload: &Value) {
-    for record in log_records(payload) {
-        ingest_record(state, record);
-    }
+/// Returns the number of rows stored, so the caller can push a live-update
+/// notification only when something actually changed (task 4.4).
+pub fn ingest_logs(state: &IngestState, payload: &Value) -> u64 {
+    log_records(payload)
+        .map(|record| u64::from(ingest_record(state, record)))
+        .sum()
 }
 
 /// Flatten `resourceLogs[].scopeLogs[].logRecords[]`, tolerating any level
@@ -153,29 +196,37 @@ fn as_array(value: Option<&Value>) -> &[Value] {
     value.and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
-fn ingest_record(state: &IngestState, record: &Value) {
+/// Ingest one log record; `true` when a row was written.
+fn ingest_record(state: &IngestState, record: &Value) -> bool {
     let Some(name) = event_name(record) else {
         // No event name at all: not a Claude Code event record; skip.
         state.stats.record_skip();
-        return;
+        return false;
     };
     let event_type = match name {
         "api_request" => "api_request",
         "api_error" => "api_error",
         _ => {
             state.stats.record_skip();
-            return;
+            return false;
         }
     };
     match parse_event(record, event_type) {
         Some(row) => match insert_row(state, &row) {
-            Ok(()) => state.stats.record_success(),
+            Ok(()) => {
+                state.stats.record_success();
+                true
+            }
             Err(err) => {
                 state.stats.record_failure();
                 eprintln!("ingest: failed to store {event_type} row: {err}");
+                false
             }
         },
-        None => state.stats.record_failure(),
+        None => {
+            state.stats.record_failure();
+            false
+        }
     }
 }
 
@@ -347,8 +398,8 @@ mod tests {
         (IngestState::new(Arc::new(Mutex::new(db))), dir)
     }
 
-    fn ingest_str(state: &IngestState, payload: &str) {
-        ingest_logs(state, &serde_json::from_str(payload).unwrap());
+    fn ingest_str(state: &IngestState, payload: &str) -> u64 {
+        ingest_logs(state, &serde_json::from_str(payload).unwrap())
     }
 
     fn row_count(state: &IngestState) -> i64 {
@@ -361,8 +412,9 @@ mod tests {
     #[test]
     fn real_capture_ingests_exactly_the_api_request() {
         let (state, _dir) = test_state();
-        ingest_str(&state, REAL_API_REQUEST_BATCH);
+        let stored = ingest_str(&state, REAL_API_REQUEST_BATCH);
 
+        assert_eq!(stored, 1, "ingest_logs reports the stored-row count");
         assert_eq!(row_count(&state), 1);
         let stats = state.stats.snapshot();
         assert_eq!(stats.events_ingested, 1);
@@ -481,7 +533,7 @@ mod tests {
     fn unknown_events_and_empty_payloads_are_ignored_without_error() {
         let (state, _dir) = test_state();
         // A no-API-request session really exports an empty object.
-        ingest_str(&state, "{}");
+        assert_eq!(ingest_str(&state, "{}"), 0, "nothing storable, count 0");
         // Unknown future event name with unknown attributes.
         ingest_str(
             &state,

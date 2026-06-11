@@ -11,6 +11,19 @@
 //! - `POST /session` — SessionStart hook mapping endpoint, see
 //!   [`crate::session`]
 //!
+//! # Pause (task 4.4)
+//!
+//! While capture is paused ([`IngestState::paused`], shared with
+//! `capture::CaptureState`) every endpoint keeps returning success but
+//! discards instead of storing: the exporter and the SessionStart hook must
+//! never see errors, and the paused window stays recoverable via transcript
+//! backfill (PRD FR-5). Malformed JSON still gets a 400 — pause changes
+//! what is stored, not the protocol.
+//!
+//! When an export stores at least one row, [`IngestState::notify_stored`]
+//! fires the live-update push (a Tauri event in production) so the popover
+//! refreshes without polling.
+//!
 //! The port is never auto-rebound: `settings.json` holds the literal
 //! endpoint, so a different port would silently break export. A port
 //! conflict at startup is recorded in [`ReceiverStatus`] and surfaced to the
@@ -134,10 +147,19 @@ pub fn router(ingest: IngestState) -> Router {
 /// `POST /v1/logs`: validate the payload is JSON, then ingest storable
 /// events. Ingest never fails the export: per-record problems are tallied
 /// in the ingest-failure counter instead (version tolerance, PRD FR-1).
+/// While paused, valid payloads are acknowledged and dropped without
+/// touching the database or the counters; if anything was stored, the
+/// live-update notifier fires (task 4.4).
 async fn post_logs(State(ingest): State<IngestState>, body: Bytes) -> Response {
     match parse_otlp_json(&body) {
         Ok(payload) => {
-            ingest::ingest_logs(&ingest, &payload);
+            if ingest.paused() {
+                return export_success();
+            }
+            let stored = ingest::ingest_logs(&ingest, &payload);
+            if stored > 0 {
+                ingest.notify_stored(stored);
+            }
             export_success()
         }
         Err(err) => invalid_json(&err),
@@ -225,19 +247,21 @@ mod tests {
     /// ingest state (with its temp dir guard).
     async fn start_test_receiver() -> (SocketAddr, SharedStatus, IngestState, tempfile::TempDir) {
         let (ingest, dir) = test_ingest_state();
+        let (addr, status) = start_test_receiver_with(ingest.clone()).await;
+        (addr, status, ingest, dir)
+    }
+
+    /// Spawn the receiver for a pre-built ingest state (custom pause flag
+    /// or notifier) and wait for Listening.
+    async fn start_test_receiver_with(ingest: IngestState) -> (SocketAddr, SharedStatus) {
         let status = new_status();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        tokio::spawn(serve_on(addr, Arc::clone(&status), ingest.clone()));
+        tokio::spawn(serve_on(addr, Arc::clone(&status), ingest));
 
         for _ in 0..100 {
             let snapshot = status.lock().unwrap().clone();
             if let ReceiverStatus::Listening { port } = snapshot {
-                return (
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                    status,
-                    ingest,
-                    dir,
-                );
+                return (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), status);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -384,6 +408,109 @@ mod tests {
             *status.lock().unwrap(),
             ReceiverStatus::PortInUse { port: taken.port() }
         );
+    }
+
+    /// Pause (task 4.4): valid exports are acknowledged (200) but nothing
+    /// is stored and no counter moves; flipping the shared flag back
+    /// restores ingestion on the very next export.
+    #[tokio::test]
+    async fn paused_logs_return_200_discard_and_resume_restores() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (base, dir) = test_ingest_state();
+        let paused = Arc::new(AtomicBool::new(true));
+        let ingest = base.with_pause_flag(Arc::clone(&paused));
+        let (addr, _status) = start_test_receiver_with(ingest.clone()).await;
+
+        let capture = include_str!("../tests/fixtures/otlp_logs_api_request.json");
+        assert_eq!(http_post(addr, "/v1/logs", capture).await, 200);
+
+        let count: i64 = {
+            let db = ingest.db.lock().unwrap();
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count, 0, "paused export must not be stored");
+        let stats = ingest.stats.snapshot();
+        assert_eq!(
+            (
+                stats.events_ingested,
+                stats.events_skipped,
+                stats.ingest_failures
+            ),
+            (0, 0, 0),
+            "discard must not move any ingest counter"
+        );
+
+        // Protocol behavior is unchanged while paused.
+        assert_eq!(http_post(addr, "/v1/logs", "{not json").await, 400);
+
+        // Resume: the same export now lands as a row.
+        paused.store(false, Ordering::SeqCst);
+        assert_eq!(http_post(addr, "/v1/logs", capture).await, 200);
+        let count: i64 = {
+            let db = ingest.db.lock().unwrap();
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count, 1, "resume restores ingestion");
+
+        let _ = dir;
+    }
+
+    /// Pause also drops SessionStart hook mappings (recoverable via the
+    /// backfill cwd self-heal) while keeping the hook's 200 contract.
+    #[tokio::test]
+    async fn paused_session_returns_200_and_writes_nothing() {
+        use std::sync::atomic::AtomicBool;
+
+        let (base, dir) = test_ingest_state();
+        let ingest = base.with_pause_flag(Arc::new(AtomicBool::new(true)));
+        let (addr, _status) = start_test_receiver_with(ingest.clone()).await;
+
+        let body = r#"{"session_id": "sess-paused", "cwd": "/tmp/project"}"#;
+        assert_eq!(http_post(addr, "/session", body).await, 200);
+
+        let count: i64 = {
+            let db = ingest.db.lock().unwrap();
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count, 0);
+        // Unusable payloads still get their 400 while paused.
+        assert_eq!(http_post(addr, "/session", "{}").await, 400);
+
+        let _ = dir;
+    }
+
+    /// Live-update push (task 4.4): the notifier fires with the stored-row
+    /// count when an export stores something, and stays silent for exports
+    /// with nothing storable.
+    #[tokio::test]
+    async fn notifier_fires_only_when_rows_are_stored() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let (base, dir) = test_ingest_state();
+        let notified = Arc::new(AtomicU64::new(0));
+        let sink = Arc::clone(&notified);
+        let ingest = base.with_notifier(Arc::new(move |stored| {
+            sink.fetch_add(stored, Ordering::SeqCst);
+        }));
+        let (addr, _status) = start_test_receiver_with(ingest).await;
+
+        // Nothing storable: empty export, then an unknown event.
+        assert_eq!(http_post(addr, "/v1/logs", "{}").await, 200);
+        assert_eq!(notified.load(Ordering::SeqCst), 0);
+
+        // The real capture stores one row → one notification of count 1.
+        let capture = include_str!("../tests/fixtures/otlp_logs_api_request.json");
+        assert_eq!(http_post(addr, "/v1/logs", capture).await, 200);
+        assert_eq!(notified.load(Ordering::SeqCst), 1);
+
+        let _ = dir;
     }
 
     #[test]
