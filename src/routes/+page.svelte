@@ -74,6 +74,7 @@
     </p>
     <div class="row">
       <a class="button-link" href={resolve("/health")}>Open health view</a>
+      <a class="button-link" href={resolve("/settings")}>Settings</a>
       <button onclick={() => void refresh()}>Re-check</button>
     </div>
   {:else if screen === "preview" && status}
@@ -147,6 +148,18 @@
       so sessions that are already running will never send usage data. Start a new session (or restart
       running ones) to begin tracking.
     </p>
+    {#if outcome?.autostart_enabled}
+      <p class="muted">
+        The app is registered to start at login so the receiver is always up. You can turn this off
+        in <a href={resolve("/settings")}>settings</a>.
+      </p>
+    {:else}
+      <p class="muted">
+        Start at login is not enabled{outcome?.autostart_note
+          ? ` (${outcome.autostart_note})`
+          : ""}. You can enable it in <a href={resolve("/settings")}>settings</a>.
+      </p>
+    {/if}
     <p>
       <a class="button-link" href={resolve("/health")}>Open the health view</a> to confirm events are
       flowing.

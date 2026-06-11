@@ -109,7 +109,7 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 |----|-------|-------------|----------|------------|------------|--------|
 | 2.1 | settings.json merge engine | Read/parse, deep-merge of env block + SessionStart hook entry, timestamped backup, strict unmerge of app-owned keys only; fixture test suite | High | L | 1.1 | done <!-- vk: --> |
 | 2.2 | Onboarding flow | First-run UI: detect config state, render diff preview, conflict detection (existing OTel vars), apply merge, "restart your sessions" notice | High | M | 2.1 | done <!-- vk: --> |
-| 2.3 | Autostart (LaunchAgent) | `tauri-plugin-autostart` integration; enabled during onboarding, toggleable in settings | High | S | 1.1 | <!-- vk: --> |
+| 2.3 | Autostart (LaunchAgent) | `tauri-plugin-autostart` integration; enabled during onboarding, toggleable in settings | High | S | 1.1 | done <!-- vk: --> |
 | 2.4 | Uninstall flow | Reverse merge, remove LaunchAgent, optional DB deletion, confirmation UX | Medium | M | 2.1, 2.3 | <!-- vk: --> |
 | 2.5 | Health & diagnostics view | Receiver status, last-event-at, config installed/missing/conflicting, port conflict surfacing, "configured but no events" detector with causes | Medium | M | 1.4, 2.2 | <!-- vk: --> |
 
@@ -128,8 +128,8 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 - [x] Re-running onboarding on an already-configured machine is a no-op with a "already configured" state — `changed=false` routes to the configured screen; re-apply writes nothing and takes no backup (tested + verified live across an app relaunch)
 
 **2.3 - Autostart (LaunchAgent)**
-- [ ] App relaunches on login after enabling; LaunchAgent plist present
-- [ ] Toggle off removes the LaunchAgent; state reflected accurately in settings UI
+- [x] App relaunches on login after enabling; LaunchAgent plist present — `tauri-plugin-autostart` in `MacosLauncher::LaunchAgent` mode: `enable()` writes `~/Library/LaunchAgents/<app>.plist`; auto-enabled after onboarding apply (`onboarding_apply` → `autostart::enable_after_onboarding`, best-effort, never fails the merge). Per task constraint, verified at the plugin-API level (MockRuntime tests in `src-tauri/src/autostart.rs` read real plugin state), not via a live login on this machine: dev builds deliberately refuse `enable()` so a LaunchAgent never points at the dev binary; live relaunch check belongs to release-build validation
+- [x] Toggle off removes the LaunchAgent; state reflected accurately in settings UI — `/settings` view with start-at-login toggle; `autostart_set(false)` removes the plist only when registered (idempotent), and the UI always re-reads `autostart_status` (live `is_enabled()`, never cached) after every action, including refusals/errors
 
 **2.4 - Uninstall flow**
 - [ ] Uninstall removes app-owned settings.json entries, the LaunchAgent, and (only if opted-in) the database
