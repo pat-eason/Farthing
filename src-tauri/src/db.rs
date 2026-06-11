@@ -61,6 +61,25 @@ const MIGRATIONS: &[&str] = &[
         updated_at_ms INTEGER NOT NULL
     ) WITHOUT ROWID;
     ",
+    // v2: dedup identity (spike 3.1, docs/notes/dedup-key.md) — `request_id`
+    // is the exact dedup key across otel and backfill rows, enforced by a
+    // partial unique index. Pre-existing duplicates (an OTLP re-delivery
+    // could have inserted the same request twice under v1) are collapsed to
+    // the earliest row first so the index can build; v1 rows are all
+    // source='otel' so no preference beyond first-wins is needed.
+    "
+    DELETE FROM requests
+     WHERE request_id IS NOT NULL
+       AND id NOT IN (
+           SELECT MIN(id) FROM requests
+            WHERE request_id IS NOT NULL
+            GROUP BY request_id
+       );
+
+    CREATE UNIQUE INDEX idx_requests_request_id
+        ON requests (request_id)
+        WHERE request_id IS NOT NULL;
+    ",
 ];
 
 /// Errors from opening or migrating the database.
@@ -268,6 +287,7 @@ mod tests {
             "idx_requests_timestamp",
             "idx_requests_session_id",
             "idx_requests_model",
+            "idx_requests_request_id",
         ] {
             assert!(indexes.iter().any(|i| i == index), "missing index {index}");
         }
@@ -390,6 +410,66 @@ mod tests {
         // Re-running the same migration list is a no-op.
         apply_migrations(&conn, v2).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn v2_collapses_duplicate_request_ids_and_enforces_uniqueness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DB_FILE_NAME);
+
+        // Boot at v1 and create the duplicates v1 allowed: the same
+        // request_id twice (OTLP re-delivery) plus two NULL-id rows.
+        {
+            let conn = Connection::open(&path).unwrap();
+            configure_connection(&conn).unwrap();
+            apply_migrations(&conn, &MIGRATIONS[..1]).unwrap();
+            for (request_id, ts) in [
+                (Some("req_dup"), 1),
+                (Some("req_dup"), 2),
+                (Some("req_other"), 3),
+                (None, 4),
+                (None, 5),
+            ] {
+                conn.execute(
+                    "INSERT INTO requests (request_id, session_id, timestamp_ms)
+                     VALUES (?1, 's', ?2)",
+                    rusqlite::params![request_id, ts],
+                )
+                .unwrap();
+            }
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u64);
+
+        // The earliest req_dup row survived; NULL ids are untouched.
+        let kept: Vec<i64> = {
+            let mut stmt = db
+                .conn()
+                .prepare("SELECT timestamp_ms FROM requests ORDER BY timestamp_ms")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(kept, vec![1, 3, 4, 5]);
+
+        // Re-inserting a stored request_id now violates the unique index…
+        let dup = db.conn().execute(
+            "INSERT INTO requests (request_id, session_id, timestamp_ms)
+             VALUES ('req_dup', 's', 6)",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate request_id must be rejected");
+        // …while NULL request_ids stay unconstrained (api_error rows).
+        db.conn()
+            .execute(
+                "INSERT INTO requests (request_id, session_id, timestamp_ms)
+                 VALUES (NULL, 's', 7)",
+                [],
+            )
+            .unwrap();
     }
 
     #[test]
