@@ -111,7 +111,7 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 | 2.2 | Onboarding flow | First-run UI: detect config state, render diff preview, conflict detection (existing OTel vars), apply merge, "restart your sessions" notice | High | M | 2.1 | done <!-- vk: --> |
 | 2.3 | Autostart (LaunchAgent) | `tauri-plugin-autostart` integration; enabled during onboarding, toggleable in settings | High | S | 1.1 | done <!-- vk: --> |
 | 2.4 | Uninstall flow | Reverse merge, remove LaunchAgent, optional DB deletion, confirmation UX | Medium | M | 2.1, 2.3 | done <!-- vk: --> |
-| 2.5 | Health & diagnostics view | Receiver status, last-event-at, config installed/missing/conflicting, port conflict surfacing, "configured but no events" detector with causes | Medium | M | 1.4, 2.2 | <!-- vk: --> |
+| 2.5 | Health & diagnostics view | Receiver status, last-event-at, config installed/missing/conflicting, port conflict surfacing, "configured but no events" detector with causes | Medium | M | 1.4, 2.2 | done <!-- vk: --> |
 
 ### Task Details
 
@@ -137,9 +137,9 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 - [x] Confirmation dialog states exactly what will and won't be removed — `uninstall_status` drives the dialog in `src/routes/settings/+page.svelte`: will-remove list (settings entries with the literal line diff, LaunchAgent live state, opt-in DB checkbox with size/path) and won't-remove list (rest of settings.json, backups dir, the app bundle itself with quit-and-Trash instructions)
 
 **2.5 - Health & diagnostics view**
-- [ ] Shows: receiver listening (or port-conflict error), last event received timestamp, settings.json state (installed/missing/conflicting), backfill progress
-- [ ] "Configured but no events in N minutes" state lists likely causes (sessions predate config, port conflict, paused)
-- [ ] Ingest-failure counter from 1.4 surfaced here
+- [x] Shows: receiver listening (or port-conflict error), last event received timestamp, settings.json state (installed/missing/conflicting), backfill progress — `src-tauri/src/health.rs` `health_status` command aggregates everything in one read-only query, rendered by the full `/health` view (replaces the 2.2 stub, auto-refreshes every 5s). Last-event-at is the freshest of the in-memory ingest clock and the newest stored `requests` row, so it survives app restarts; settings.json state is derived live (installed / missing / conflicting with the conflict list / unreadable). Backfill progress renders the `not_available` placeholder until the Epic 3 engine ships (the `BackfillStatus` enum is the extension point). Every state verified rendered in-browser against the serialization contract locked by `health_serializes_for_frontend`
+- [x] "Configured but no events in N minutes" state lists likely causes (sessions predate config, port conflict, paused) — `diagnose_no_events`: fires only when config is installed and nothing arrived in 10 minutes (or ever); a broken receiver (port conflict / failed) is reported as the definitive cause, otherwise the ambiguous pair (restart pre-config sessions, or Claude Code simply not in use) with remediation text
+- [x] Ingest-failure counter from 1.4 surfaced here — `IngestStatsSnapshot` embedded in the health payload; failures render highlighted with a "please report this" note, plus events-stored/ingested/skipped context counters
 
 ---
 
