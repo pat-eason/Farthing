@@ -39,3 +39,22 @@ export interface TodayMetrics {
 export function getTodayMetrics(): Promise<TodayMetrics> {
   return invoke<TodayMetrics>("today_metrics");
 }
+
+/** One day's cost bucket in the sparkline series. */
+export interface DailyCost {
+  /** Local midnight opening this day (unix ms, inclusive). */
+  day_start_ms: number;
+  /** API-equivalent cost; unpriced rows contribute nothing. */
+  cost_usd: number;
+  /** api_request rows that day (errors excluded). */
+  requests: number;
+}
+
+/**
+ * Read-only: per-day cost buckets for the trailing `days` local calendar
+ * days, oldest first, today last. Gap days come back as explicit zero
+ * buckets, so the result always has exactly `days` entries.
+ */
+export function getDailyCosts(days: number): Promise<DailyCost[]> {
+  return invoke<DailyCost[]>("daily_costs", { days });
+}

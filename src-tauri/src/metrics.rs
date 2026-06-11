@@ -1,4 +1,4 @@
-//! Today-metrics queries for the menu bar popover (task 4.2).
+//! Today-metrics queries for the menu bar popover (tasks 4.2/4.3).
 //!
 //! One read-only command ([`today_metrics`]) that aggregates everything the
 //! popover renders for the current local calendar day:
@@ -18,6 +18,14 @@
 //! Both queries are index-only range scans over `idx_requests_time_rollup`
 //! (schema v3), so they touch only today's index pages regardless of table
 //! size (<100ms popover budget, NFR).
+//!
+//! A second command ([`daily_costs`], task 4.3) returns the per-day cost
+//! series behind the popover sparkline: one bucket per local calendar day
+//! for the trailing N days (today inclusive), each bucket aggregated with
+//! the same `[local midnight, next local midnight)` window as
+//! [`today_metrics`] so the last sparkline bar always equals today's
+//! headline cost. Days with no rows come back as explicit zero buckets;
+//! the frontend never has to infer gaps.
 
 use serde::Serialize;
 use tauri::{Manager, Runtime};
@@ -164,6 +172,80 @@ pub fn today_metrics<R: Runtime>(app: tauri::AppHandle<R>) -> Result<TodayMetric
     let db = state.0.lock().expect("db mutex poisoned");
     metrics_for_window(&db, day_start_ms, day_end_ms)
         .map_err(|err| format!("cannot query today's metrics: {err}"))
+}
+
+/// Longest series [`daily_costs`] will return (a year of daily bars).
+const MAX_SPARKLINE_DAYS: u32 = 366;
+
+/// One day's cost bucket in the sparkline series.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DailyCost {
+    /// Local midnight opening this day (unix ms, inclusive).
+    pub day_start_ms: i64,
+    /// API-equivalent cost; unpriced rows contribute nothing (same rule as
+    /// the headline total).
+    pub cost_usd: f64,
+    /// `api_request` rows that day (errors excluded).
+    pub requests: i64,
+}
+
+/// Local-midnight boundaries for the trailing `days` calendar days ending
+/// today: `days + 1` ascending instants where consecutive pairs bracket one
+/// day (today's window is the last pair). Each midnight is resolved
+/// independently via [`local_midnight_ms`], so DST transitions inside the
+/// range keep every day exactly `[00:00, next 00:00)` local.
+pub fn trailing_day_boundaries(days: u32, now: chrono::DateTime<chrono::Local>) -> Vec<i64> {
+    let today = now.date_naive();
+    let mut boundaries = Vec::with_capacity(days as usize + 1);
+    let mut date = today - chrono::Duration::days(i64::from(days) - 1);
+    for _ in 0..days {
+        boundaries.push(local_midnight_ms(date));
+        date = date.succ_opt().expect("not at the end of the calendar");
+    }
+    boundaries.push(local_midnight_ms(date)); // tomorrow: closes today's window
+    boundaries
+}
+
+/// Aggregate one cost bucket per `[boundaries[i], boundaries[i+1])` window.
+/// Days without rows yield explicit `cost_usd == 0.0, requests == 0`
+/// buckets, so the result always has `boundaries.len() - 1` entries in
+/// chronological order. Each window is the same indexed range scan
+/// `today_metrics` uses, so the buckets match its values exactly.
+pub fn daily_cost_series(db: &Db, boundaries: &[i64]) -> Result<Vec<DailyCost>, rusqlite::Error> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT
+            COALESCE(SUM(cost_usd), 0.0),
+            COALESCE(SUM(event_type = 'api_request'), 0)
+         FROM requests
+         WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2",
+    )?;
+    boundaries
+        .windows(2)
+        .map(|window| {
+            stmt.query_row((window[0], window[1]), |row| {
+                Ok(DailyCost {
+                    day_start_ms: window[0],
+                    cost_usd: row.get(0)?,
+                    requests: row.get(1)?,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Frontend query: per-day cost buckets for the popover sparkline, oldest
+/// first, today last. `days` is clamped to `1..=366`.
+#[tauri::command]
+pub fn daily_costs<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    days: u32,
+) -> Result<Vec<DailyCost>, String> {
+    let days = days.clamp(1, MAX_SPARKLINE_DAYS);
+    let boundaries = trailing_day_boundaries(days, chrono::Local::now());
+    let state = app.state::<DbState>();
+    let db = state.0.lock().expect("db mutex poisoned");
+    daily_cost_series(&db, &boundaries).map_err(|err| format!("cannot query daily costs: {err}"))
 }
 
 #[cfg(test)]
@@ -622,6 +704,215 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(100),
             "metrics queries took {elapsed:?} against 150k rows"
+        );
+    }
+
+    // ---- daily cost series (sparkline, task 4.3) ----
+
+    /// Fixed boundaries for a 7-day series ending at the test day.
+    fn seven_day_boundaries() -> Vec<i64> {
+        (0..=7).map(|i| START - (6 - i) * DAY_MS).collect()
+    }
+
+    #[test]
+    fn daily_series_buckets_match_per_day_aggregation_exactly() {
+        let (_dir, db) = test_db();
+        // Costs on days -6, -3 (two rows), and today; the rest are gaps.
+        insert_request(
+            &db,
+            Some("a"),
+            START - 6 * DAY_MS + 10,
+            Some(1.25),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        insert_request(
+            &db,
+            Some("b"),
+            START - 3 * DAY_MS + 10,
+            Some(2.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        insert_request(
+            &db,
+            Some("b"),
+            START - 3 * DAY_MS + 20,
+            Some(0.5),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        insert_request(
+            &db,
+            Some("c"),
+            START + 10,
+            Some(4.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+
+        let series = daily_cost_series(&db, &seven_day_boundaries()).unwrap();
+        assert_eq!(series.len(), 7);
+        let costs: Vec<f64> = series.iter().map(|d| d.cost_usd).collect();
+        assert_eq!(costs, vec![1.25, 0.0, 0.0, 2.5, 0.0, 0.0, 4.0]);
+        let requests: Vec<i64> = series.iter().map(|d| d.requests).collect();
+        assert_eq!(requests, vec![1, 0, 0, 2, 0, 0, 1]);
+
+        // Every bucket equals the full metrics aggregation for its window:
+        // the sparkline can never disagree with today_metrics.
+        for (i, bucket) in series.iter().enumerate() {
+            let window_start = START - (6 - i as i64) * DAY_MS;
+            assert_eq!(bucket.day_start_ms, window_start);
+            let full = metrics_for_window(&db, window_start, window_start + DAY_MS).unwrap();
+            assert_eq!(bucket.cost_usd, full.cost_usd);
+            assert_eq!(bucket.requests, full.requests);
+        }
+    }
+
+    #[test]
+    fn daily_series_day_boundaries_are_inclusive_start_exclusive_end() {
+        let (_dir, db) = test_db();
+        let day3_start = START - 3 * DAY_MS;
+        // Exactly at a midnight boundary: belongs to the day it opens.
+        insert_request(
+            &db,
+            Some("s"),
+            day3_start,
+            Some(1.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        // One ms before that midnight: belongs to the previous day.
+        insert_request(
+            &db,
+            Some("s"),
+            day3_start - 1,
+            Some(2.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+
+        let series = daily_cost_series(&db, &seven_day_boundaries()).unwrap();
+        let costs: Vec<f64> = series.iter().map(|d| d.cost_usd).collect();
+        assert_eq!(costs, vec![0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn daily_series_empty_db_yields_all_zero_buckets() {
+        let (_dir, db) = test_db();
+        let series = daily_cost_series(&db, &seven_day_boundaries()).unwrap();
+        assert_eq!(series.len(), 7);
+        assert!(series.iter().all(|d| d.cost_usd == 0.0 && d.requests == 0));
+    }
+
+    #[test]
+    fn daily_series_single_active_day_keeps_explicit_gap_buckets() {
+        let (_dir, db) = test_db();
+        insert_request(
+            &db,
+            Some("s"),
+            START + 10,
+            Some(3.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        let series = daily_cost_series(&db, &seven_day_boundaries()).unwrap();
+        assert_eq!(series.len(), 7, "gap days stay as explicit zero buckets");
+        assert_eq!(series[6].cost_usd, 3.0);
+        assert!(series[..6].iter().all(|d| d.cost_usd == 0.0));
+    }
+
+    #[test]
+    fn daily_series_excludes_unpriced_cost_and_error_requests() {
+        let (_dir, db) = test_db();
+        // Unpriced row: no cost contribution, still a request.
+        insert_request(&db, Some("s"), START + 1, None, (5, 0, 0, 0), "api_request");
+        // Error row: neither cost nor request.
+        insert_request(&db, Some("s"), START + 2, None, (0, 0, 0, 0), "api_error");
+        insert_request(
+            &db,
+            Some("s"),
+            START + 3,
+            Some(1.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+
+        let series = daily_cost_series(&db, &seven_day_boundaries()).unwrap();
+        let today = series.last().unwrap();
+        assert_eq!(today.cost_usd, 1.0);
+        assert_eq!(today.requests, 2);
+    }
+
+    #[test]
+    fn trailing_day_boundaries_are_local_midnights_ascending() {
+        let now = chrono::Local::now();
+        for days in [7u32, 30] {
+            let boundaries = trailing_day_boundaries(days, now);
+            assert_eq!(boundaries.len(), days as usize + 1);
+            assert!(boundaries.windows(2).all(|w| w[0] < w[1]));
+            // The last pair is exactly today's window.
+            let (today_start, today_end) = local_day_window(now);
+            assert_eq!(boundaries[days as usize - 1], today_start);
+            assert_eq!(boundaries[days as usize], today_end);
+            // Every boundary renders as a 00:00 local wall-clock time.
+            use chrono::TimeZone;
+            for ms in &boundaries {
+                let local = chrono::Local.timestamp_millis_opt(*ms).unwrap();
+                assert_eq!(local.format("%H:%M:%S%.3f").to_string(), "00:00:00.000");
+            }
+            // Each day is 24h except DST transitions (23h/25h).
+            for w in boundaries.windows(2) {
+                let len = w[1] - w[0];
+                assert!(
+                    (23 * 3_600_000..=25 * 3_600_000).contains(&len),
+                    "day length out of range: {len}ms"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn daily_costs_command_clamps_days_and_reads_managed_db() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = TempDir::new().unwrap();
+        let db = Db::open_in_dir(dir.path()).unwrap();
+        let now_ms = chrono::Local::now().timestamp_millis();
+        db.conn()
+            .execute(
+                "INSERT INTO requests (session_id, timestamp_ms, cost_usd, input_tokens)
+                 VALUES ('sess-now', ?1, 0.75, 42)",
+                params![now_ms],
+            )
+            .unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        app.manage(DbState(Arc::new(Mutex::new(db))));
+
+        let series = daily_costs(app.handle().clone(), 7).expect("series");
+        assert_eq!(series.len(), 7);
+        assert_eq!(series.last().unwrap().cost_usd, 0.75);
+        assert_eq!(series.last().unwrap().requests, 1);
+
+        // days = 0 clamps to 1 bucket instead of an empty (or panicking) series.
+        let clamped = daily_costs(app.handle().clone(), 0).expect("clamped series");
+        assert_eq!(clamped.len(), 1);
+        assert_eq!(clamped[0].cost_usd, 0.75);
+    }
+
+    #[test]
+    fn daily_cost_serializes_for_frontend() {
+        let bucket = DailyCost {
+            day_start_ms: START,
+            cost_usd: 1.5,
+            requests: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(&bucket).unwrap(),
+            serde_json::json!({"day_start_ms": START, "cost_usd": 1.5, "requests": 3})
         );
     }
 

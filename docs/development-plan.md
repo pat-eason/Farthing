@@ -211,7 +211,7 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 |----|-------|-------------|----------|------------|------------|--------|
 | 4.1 | Tray icon & popover shell | Tauri v2 TrayIcon, popover window anchored to tray, `ActivationPolicy::Accessory`, menu (open app / pause / quit) | High | M | 1.1 | done <!-- vk: --> |
 | 4.2 | Today-metrics queries & popover content | SQL aggregations (local-midnight day boundary, distinct session_ids), popover layout: cost, in/out/cache tokens, sessions, top 3 projects | High | M | 1.4, 4.1 | done <!-- vk: --> |
-| 4.3 | Sparkline | 7/30-day cost sparkline in popover (uPlot/LayerCake) | Medium | S | 4.2 | <!-- vk: --> |
+| 4.3 | Sparkline | 7/30-day cost sparkline in popover (uPlot/LayerCake) | Medium | S | 4.2 | done <!-- vk: --> |
 | 4.4 | Live updates & pause/resume | Rust→frontend event push on ingest; pause state (receiver 200+discard), paused badge, resume | Medium | M | 4.2 | <!-- vk: --> |
 
 ### Task Details
@@ -228,8 +228,8 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 - [x] Cost labeled "API-equivalent" — label sits beside the cost headline (screenshot-verified); unpriced rows (unknown model) are excluded from the total and surfaced as "N requests with unknown pricing excluded from cost (tokens counted)" rather than silently counting as $0
 
 **4.3 - Sparkline**
-- [ ] 7-day and 30-day toggle; bars/line match SQL aggregation values exactly
-- [ ] Renders correctly with sparse data (gaps, single day, empty)
+- [x] 7-day and 30-day toggle; bars/line match SQL aggregation values exactly — new `daily_costs(days)` command (`src-tauri/src/metrics.rs`): one bucket per trailing local calendar day (each boundary an independently-resolved local midnight, DST-correct), every bucket the same indexed range scan `today_metrics` uses; `daily_series_buckets_match_per_day_aggregation_exactly` asserts each bucket equals `metrics_for_window` for its window. Live (seeded 120k rows + real backfill): 7d view showed $13,329 / today bar $2,440 vs direct SQL $13,329.19 / $2,439.69; clicking 30d refetched and showed $17,237 vs SQL $17,237.15 (screenshot-verified, both ranges). Rendered as a dependency-free SVG bar chart (`src/lib/Sparkline.svelte`, today highlighted, per-day tooltips) instead of pulling in uPlot/LayerCake; fetch+render 54ms in dev
+- [x] Renders correctly with sparse data (gaps, single day, empty) — gap days come back as explicit zero buckets from the backend (frontend never infers); zero days draw baseline only but keep a full-height tooltip hover target. Live-verified all three: dense run showed a mid-week gap day as empty space; a single-active-day DB rendered one bar in both 7d and 30d (total $4.50 exact); a fresh empty DB rendered flat baseline + "No cost in the last 7 days." with no errors. Unit tests pin gaps/single-day/empty/boundary-ms cases (158 total green)
 
 **4.4 - Live updates & pause/resume**
 - [ ] New ingested event updates popover values within one export interval (~5s) without reopening
