@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 pub mod db;
+pub mod ingest;
 pub mod receiver;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -18,18 +19,27 @@ pub fn run() {
         .setup(|app| {
             // macOS: ~/Library/Application Support/com.peason.farthing
             let data_dir = app.path().app_data_dir()?;
-            let database = db::Db::open_in_dir(&data_dir)?;
-            app.manage(db::DbState(Mutex::new(database)));
+            let database = Arc::new(Mutex::new(db::Db::open_in_dir(&data_dir)?));
+            app.manage(db::DbState(Arc::clone(&database)));
+
+            // Ingest pipeline state: shared DB handle + counters, queryable
+            // via `ingest_stats` (health view, task 2.5).
+            let ingest_state = ingest::IngestState::new(database);
+            app.manage(ingest_state.clone());
 
             // OTLP receiver on 127.0.0.1:43177. A port conflict is recorded
             // in ReceiverState (queryable via `receiver_status`), never
             // auto-rebound: settings.json holds the literal endpoint.
             let status = receiver::new_status();
             app.manage(receiver::ReceiverState(Arc::clone(&status)));
-            tauri::async_runtime::spawn(receiver::run(status));
+            tauri::async_runtime::spawn(receiver::run(status, ingest_state));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, receiver::receiver_status])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            receiver::receiver_status,
+            ingest::ingest_stats
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -50,7 +50,7 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 | 1.1 | Scaffold Tauri v2 app | Tauri v2 + Svelte/TS template, repo init, basic window, dev/build scripts, CI build check | High | M | — | done <!-- vk: --> |
 | 1.2 | SQLite layer & schema | rusqlite + WAL, App Support path resolution, embedded migrations, tables: `requests`, `sessions`, `ingest_state`, `meta` | High | M | 1.1 | done <!-- vk: --> |
 | 1.3 | axum OTLP receiver | Localhost-only server on fixed port 43177, `POST /v1/logs`, `POST /v1/metrics` (accept + discard), port-in-use detection (no auto-rebind) | High | M | 1.1 | done <!-- vk: --> |
-| 1.4 | OTel event ingestion | Parse `claude_code.api_request` / `api_error` from OTLP `http/json` into `requests` rows (cost_usd, 4 token counts, model, query_source, session.id, ts); version-tolerant | High | M | 1.2, 1.3 | <!-- vk: --> |
+| 1.4 | OTel event ingestion | Parse `claude_code.api_request` / `api_error` from OTLP `http/json` into `requests` rows (cost_usd, 4 token counts, model, query_source, session.id, ts); version-tolerant | High | M | 1.2, 1.3 | done <!-- vk: --> |
 | 1.5 | Session mapping endpoint | `POST /session` accepting SessionStart hook stdin JSON; upsert `session_id → cwd` into `sessions` | High | S | 1.2, 1.3 | <!-- vk: --> |
 | 1.6 | End-to-end pipeline verification | Manually configure a Claude Code session against the receiver; assert row counts/values vs the session transcript; document findings | High | M | 1.4, 1.5 | <!-- vk: --> |
 
@@ -74,10 +74,10 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 - [x] Malformed JSON returns 400 without panicking
 
 **1.4 - OTel event ingestion**
-- [ ] `claude_code.api_request` events insert rows with cost_usd, input/output/cache_read/cache_creation tokens, model, query_source, session.id, timestamp
-- [ ] `claude_code.api_error` events are stored with error metadata
-- [ ] Unknown event names and unknown attributes are ignored without error; missing required fields increment a visible ingest-failure counter
-- [ ] Fixture tests use captured real OTLP payloads (record one during development)
+- [x] `claude_code.api_request` events insert rows with cost_usd, input/output/cache_read/cache_creation tokens, model, query_source, session.id, timestamp
+- [x] `claude_code.api_error` events are stored with error metadata
+- [x] Unknown event names and unknown attributes are ignored without error; missing required fields increment a visible ingest-failure counter (`ingest_stats` command)
+- [x] Fixture tests use captured real OTLP payloads (record one during development) — real `api_request` batch captured from Claude Code v2.1.173, sanitized in `src-tauri/tests/fixtures/` (api_error fixture is reconstructed; see fixtures README)
 
 **1.5 - Session mapping endpoint**
 - [ ] `POST /session` with SessionStart hook JSON upserts (session_id, cwd, first_seen, source='hook')

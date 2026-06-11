@@ -3,9 +3,9 @@
 //! A localhost-only axum server on fixed port 43177 that accepts OTLP
 //! `http/json` exports from Claude Code:
 //!
-//! - `POST /v1/logs` — the live event pipeline (parsing into `requests` rows
-//!   lands in task 1.4; for now well-formed payloads are accepted and
-//!   discarded)
+//! - `POST /v1/logs` — the live event pipeline: payloads are handed to
+//!   [`crate::ingest`] which stores `claude_code.api_request` /
+//!   `api_error` events as `requests` rows
 //! - `POST /v1/metrics` — accepted and discarded by design; aggregations are
 //!   derived in SQL from log events (PRD FR-1)
 //!
@@ -19,12 +19,15 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::post;
 use axum::Router;
 use serde::Serialize;
 use serde_json::json;
+
+use crate::ingest::{self, IngestState};
 
 /// Fixed OTLP ingest port. Non-standard on purpose: avoids collision with a
 /// user-run collector on the standard OTLP ports 4317/4318.
@@ -69,15 +72,15 @@ pub fn receiver_status(state: tauri::State<'_, ReceiverState>) -> ReceiverStatus
 /// Bind `127.0.0.1:43177` and serve until the app exits, recording every
 /// state transition in `status`. Intended to be spawned on the Tauri async
 /// runtime.
-pub async fn run(status: SharedStatus) {
+pub async fn run(status: SharedStatus, ingest: IngestState) {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, OTLP_PORT));
-    serve_on(addr, status).await;
+    serve_on(addr, status, ingest).await;
 }
 
 /// Bind `addr` (loopback expected) and serve. Split from [`run`] so tests
 /// can use an ephemeral port. Returns when the server stops (bind failure
 /// or fatal serve error).
-pub async fn serve_on(addr: SocketAddr, status: SharedStatus) {
+pub async fn serve_on(addr: SocketAddr, status: SharedStatus, ingest: IngestState) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
@@ -102,7 +105,7 @@ pub async fn serve_on(addr: SocketAddr, status: SharedStatus) {
         .unwrap_or(addr.port());
     set_status(&status, ReceiverStatus::Listening { port });
 
-    if let Err(err) = axum::serve(listener, router()).await {
+    if let Err(err) = axum::serve(listener, router(ingest)).await {
         set_status(
             &status,
             ReceiverStatus::Failed {
@@ -116,19 +119,24 @@ fn set_status(status: &SharedStatus, next: ReceiverStatus) {
     *status.lock().expect("receiver status mutex poisoned") = next;
 }
 
-/// OTLP `http/json` routes. Stateless for now; task 1.4 threads the DB
-/// handle through `Router::with_state` to turn `/v1/logs` into real ingest.
-pub fn router() -> Router {
+/// OTLP `http/json` routes, with the ingest pipeline (DB handle + counters)
+/// threaded through as router state.
+pub fn router(ingest: IngestState) -> Router {
     Router::new()
         .route("/v1/logs", post(post_logs))
         .route("/v1/metrics", post(post_metrics))
+        .with_state(ingest)
 }
 
-/// `POST /v1/logs`: validate the payload is JSON, then (for now) discard.
-/// Task 1.4 replaces the discard with `claude_code.api_request` ingestion.
-async fn post_logs(body: Bytes) -> Response {
+/// `POST /v1/logs`: validate the payload is JSON, then ingest storable
+/// events. Ingest never fails the export: per-record problems are tallied
+/// in the ingest-failure counter instead (version tolerance, PRD FR-1).
+async fn post_logs(State(ingest): State<IngestState>, body: Bytes) -> Response {
     match parse_otlp_json(&body) {
-        Ok(_payload) => export_success(),
+        Ok(payload) => {
+            ingest::ingest_logs(&ingest, &payload);
+            export_success()
+        }
         Err(err) => invalid_json(&err),
     }
 }
@@ -202,17 +210,31 @@ mod tests {
         }]
     }"#;
 
+    /// Build an ingest state over a fresh temp database.
+    fn test_ingest_state() -> (IngestState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_dir(dir.path()).unwrap();
+        (IngestState::new(Arc::new(Mutex::new(db))), dir)
+    }
+
     /// Spawn the receiver on an ephemeral loopback port and wait for it to
-    /// report Listening. Returns the bound address and the status cell.
-    async fn start_test_receiver() -> (SocketAddr, SharedStatus) {
+    /// report Listening. Returns the bound address, the status cell, and the
+    /// ingest state (with its temp dir guard).
+    async fn start_test_receiver() -> (SocketAddr, SharedStatus, IngestState, tempfile::TempDir) {
+        let (ingest, dir) = test_ingest_state();
         let status = new_status();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        tokio::spawn(serve_on(addr, Arc::clone(&status)));
+        tokio::spawn(serve_on(addr, Arc::clone(&status), ingest.clone()));
 
         for _ in 0..100 {
             let snapshot = status.lock().unwrap().clone();
             if let ReceiverStatus::Listening { port } = snapshot {
-                return (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), status);
+                return (
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                    status,
+                    ingest,
+                    dir,
+                );
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -244,14 +266,14 @@ mod tests {
 
     #[tokio::test]
     async fn wellformed_logs_and_metrics_return_200() {
-        let (addr, _status) = start_test_receiver().await;
+        let (addr, _status, _ingest, _dir) = start_test_receiver().await;
         assert_eq!(http_post(addr, "/v1/logs", OTLP_LOGS_BODY).await, 200);
         assert_eq!(http_post(addr, "/v1/metrics", OTLP_METRICS_BODY).await, 200);
     }
 
     #[tokio::test]
     async fn malformed_json_returns_400_without_killing_server() {
-        let (addr, status) = start_test_receiver().await;
+        let (addr, status, _ingest, _dir) = start_test_receiver().await;
         assert_eq!(http_post(addr, "/v1/logs", "{not json").await, 400);
         assert_eq!(http_post(addr, "/v1/metrics", "").await, 400);
 
@@ -263,15 +285,37 @@ mod tests {
         assert_eq!(http_post(addr, "/v1/logs", OTLP_LOGS_BODY).await, 200);
     }
 
+    /// End-to-end over real HTTP: the captured Claude Code export lands as a
+    /// `requests` row (detailed field assertions live in `crate::ingest`).
+    #[tokio::test]
+    async fn posted_capture_becomes_a_requests_row() {
+        let (addr, _status, ingest, _dir) = start_test_receiver().await;
+        let capture = include_str!("../tests/fixtures/otlp_logs_api_request.json");
+        assert_eq!(http_post(addr, "/v1/logs", capture).await, 200);
+
+        let count: i64 = {
+            let db = ingest.db.lock().unwrap();
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM requests WHERE event_type = 'api_request'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count, 1);
+        assert_eq!(ingest.stats.snapshot().events_ingested, 1);
+    }
+
     #[tokio::test]
     async fn unknown_route_is_404_not_a_crash() {
-        let (addr, _status) = start_test_receiver().await;
+        let (addr, _status, _ingest, _dir) = start_test_receiver().await;
         assert_eq!(http_post(addr, "/v1/traces", "{}").await, 404);
     }
 
     #[tokio::test]
     async fn binds_loopback_only() {
-        let (addr, _status) = start_test_receiver().await;
+        let (addr, _status, _ingest, _dir) = start_test_receiver().await;
         assert!(addr.ip().is_loopback());
 
         // If this machine has a non-loopback address, a connection to it on
@@ -308,7 +352,8 @@ mod tests {
         let taken = blocker.local_addr().unwrap();
 
         let status = new_status();
-        serve_on(taken, Arc::clone(&status)).await; // returns immediately on bind failure
+        let (ingest, _dir) = test_ingest_state();
+        serve_on(taken, Arc::clone(&status), ingest).await; // returns immediately on bind failure
 
         assert_eq!(
             *status.lock().unwrap(),
