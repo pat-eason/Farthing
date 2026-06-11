@@ -255,7 +255,7 @@
 
   <div class="row">
     <button onclick={() => void refresh()}>Refresh</button>
-    <a class="button-link" href={resolve("/health")}>Health</a>
+    <a class="button-link" href={resolve("/(app)/health")}>Health</a>
     <a class="button-link" href={resolve("/")}>Back to setup</a>
   </div>
 </main>

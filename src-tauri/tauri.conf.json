@@ -14,8 +14,11 @@
       {
         "label": "main",
         "title": "Claude Usage Tracker",
-        "width": 800,
-        "height": 600,
+        "width": 1100,
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 560,
+        "center": true,
         "visible": false
       },
       {
@@ -23,7 +26,7 @@
         "url": "/popover",
         "title": "Claude Usage Tracker",
         "width": 320,
-        "height": 480,
+        "height": 512,
         "visible": false,
         "decorations": false,
         "resizable": false,
