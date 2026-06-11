@@ -97,6 +97,10 @@ export interface SeriesPoint extends Aggregates {
   /** Group key (model or project cwd); null for ungrouped points and the
    * unknown-model/unknown-project bucket. */
   key: string | null;
+  /** 5m/1h cache-creation split; null when no matching row carries it
+   * (the split is transcript-exclusive). */
+  cache_creation_5m_tokens: number | null;
+  cache_creation_1h_tokens: number | null;
 }
 
 /** One session's rollup. */
