@@ -33,6 +33,10 @@ export interface OnboardingStatus {
 export interface ApplyOutcome {
   changed: boolean;
   backup_path: string | null;
+  /** Whether the login item got registered (best-effort, after the merge). */
+  autostart_enabled: boolean;
+  /** Why autostart is not enabled (dev build, plugin error), or null. */
+  autostart_note: string | null;
 }
 
 /** Read-only: current config state + merge preview. */

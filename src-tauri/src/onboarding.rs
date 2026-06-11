@@ -39,6 +39,22 @@ pub struct DiffLine {
     pub text: String,
 }
 
+/// What [`onboarding_apply`] returns to the done screen: the merge outcome
+/// plus the best-effort autostart registration (task 2.3). Autostart runs
+/// only after a successful merge and never fails it.
+#[derive(Debug, Clone, Serialize)]
+pub struct OnboardingApplyOutcome {
+    /// Whether settings.json was rewritten (see [`ApplyOutcome::changed`]).
+    pub changed: bool,
+    /// Backup written before the rewrite, when one was taken.
+    pub backup_path: Option<std::path::PathBuf>,
+    /// Whether the login item got registered.
+    pub autostart_enabled: bool,
+    /// Why autostart is not enabled (dev build, plugin error), shown as an
+    /// informational note; the settings view has the toggle to retry.
+    pub autostart_note: Option<String>,
+}
+
 /// Everything the onboarding UI needs to render the right screen.
 #[derive(Debug, Clone, Serialize)]
 pub struct OnboardingStatus {
@@ -161,16 +177,27 @@ pub fn onboarding_status(app: tauri::AppHandle) -> Result<OnboardingStatus, Stri
 /// Frontend action: apply the merge (backup first, atomic write). Gated on
 /// the user-confirmed diff; `acknowledge_conflicts` must be `true` when the
 /// preview reported conflicts (the conflict screen's explicit choice).
+///
+/// After a successful merge, registers the app as a login item (PRD: the
+/// receiver must always be up). Best-effort: an autostart failure (or the
+/// dev-build guard) is reported in the outcome, never as an error.
 #[tauri::command]
 pub fn onboarding_apply(
     app: tauri::AppHandle,
     acknowledge_conflicts: bool,
-) -> Result<ApplyOutcome, String> {
-    apply(
+) -> Result<OnboardingApplyOutcome, String> {
+    let outcome = apply(
         &settings_path(&app)?,
         &backup_dir(&app)?,
         acknowledge_conflicts,
-    )
+    )?;
+    let autostart = crate::autostart::enable_after_onboarding(&app);
+    Ok(OnboardingApplyOutcome {
+        changed: outcome.changed,
+        backup_path: outcome.backup_path,
+        autostart_enabled: autostart.enabled,
+        autostart_note: autostart.note,
+    })
 }
 
 #[cfg(test)]

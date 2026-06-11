@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
 
+pub mod autostart;
 pub mod db;
 pub mod ingest;
 pub mod onboarding;
@@ -13,6 +14,12 @@ pub mod settings_merge;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // LaunchAgent mode per PRD; enabled during onboarding, toggleable
+        // on the settings view (autostart.rs).
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             // macOS: ~/Library/Application Support/com.peason.farthing
             let data_dir = app.path().app_data_dir()?;
@@ -36,7 +43,9 @@ pub fn run() {
             receiver::receiver_status,
             ingest::ingest_stats,
             onboarding::onboarding_status,
-            onboarding::onboarding_apply
+            onboarding::onboarding_apply,
+            autostart::autostart_status,
+            autostart::autostart_set
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
