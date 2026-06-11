@@ -108,7 +108,7 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
 | 2.1 | settings.json merge engine | Read/parse, deep-merge of env block + SessionStart hook entry, timestamped backup, strict unmerge of app-owned keys only; fixture test suite | High | L | 1.1 | done <!-- vk: --> |
-| 2.2 | Onboarding flow | First-run UI: detect config state, render diff preview, conflict detection (existing OTel vars), apply merge, "restart your sessions" notice | High | M | 2.1 | <!-- vk: --> |
+| 2.2 | Onboarding flow | First-run UI: detect config state, render diff preview, conflict detection (existing OTel vars), apply merge, "restart your sessions" notice | High | M | 2.1 | done <!-- vk: --> |
 | 2.3 | Autostart (LaunchAgent) | `tauri-plugin-autostart` integration; enabled during onboarding, toggleable in settings | High | S | 1.1 | <!-- vk: --> |
 | 2.4 | Uninstall flow | Reverse merge, remove LaunchAgent, optional DB deletion, confirmation UX | Medium | M | 2.1, 2.3 | <!-- vk: --> |
 | 2.5 | Health & diagnostics view | Receiver status, last-event-at, config installed/missing/conflicting, port conflict surfacing, "configured but no events" detector with causes | Medium | M | 1.4, 2.2 | <!-- vk: --> |
@@ -122,10 +122,10 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 - [x] Fixture suite covers: missing file, empty file, real-world large settings.json, pre-existing env block, pre-existing SessionStart hooks, malformed JSON (abort, never write) — 20 tests, fixtures in `src-tauri/tests/fixtures/settings/` (realworld.json is an anonymized real settings.json)
 
 **2.2 - Onboarding flow**
-- [ ] First launch shows a literal before/after diff of settings.json changes; nothing is written until the user confirms
-- [ ] Existing `OTEL_*` / `CLAUDE_CODE_ENABLE_TELEMETRY` values trigger a conflict screen requiring an explicit choice
-- [ ] Post-apply screen instructs restarting running Claude Code sessions and links to the health view
-- [ ] Re-running onboarding on an already-configured machine is a no-op with a "already configured" state
+- [x] First launch shows a literal before/after diff of settings.json changes; nothing is written until the user confirms — `src-tauri/src/onboarding.rs` (`onboarding_status`: read-only line diff via `similar`) + preview screen in `src/routes/+page.svelte`; verified live against a scratch file (`CLAUDE_USAGE_TRACKER_SETTINGS_PATH` dev override)
+- [x] Existing `OTEL_*` / `CLAUDE_CODE_ENABLE_TELEMETRY` values trigger a conflict screen requiring an explicit choice — conflict table with "Overwrite and continue" / "Cancel, change nothing"; backend `onboarding_apply` refuses unless `acknowledge_conflicts=true`
+- [x] Post-apply screen instructs restarting running Claude Code sessions and links to the health view — done screen shows backup path + restart notice + link to `/health` (stub view with receiver status; full diagnostics in 2.5)
+- [x] Re-running onboarding on an already-configured machine is a no-op with a "already configured" state — `changed=false` routes to the configured screen; re-apply writes nothing and takes no backup (tested + verified live across an app relaunch)
 
 **2.3 - Autostart (LaunchAgent)**
 - [ ] App relaunches on login after enabling; LaunchAgent plist present
