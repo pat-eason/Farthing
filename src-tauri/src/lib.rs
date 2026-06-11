@@ -5,6 +5,7 @@ use tauri::Manager;
 pub mod db;
 pub mod ingest;
 pub mod receiver;
+pub mod session;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
