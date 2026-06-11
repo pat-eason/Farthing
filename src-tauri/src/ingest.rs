@@ -280,6 +280,13 @@ fn value_f64(value: &Value) -> Option<f64> {
     }
 }
 
+/// Insert one live row. Dedup per spike 3.1 (`docs/notes/dedup-key.md`):
+/// `request_id` is the exact identity across sources, and **otel wins** — a
+/// conflict with an existing `backfill` row (the startup backfill can beat a
+/// still-in-flight request's export by seconds) takes the row over with the
+/// authoritative exporter data, keeping only the transcript-exclusive 5m/1h
+/// cache-split columns. A conflict with an existing `otel` row (OTLP
+/// re-delivery) is a no-op.
 fn insert_row(state: &IngestState, row: &RequestRow) -> Result<(), rusqlite::Error> {
     let db = state.db.lock().expect("db mutex poisoned");
     db.conn()
@@ -288,7 +295,22 @@ fn insert_row(state: &IngestState, row: &RequestRow) -> Result<(), rusqlite::Err
                 request_id, session_id, timestamp_ms, model, query_source,
                 cost_usd, input_tokens, output_tokens, cache_read_tokens,
                 cache_creation_tokens, event_type, error, duration_ms, source
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'otel')",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'otel')
+             ON CONFLICT (request_id) WHERE request_id IS NOT NULL DO UPDATE SET
+                session_id = excluded.session_id,
+                timestamp_ms = excluded.timestamp_ms,
+                model = excluded.model,
+                query_source = excluded.query_source,
+                cost_usd = excluded.cost_usd,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cache_read_tokens = excluded.cache_read_tokens,
+                cache_creation_tokens = excluded.cache_creation_tokens,
+                event_type = excluded.event_type,
+                error = excluded.error,
+                duration_ms = excluded.duration_ms,
+                source = 'otel'
+             WHERE requests.source = 'backfill'",
             rusqlite::params![
                 row.request_id,
                 row.session_id,
@@ -372,6 +394,58 @@ mod tests {
                 assert!(row.get::<_, Option<String>>("error")?.is_none());
                 assert_eq!(row.get::<_, i64>("duration_ms")?, 1648);
                 assert_eq!(row.get::<_, String>("source")?, "otel");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn redelivered_batch_does_not_duplicate_the_request_row() {
+        let (state, _dir) = test_state();
+        ingest_str(&state, REAL_API_REQUEST_BATCH);
+        // OTLP exporters retry on transport errors; the same batch can
+        // arrive twice. The request_id unique index makes this a no-op.
+        ingest_str(&state, REAL_API_REQUEST_BATCH);
+
+        assert_eq!(row_count(&state), 1);
+        assert_eq!(state.stats.snapshot().ingest_failures, 0);
+    }
+
+    #[test]
+    fn otel_takes_over_an_existing_backfill_row_keeping_the_cache_split() {
+        let (state, _dir) = test_state();
+        // The startup backfill stored this request first (NULL cost, with
+        // the transcript-exclusive 5m/1h split), then the live export
+        // arrives a few seconds later.
+        {
+            let db = state.db.lock().unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO requests (
+                        request_id, session_id, timestamp_ms, model, cost_usd,
+                        input_tokens, output_tokens, cache_read_tokens,
+                        cache_creation_tokens, cache_creation_5m_tokens,
+                        cache_creation_1h_tokens, source
+                     ) VALUES ('req_011CbwuYCfawVQtYFZaU7Kgi', 'c2399881-2a19-4df5-9649-7a67248d135c',
+                               1781200718000, 'claude-haiku-4-5-20251001', NULL,
+                               10, 41, 44436, 0, 0, 0, 'backfill')",
+                    [],
+                )
+                .unwrap();
+        }
+        ingest_str(&state, REAL_API_REQUEST_BATCH);
+
+        assert_eq!(row_count(&state), 1);
+        let db = state.db.lock().unwrap();
+        db.conn()
+            .query_row("SELECT * FROM requests", [], |row| {
+                // Otel data won: authoritative cost + exporter timestamp.
+                assert_eq!(row.get::<_, String>("source")?, "otel");
+                assert!((row.get::<_, f64>("cost_usd")? - 0.0046586).abs() < 1e-9);
+                assert_eq!(row.get::<_, i64>("timestamp_ms")?, 1_781_200_718_939);
+                // The transcript-exclusive split survived the takeover.
+                assert_eq!(row.get::<_, i64>("cache_creation_5m_tokens")?, 0);
+                assert_eq!(row.get::<_, i64>("cache_creation_1h_tokens")?, 0);
                 Ok(())
             })
             .unwrap();
