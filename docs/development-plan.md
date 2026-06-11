@@ -49,7 +49,7 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 |----|-------|-------------|----------|------------|------------|--------|
 | 1.1 | Scaffold Tauri v2 app | Tauri v2 + Svelte/TS template, repo init, basic window, dev/build scripts, CI build check | High | M | — | done <!-- vk: --> |
 | 1.2 | SQLite layer & schema | rusqlite + WAL, App Support path resolution, embedded migrations, tables: `requests`, `sessions`, `ingest_state`, `meta` | High | M | 1.1 | done <!-- vk: --> |
-| 1.3 | axum OTLP receiver | Localhost-only server on fixed port 43177, `POST /v1/logs`, `POST /v1/metrics` (accept + discard), port-in-use detection (no auto-rebind) | High | M | 1.1 | <!-- vk: --> |
+| 1.3 | axum OTLP receiver | Localhost-only server on fixed port 43177, `POST /v1/logs`, `POST /v1/metrics` (accept + discard), port-in-use detection (no auto-rebind) | High | M | 1.1 | done <!-- vk: --> |
 | 1.4 | OTel event ingestion | Parse `claude_code.api_request` / `api_error` from OTLP `http/json` into `requests` rows (cost_usd, 4 token counts, model, query_source, session.id, ts); version-tolerant | High | M | 1.2, 1.3 | <!-- vk: --> |
 | 1.5 | Session mapping endpoint | `POST /session` accepting SessionStart hook stdin JSON; upsert `session_id → cwd` into `sessions` | High | S | 1.2, 1.3 | <!-- vk: --> |
 | 1.6 | End-to-end pipeline verification | Manually configure a Claude Code session against the receiver; assert row counts/values vs the session transcript; document findings | High | M | 1.4, 1.5 | <!-- vk: --> |
@@ -68,10 +68,10 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 - [x] Unit tests cover fresh-create, re-open, and migration-upgrade paths
 
 **1.3 - axum OTLP receiver**
-- [ ] Server binds `127.0.0.1:43177`; connection attempts from a non-loopback address fail
-- [ ] `POST /v1/logs` and `POST /v1/metrics` return 200 for well-formed OTLP `http/json`; metrics payloads are discarded
-- [ ] Port-in-use at startup is detected and exposed as queryable app state (no auto-rebind)
-- [ ] Malformed JSON returns 400 without panicking
+- [x] Server binds `127.0.0.1:43177`; connection attempts from a non-loopback address fail
+- [x] `POST /v1/logs` and `POST /v1/metrics` return 200 for well-formed OTLP `http/json`; metrics payloads are discarded
+- [x] Port-in-use at startup is detected and exposed as queryable app state (no auto-rebind)
+- [x] Malformed JSON returns 400 without panicking
 
 **1.4 - OTel event ingestion**
 - [ ] `claude_code.api_request` events insert rows with cost_usd, input/output/cache_read/cache_creation tokens, model, query_source, session.id, timestamp
