@@ -71,7 +71,7 @@ Key insight from design: Claude Code hooks do **not** carry token/cost data (ver
 - Database lives at `~/Library/Application Support/<app>/usage.db` (platform-correct, owned by the app's uninstall flow, survives `~/.claude` cleanup tooling).
 - App creates and migrates `usage.db` on boot (rusqlite; WAL mode).
 - Core tables (indicative): `requests` (per-API-request rows), `sessions` (session_id, cwd, first_seen, last_seen, source), `ingest_state` (transcript byte offsets for idempotent backfill), `meta` (schema version).
-- Dedup strategy so live OTel rows and backfilled transcript rows for the same activity don't double-count. **Requires a spike**: verify whether `claude_code.api_request` events carry a request identifier matching the transcript's `requestId`; if yes, dedup on it — if no, fall back to (session_id, timestamp window, token signature) fuzzy matching.
+- Dedup strategy so live OTel rows and backfilled transcript rows for the same activity don't double-count. **Spike resolved (3.1, see `docs/notes/dedup-key.md`)**: `claude_code.api_request` carries `request_id` identical to the transcript's `requestId` (verified across 4 sessions/6 requests, with zero cross-session collisions in 26,815 transcript requestIds) — dedup on exact `request_id` with a partial unique index; OTel rows win on conflict (they carry authoritative `cost_usd`); (session_id, model, ±2s timestamp window, token signature) fuzzy matching retained only as a fallback for rows missing the id.
 - All UI metrics are SQL aggregations over `requests` joined to `sessions`.
 
 ### FR-5: Transcript backfill & gap recovery (MVP)
@@ -145,7 +145,7 @@ Key insight from design: Claude Code hooks do **not** carry token/cost data (ver
 | Claude Code OTel event schema changes between releases | High | Version-tolerant parsing (ignore unknown fields, alert on missing required fields); health view surfaces ingest failures; transcripts as independent fallback source |
 | settings.json merge corrupts user config | High | Preview diff before write, timestamped backup, strict deep-merge touching only app-owned keys, extensive fixture tests, reversible uninstall |
 | Data dropped while app not running | Medium | LaunchAgent autostart + incremental transcript backfill on every start; dedup prevents double-count |
-| Double-counting between OTel and backfill rows | Medium | Deterministic dedup keys (session_id + timestamp window + token signature); tag rows by source; backfill diff report |
+| Double-counting between OTel and backfill rows | Medium | Deterministic dedup on exact `request_id` (verified shared by both sources; fuzzy session_id + timestamp window + token signature only as fallback); tag rows by source; backfill diff report |
 | User already runs an OTel collector / has telemetry env set | Medium | Conflict detection in onboarding; fixed non-standard port (43177); explicit user choice, never silent overwrite |
 | Pricing table staleness (backfill cost wrong for new models) | Low | Bundled table + fail-silent remote refresh (pinned LiteLLM URL); "unknown model" rows flagged with tokens-only display; OTel rows unaffected (cost_usd comes from Claude Code) |
 | `cost_usd` semantics for subscription users | Low | Label as "API-equivalent spend" throughout the UI |
