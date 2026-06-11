@@ -1,15 +1,30 @@
 <script lang="ts">
-  // Settings view (task 2.3): start-at-login toggle backed by the
-  // autostart commands. State is always re-read from the plugin after a
+  // Settings view: start-at-login toggle (task 2.3) and the uninstall flow
+  // (task 2.4). Autostart state is always re-read from the plugin after a
   // toggle, so the UI shows what is actually registered (including changes
   // made outside the app). Dev builds refuse to enable; the toggle shows
-  // why instead of pretending it worked.
+  // why instead of pretending it worked. Uninstall never touches anything
+  // until the confirmation dialog (which states exactly what will and won't
+  // be removed) is confirmed.
   import { resolve } from "$app/paths";
   import { getAutostartStatus, setAutostart, type AutostartStatus } from "$lib/autostart";
+  import {
+    applyUninstall,
+    getUninstallStatus,
+    type UninstallOutcome,
+    type UninstallStatus,
+  } from "$lib/uninstall";
 
   let status: AutostartStatus | undefined = $state();
   let busy = $state(false);
   let errorMessage = $state("");
+
+  type UninstallScreen = "idle" | "loading" | "confirm" | "working" | "done";
+  let uninstallScreen: UninstallScreen = $state("idle");
+  let uninstallStatus: UninstallStatus | undefined = $state();
+  let uninstallOutcome: UninstallOutcome | undefined = $state();
+  let uninstallError = $state("");
+  let deleteDatabase = $state(false);
 
   async function refresh() {
     errorMessage = "";
@@ -38,6 +53,39 @@
     } finally {
       busy = false;
     }
+  }
+
+  async function startUninstall() {
+    uninstallScreen = "loading";
+    uninstallError = "";
+    deleteDatabase = false;
+    try {
+      uninstallStatus = await getUninstallStatus();
+      uninstallScreen = "confirm";
+    } catch (err) {
+      uninstallError = String(err);
+      uninstallScreen = "idle";
+    }
+  }
+
+  async function confirmUninstall() {
+    uninstallScreen = "working";
+    uninstallError = "";
+    try {
+      uninstallOutcome = await applyUninstall(deleteDatabase);
+      uninstallScreen = "done";
+      // The LaunchAgent state changed; reflect it in the toggle above.
+      void refresh();
+    } catch (err) {
+      uninstallError = String(err);
+      uninstallScreen = "confirm";
+    }
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   $effect(() => {
@@ -84,6 +132,127 @@
     </div>
   </section>
 
+  <section class="setting uninstall">
+    <div class="setting-text full">
+      <h2>Uninstall</h2>
+      {#if uninstallScreen === "idle"}
+        <p class="muted">
+          Removes everything this app set up: the settings.json entries, the start-at-login
+          LaunchAgent, and (only if you choose) the usage database. You'll see exactly what will be
+          removed before anything happens.
+        </p>
+        {#if uninstallError}
+          <p class="error-box">{uninstallError}</p>
+        {/if}
+        <button class="danger" onclick={() => void startUninstall()}>Uninstall…</button>
+      {:else if uninstallScreen === "loading"}
+        <p class="muted">Checking what an uninstall would remove…</p>
+      {:else if uninstallScreen === "confirm" && uninstallStatus}
+        <h3>This will be removed:</h3>
+        <ul>
+          <li>
+            {#if uninstallStatus.settings_changed}
+              The telemetry settings and session hook this app added to
+              <code>{uninstallStatus.settings_path}</code>. A timestamped backup is saved first.
+              <details>
+                <summary>Show the exact change</summary>
+                <pre class="diff">{#each uninstallStatus.diff as line, i (i)}<span
+                      class="diff-{line.kind}"
+                      >{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "} {line.text}
+</span>{/each}</pre>
+              </details>
+            {:else}
+              Nothing from <code>{uninstallStatus.settings_path}</code>: no app-added entries were
+              found there.
+            {/if}
+          </li>
+          <li>
+            {#if uninstallStatus.autostart_enabled}
+              The start-at-login LaunchAgent.
+            {:else}
+              No LaunchAgent: start at login is not currently registered.
+            {/if}
+          </li>
+          <li>
+            {#if uninstallStatus.database_exists}
+              <label>
+                <input type="checkbox" bind:checked={deleteDatabase} />
+                Also delete the usage database ({formatBytes(uninstallStatus.database_size_bytes)} at
+                <code>{uninstallStatus.database_path}</code>). Unchecked, your usage history is
+                kept.
+              </label>
+            {:else}
+              No usage database found on disk.
+            {/if}
+          </li>
+        </ul>
+        <h3>This will <em>not</em> be removed:</h3>
+        <ul>
+          <li>
+            Everything else in <code>{uninstallStatus.settings_path}</code>: only the entries this
+            app added are touched, and only if you haven't edited them.
+          </li>
+          <li>
+            Your settings.json backups in <code>{uninstallStatus.backups_dir}</code>, kept so you
+            can restore any earlier state.
+          </li>
+          {#if !deleteDatabase && uninstallStatus.database_exists}
+            <li>The usage database (leave the box above unchecked to keep it).</li>
+          {/if}
+          <li>The app itself: quit it and drag it to the Trash afterwards.</li>
+        </ul>
+        {#if uninstallError}
+          <p class="error-box">{uninstallError}</p>
+        {/if}
+        <div class="row">
+          <button class="danger" onclick={() => void confirmUninstall()}>
+            {deleteDatabase ? "Uninstall and delete database" : "Uninstall"}
+          </button>
+          <button onclick={() => (uninstallScreen = "idle")}>Cancel</button>
+        </div>
+      {:else if uninstallScreen === "working"}
+        <p class="muted">Uninstalling…</p>
+      {:else if uninstallScreen === "done" && uninstallOutcome}
+        <h3>Uninstalled</h3>
+        <ul>
+          <li>
+            {#if uninstallOutcome.settings_changed}
+              settings.json entries removed.
+              {#if uninstallOutcome.backup_path}
+                Backup saved to <code>{uninstallOutcome.backup_path}</code>.
+              {/if}
+            {:else}
+              settings.json was already clean; nothing to remove.
+            {/if}
+          </li>
+          <li>
+            {#if uninstallOutcome.autostart_note}
+              LaunchAgent: {uninstallOutcome.autostart_note}
+            {:else if uninstallOutcome.autostart_enabled}
+              LaunchAgent is still registered.
+            {:else}
+              LaunchAgent removed (or was never registered).
+            {/if}
+          </li>
+          <li>
+            {#if uninstallOutcome.database_deleted}
+              Usage database deleted.
+            {:else if uninstallOutcome.database_note}
+              Usage database: {uninstallOutcome.database_note}
+            {:else}
+              Usage database kept.
+            {/if}
+          </li>
+        </ul>
+        <p>
+          Claude Code sessions started from now on won't export anything to this app and run no app
+          hook. Already-running sessions stop exporting when you restart them. To finish, quit this
+          app and move it to the Trash.
+        </p>
+      {/if}
+    </div>
+  </section>
+
   <div class="row">
     <button onclick={() => void refresh()}>Refresh</button>
     <a class="button-link" href={resolve("/health")}>Health</a>
@@ -108,6 +277,11 @@
     margin: 0 0 0.25rem;
   }
 
+  h3 {
+    font-size: 0.95rem;
+    margin: 1rem 0 0.25rem;
+  }
+
   .muted {
     color: #6b6b6b;
   }
@@ -129,6 +303,10 @@
     max-width: 65%;
   }
 
+  .setting-text.full {
+    max-width: 100%;
+  }
+
   .setting-control {
     display: flex;
     align-items: center;
@@ -138,6 +316,38 @@
 
   .state {
     font-size: 0.9em;
+  }
+
+  ul {
+    margin: 0.25rem 0 0.5rem;
+    padding-left: 1.25rem;
+  }
+
+  li {
+    margin: 0.35rem 0;
+  }
+
+  .diff {
+    background: rgba(0, 0, 0, 0.05);
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+    font-size: 0.82em;
+    line-height: 1.45;
+    margin: 0.5rem 0 0;
+  }
+
+  .diff span {
+    display: block;
+    white-space: pre;
+  }
+
+  .diff-add {
+    color: #1a7f37;
+  }
+
+  .diff-remove {
+    color: #b42318;
   }
 
   .error-box,
@@ -184,6 +394,12 @@
     color: #ffffff;
   }
 
+  button.danger {
+    background-color: #b42318;
+    border-color: #b42318;
+    color: #ffffff;
+  }
+
   button:disabled {
     opacity: 0.6;
     cursor: default;
@@ -192,6 +408,10 @@
   button:hover:not(:disabled),
   .button-link:hover {
     border-color: #396cd8;
+  }
+
+  button.danger:hover:not(:disabled) {
+    border-color: #8a1f11;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -205,6 +425,18 @@
 
     .setting {
       border-bottom-color: rgba(255, 255, 255, 0.18);
+    }
+
+    .diff {
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    .diff-add {
+      color: #7ee787;
+    }
+
+    .diff-remove {
+      color: #ffa198;
     }
 
     .error-box {
@@ -227,6 +459,11 @@
     button.primary {
       background-color: #396cd8;
       border-color: #396cd8;
+    }
+
+    button.danger {
+      background-color: #b42318;
+      border-color: #b42318;
     }
   }
 </style>

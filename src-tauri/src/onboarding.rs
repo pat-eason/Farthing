@@ -124,16 +124,16 @@ pub fn apply(
 
 /// Pretty-print a settings map exactly as the merge engine writes it
 /// (2-space indent, trailing newline), so the preview's `after` matches the
-/// future file bytes.
-fn render(map: &Map<String, Value>) -> String {
+/// future file bytes. Shared with the uninstall flow (task 2.4).
+pub(crate) fn render(map: &Map<String, Value>) -> String {
     let mut rendered = serde_json::to_string_pretty(&Value::Object(map.clone()))
         .unwrap_or_else(|_| "{}".to_string());
     rendered.push('\n');
     rendered
 }
 
-/// Line-based diff for the preview screen.
-fn diff_lines(before: &str, after: &str) -> Vec<DiffLine> {
+/// Line-based diff for the preview screen. Shared with the uninstall flow.
+pub(crate) fn diff_lines(before: &str, after: &str) -> Vec<DiffLine> {
     TextDiff::from_lines(before, after)
         .iter_all_changes()
         .map(|change| DiffLine {
@@ -148,8 +148,8 @@ fn diff_lines(before: &str, after: &str) -> Vec<DiffLine> {
 }
 
 /// Resolve the real settings file: the env override when set (dev/testing),
-/// otherwise `~/.claude/settings.json`.
-fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+/// otherwise `~/.claude/settings.json`. Shared with the uninstall flow.
+pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var(SETTINGS_PATH_ENV) {
         return Ok(PathBuf::from(path));
     }
@@ -160,8 +160,10 @@ fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Backups live next to the database in the app-data dir, never inside
-/// `~/.claude` (uninstall must not leave litter there).
-fn backup_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+/// `~/.claude` (uninstall must not leave litter there). Shared with the
+/// uninstall flow, which writes one last backup before unmerging and
+/// deliberately never deletes this directory.
+pub(crate) fn backup_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map(|dir| dir.join("backups"))
