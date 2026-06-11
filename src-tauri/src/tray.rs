@@ -11,11 +11,11 @@
 //!   appears; closing it hides the window and flips back to `Accessory`
 //!   so the Dock icon disappears while the app stays resident.
 //!
-//! The pause menu item only flips [`TrayState::paused`] for now; task 4.4
-//! wires the receiver to discard (200 + drop) while paused and adds the
-//! paused badge.
+//! The "Pause capture" check item drives `capture::apply_paused` (task
+//! 4.4): the receiver discards (200 + drop) while paused, the tray shows a
+//! "Paused" title badge next to the icon, and the persisted state restores
+//! the menu check + badge on the next launch.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,8 +24,16 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, Runtime, Window, WindowEvent};
 use tauri_plugin_positioner::{Position, WindowExt};
 
+use crate::capture::{self, CaptureState};
+
 pub const MAIN_WINDOW: &str = "main";
 pub const POPOVER_WINDOW: &str = "popover";
+
+/// Tray icon id, used to look the icon up for the paused title badge.
+pub const TRAY_ID: &str = "main-tray";
+
+/// Menu-bar badge shown next to the tray icon while capture is paused.
+const PAUSED_BADGE: &str = "Paused";
 
 const MENU_OPEN_APP: &str = "open-app";
 const MENU_PAUSE: &str = "pause";
@@ -39,24 +47,15 @@ const MENU_QUIT: &str = "quit";
 /// are treated as "the popover was open; leave it closed".
 const REOPEN_SUPPRESS_WINDOW: Duration = Duration::from_millis(300);
 
-/// Shared tray state: capture-pause flag (stub until 4.4 points the
-/// receiver at it) plus the popover auto-hide timestamp used for tray-click
-/// toggle suppression.
+/// Shared tray state: the popover auto-hide timestamp used for tray-click
+/// toggle suppression. (The capture-pause flag lives in
+/// [`crate::capture::CaptureState`] since task 4.4.)
 #[derive(Clone, Default)]
 pub struct TrayState {
-    paused: Arc<AtomicBool>,
     popover_hidden_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl TrayState {
-    pub fn paused(&self) -> bool {
-        self.paused.load(Ordering::SeqCst)
-    }
-
-    pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::SeqCst);
-    }
-
     fn note_popover_hidden(&self) {
         *self.popover_hidden_at.lock().expect("tray state poisoned") = Some(Instant::now());
     }
@@ -75,8 +74,13 @@ impl TrayState {
     }
 }
 
+/// Handle to the "Pause capture" check item, managed so pause changes made
+/// outside the menu (popover resume button) can sync the check state.
+pub struct PauseMenuHandle<R: Runtime>(CheckMenuItem<R>);
+
 /// Builds the tray icon + menu and switches the app to menu-bar-only mode.
-/// Called once from the app `setup` hook.
+/// Called once from the app `setup` hook, after `CaptureState` is managed:
+/// the persisted pause state seeds the menu check + paused badge.
 pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
     let state = TrayState::default();
     app.manage(state);
@@ -86,6 +90,8 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+    let paused = app.state::<CaptureState>().paused();
+
     let open_app = MenuItem::with_id(
         app,
         MENU_OPEN_APP,
@@ -94,7 +100,7 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let pause =
-        CheckMenuItem::with_id(app, MENU_PAUSE, "Pause capture", true, false, None::<&str>)?;
+        CheckMenuItem::with_id(app, MENU_PAUSE, "Pause capture", true, paused, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
@@ -112,7 +118,11 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         .expect("bundled window icon missing")
         .clone();
 
-    TrayIconBuilder::with_id("main-tray")
+    // Managed so capture::apply_paused can sync the check state when the
+    // pause changes from outside the menu (popover resume button).
+    app.manage(PauseMenuHandle(pause.clone()));
+
+    let tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         // Template image: macOS renders it as a monochrome glyph that adapts
         // to the menu bar appearance (dark/light).
@@ -137,6 +147,11 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         })
         .build(app.handle())?;
 
+    // Restore the paused badge for a launch into a persisted pause.
+    if paused {
+        let _ = tray.set_title(Some(PAUSED_BADGE));
+    }
+
     Ok(())
 }
 
@@ -144,13 +159,31 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: &MenuEvent, pause: &
     match event.id().as_ref() {
         MENU_OPEN_APP => show_main_window(app),
         MENU_PAUSE => {
-            // The check item toggles natively; mirror its state into the
-            // shared flag the receiver will consult (task 4.4).
+            // The check item toggles natively; persist + fan out the new
+            // state (receiver flag, badge, frontend event). If persisting
+            // fails, resync the UI to the unchanged real state.
             let checked = pause.is_checked().unwrap_or(false);
-            app.state::<TrayState>().set_paused(checked);
+            if let Err(err) = capture::apply_paused(app, checked) {
+                eprintln!("tray: pause toggle failed: {err}");
+                sync_paused_ui(app, app.state::<CaptureState>().paused());
+            }
         }
         MENU_QUIT => app.exit(0),
         _ => {}
+    }
+}
+
+/// Bring the tray UI in line with `paused`: menu check state + the menu-bar
+/// "Paused" title badge. Tolerates a missing tray/menu (tests, startup
+/// ordering) — state is owned by `CaptureState`, this is presentation only.
+pub fn sync_paused_ui<R: Runtime>(app: &AppHandle<R>, paused: bool) {
+    if let Some(handle) = app.try_state::<PauseMenuHandle<R>>() {
+        let _ = handle.0.set_checked(paused);
+    }
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        // Clear with Some("") — set_title(None) leaves the previous title in
+        // place on macOS (live-verified).
+        let _ = tray.set_title(Some(if paused { PAUSED_BADGE } else { "" }));
     }
 }
 
@@ -216,22 +249,15 @@ pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) 
 mod tests {
     use super::*;
 
+    /// Presentation-only sync: with no tray icon and no managed menu handle
+    /// (mock runtime), syncing must be a silent no-op, not a panic.
     #[test]
-    fn paused_defaults_to_false_and_toggles() {
-        let state = TrayState::default();
-        assert!(!state.paused());
-        state.set_paused(true);
-        assert!(state.paused());
-        state.set_paused(false);
-        assert!(!state.paused());
-    }
-
-    #[test]
-    fn paused_is_shared_across_clones() {
-        let state = TrayState::default();
-        let clone = state.clone();
-        clone.set_paused(true);
-        assert!(state.paused());
+    fn sync_paused_ui_tolerates_missing_tray_and_menu() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        sync_paused_ui(app.handle(), true);
+        sync_paused_ui(app.handle(), false);
     }
 
     #[test]

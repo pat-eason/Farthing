@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub mod autostart;
 pub mod backfill;
+pub mod capture;
 pub mod db;
 pub mod health;
 pub mod ingest;
@@ -46,9 +47,23 @@ pub fn run() {
             let database = Arc::new(Mutex::new(db::Db::open_in_dir(&data_dir)?));
             app.manage(db::DbState(Arc::clone(&database)));
 
+            // Capture pause/resume (task 4.4): persisted in `meta`, so a
+            // paused app stays paused across restarts. Loaded before the
+            // receiver spawns and before tray::setup seeds the menu/badge.
+            let capture_state = capture::CaptureState::load(Arc::clone(&database));
+            app.manage(capture_state.clone());
+
             // Ingest pipeline state: shared DB handle + counters, queryable
-            // via `ingest_stats` (health view, task 2.5).
-            let ingest_state = ingest::IngestState::new(Arc::clone(&database));
+            // via `ingest_stats` (health view, task 2.5). The receiver
+            // consults the shared pause flag per request, and pushes a
+            // Tauri event after each export that stores rows so the popover
+            // updates live instead of polling (task 4.4).
+            let ingest_app = app.handle().clone();
+            let ingest_state = ingest::IngestState::new(Arc::clone(&database))
+                .with_pause_flag(capture_state.pause_flag())
+                .with_notifier(Arc::new(move |stored| {
+                    let _ = ingest_app.emit(ingest::INGESTED_EVENT, stored);
+                }));
             app.manage(ingest_state.clone());
 
             // Pricing table for backfill cost computation (task 3.3):
@@ -99,6 +114,8 @@ pub fn run() {
             health::health_status,
             metrics::today_metrics,
             metrics::daily_costs,
+            capture::capture_status,
+            capture::capture_set_paused,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,

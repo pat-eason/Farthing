@@ -212,7 +212,7 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 | 4.1 | Tray icon & popover shell | Tauri v2 TrayIcon, popover window anchored to tray, `ActivationPolicy::Accessory`, menu (open app / pause / quit) | High | M | 1.1 | done <!-- vk: --> |
 | 4.2 | Today-metrics queries & popover content | SQL aggregations (local-midnight day boundary, distinct session_ids), popover layout: cost, in/out/cache tokens, sessions, top 3 projects | High | M | 1.4, 4.1 | done <!-- vk: --> |
 | 4.3 | Sparkline | 7/30-day cost sparkline in popover (uPlot/LayerCake) | Medium | S | 4.2 | done <!-- vk: --> |
-| 4.4 | Live updates & pause/resume | Rust→frontend event push on ingest; pause state (receiver 200+discard), paused badge, resume | Medium | M | 4.2 | <!-- vk: --> |
+| 4.4 | Live updates & pause/resume | Rust→frontend event push on ingest; pause state (receiver 200+discard), paused badge, resume | Medium | M | 4.2 | done <!-- vk: --> |
 
 ### Task Details
 
@@ -232,9 +232,9 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 - [x] Renders correctly with sparse data (gaps, single day, empty) — gap days come back as explicit zero buckets from the backend (frontend never infers); zero days draw baseline only but keep a full-height tooltip hover target. Live-verified all three: dense run showed a mid-week gap day as empty space; a single-active-day DB rendered one bar in both 7d and 30d (total $4.50 exact); a fresh empty DB rendered flat baseline + "No cost in the last 7 days." with no errors. Unit tests pin gaps/single-day/empty/boundary-ms cases (158 total green)
 
 **4.4 - Live updates & pause/resume**
-- [ ] New ingested event updates popover values within one export interval (~5s) without reopening
-- [ ] Pause: receiver returns 200 and discards; tray shows paused badge; resume restores ingestion
-- [ ] Paused state persists across app restart
+- [x] New ingested event updates popover values within one export interval (~5s) without reopening — `/v1/logs` now reports its stored-row count (`ingest::ingest_logs` returns it) and fires an `ingest:stored` Tauri event (wired in `lib.rs`) only when rows actually landed; the popover replaces the 4.2 poll with a 200ms-debounced refetch on that event (focus refresh kept). Live-verified with the popover held open: posting a synthetic `api_request` flipped the display $0.00→$4.20 (and later $4.20→$5.50) within 1.5s of the POST, screenshot-confirmed, no reopen — well inside the ~5s export interval
+- [x] Pause: receiver returns 200 and discards; tray shows paused badge; resume restores ingestion — shared `Arc<AtomicBool>` (`capture::CaptureState` → `IngestState::with_pause_flag`) checked per request: paused `/v1/logs` and `/session` return their success codes but write nothing and move no counters (malformed JSON still 400s; protocol unchanged). Live: paused POSTs got 200 with row counts frozen, tray showed a "Paused" title badge next to the icon, popover showed a "Capture paused" banner + Resume button; clicking Resume cleared flag/badge/banner and the next POST landed as a row + live popover update. Two real bugs found and fixed live: tray/menu mutations from the command thread need `run_on_main_thread`, and `set_title(None)` doesn't clear on macOS (cleared with `Some("")`)
+- [x] Paused state persists across app restart — persisted in `meta` under `capture_paused`; `CaptureState::load` reads it before the receiver spawns and `tray::setup` seeds the menu check + badge from it. Live: paused → killed and relaunched the dev app → `meta` read back `1`, "Paused" badge restored, "Pause capture" check mark restored (AXMenuItemMarkChar `✓`), and a post-restart POST was discarded (200, row count unchanged). Unit-tested by reopening the database file as a fresh process would (165 tests green)
 
 ---
 
