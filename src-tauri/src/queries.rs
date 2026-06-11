@@ -1025,6 +1025,21 @@ pub fn facet_options<R: Runtime>(app: tauri::AppHandle<R>) -> Result<FacetOption
     facet_options_for(&db).map_err(|err| format!("cannot query facet options: {err}"))
 }
 
+// ---------------------------------------------------------------------------
+// home_dir
+// ---------------------------------------------------------------------------
+
+/// Frontend query: the user's home directory, so the views can display
+/// project paths cleaned (`~/Projects/…`, PRD FR-3). `None` when the home
+/// directory can't be resolved; the UI then shows absolute paths unchanged.
+#[tauri::command]
+pub fn home_dir<R: Runtime>(app: tauri::AppHandle<R>) -> Option<String> {
+    app.path()
+        .home_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2141,9 +2156,14 @@ mod tests {
         assert_eq!(detail.requests.len(), 1);
         assert_eq!(detail.models.len(), 1);
 
-        let projects = project_rollups(handle, Facets::default()).unwrap();
+        let projects = project_rollups(handle.clone(), Facets::default()).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].cwd.as_deref(), Some("/proj/live"));
+
+        // The 5.6 projects view cleans paths with the home dir; an absolute
+        // path (never empty, never `~`-relative) is the whole contract.
+        let home = home_dir(handle).expect("mock runtime resolves a home dir");
+        assert!(home.starts_with('/'), "absolute home dir, got {home}");
     }
 
     // ---- index usage (Epic 5 perf acceptance) ----

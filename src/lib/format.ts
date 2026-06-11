@@ -19,6 +19,17 @@ export function formatTokens(value: number): string {
   return `${(value / 1_000_000_000).toFixed(1)}B`;
 }
 
+/** Directory path cleaned for display: the home-dir prefix becomes `~`
+ * (PRD FR-3, e.g. "~/Projects/luxurypresence/websites"). Unknown home or
+ * a path outside it passes through unchanged. */
+export function cleanPath(path: string, home: string | null | undefined): string {
+  if (!home) return path;
+  const root = home.endsWith("/") ? home.slice(0, -1) : home;
+  if (root === "" || root === "/") return path;
+  if (path === root) return "~";
+  return path.startsWith(`${root}/`) ? `~${path.slice(root.length)}` : path;
+}
+
 /** Display name for a project: the last path segment of the session cwd. */
 export function projectName(cwd: string | null): string {
   if (cwd === null) return "(unknown project)";

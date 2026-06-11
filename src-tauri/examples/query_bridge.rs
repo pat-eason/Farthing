@@ -125,6 +125,9 @@ async fn invoke(
         },
         "project_rollups" => to_json(queries::project_rollups_for(&db, &args.facets, now)),
         "facet_options" => to_json(queries::facet_options_for(&db)),
+        // No AppHandle here: $HOME stands in for the path resolver, which
+        // also lets browser verification pick the home dir the seed uses.
+        "home_dir" => to_json(Ok::<_, rusqlite::Error>(std::env::var("HOME").ok())),
         other => return cors(StatusCode::NOT_FOUND, format!("unknown command: {other}")),
     };
     match result {
