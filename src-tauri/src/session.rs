@@ -62,6 +62,8 @@ struct SessionMapping {
 /// `POST /session`: upsert the SessionStart hook's `session_id → cwd`
 /// mapping. 200 = written, 202 = accepted (write still in flight after the
 /// wait budget), 400 = unusable payload, 500 = database write failed.
+/// While capture is paused (task 4.4), valid payloads are acknowledged and
+/// dropped — backfill's session cwd self-heal (3.4) recovers the mapping.
 pub async fn post_session(State(ingest): State<IngestState>, body: Bytes) -> Response {
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -70,6 +72,9 @@ pub async fn post_session(State(ingest): State<IngestState>, body: Bytes) -> Res
     let Some(mapping) = parse_hook_payload(&payload) else {
         return bad_request("missing or empty session_id");
     };
+    if ingest.paused() {
+        return (StatusCode::OK, Json(json!({}))).into_response();
+    }
 
     let db = Arc::clone(&ingest.db);
     let write = tokio::task::spawn_blocking(move || upsert_session(&db, &mapping, now_ms()));
