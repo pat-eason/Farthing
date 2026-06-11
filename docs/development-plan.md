@@ -252,7 +252,7 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
-| 5.1 | Desktop window shell & navigation | Full window from tray, view navigation, activation policy flip, dark/light | High | M | 4.1 | <!-- vk: --> |
+| 5.1 | Desktop window shell & navigation | Full window from tray, view navigation, activation policy flip, dark/light | High | M | 4.1 | done <!-- vk: --> |
 | 5.2 | Faceted query layer | Tauri commands wrapping SQL aggregations with shared facet params (project, model, date range, query_source); seed-data script for dev | High | M | 1.2 | <!-- vk: --> |
 | 5.3 | Cost-over-time view | Line/bar chart, day/week/month/all ranges, stack by model or project | High | M | 5.1, 5.2 | <!-- vk: --> |
 | 5.4 | Sessions view | Sortable table (cost, tokens, duration, project, models) + per-session detail drill-in | Medium | M | 5.1, 5.2 | <!-- vk: --> |
@@ -262,9 +262,9 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 ### Task Details
 
 **5.1 - Desktop window shell & navigation**
-- [ ] Window opens from tray menu and popover; closing returns to Accessory mode
-- [ ] Navigation between the four views preserves active facet selections
-- [ ] Respects system dark/light appearance
+- [x] Window opens from tray menu and popover; closing returns to Accessory mode — tray-menu path existed since 4.1; new `open_main_window` command (`src-tauri/src/tray.rs`, main-thread-dispatched) backs an "Open Claude Usage Tracker" footer button in the popover (popover hidden explicitly on handoff). Live-verified with synthetic clicks + `lsappinfo`: tray menu → window shown, `ApplicationType` flipped `UIElement`→`Foreground`; close button → window hidden (0 AX windows), flipped back to `UIElement`, app resident; popover button → same Foreground flip with the popover dismissed. Main window now 1100x720 (min 800x560, centered)
+- [x] Navigation between the four views preserves active facet selections — shell layout `src/routes/(app)/+layout.svelte` (sidebar: four views + Health/Settings, which moved into the group with URLs unchanged) around stub view pages (5.3-5.6 fill them in); shared facet state in `src/lib/facets.svelte.ts` (range/source/project/model, module-level `$state` so it survives navigation and window close/reopen) edited via `FacetBar.svelte`. "/" now auto-forwards to `/cost` when already configured (onboarding unchanged otherwise). Verified in-browser (facets set on /cost survived the full cost→sessions→tokens→projects→cost round trip) and in the live app (Source=Subagents only set on Cost persisted onto Sessions, Clear (1) shown)
+- [x] Respects system dark/light appearance — all new shell/facet/stub styles carry `prefers-color-scheme: dark` variants like the existing pages. Verified via playwright `emulateMedia` (light/dark computed colors + screenshots) and live: the running window re-rendered correctly when system appearance was toggled light↔dark via AppleScript, no restart
 
 **5.2 - Faceted query layer**
 - [ ] One shared facet struct (project, model, date range, query_source) applied across all aggregation commands
