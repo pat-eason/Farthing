@@ -7,12 +7,26 @@
   // view is open so a restarted Claude Code session shows up without
   // clicking anything.
   import { resolve } from "$app/paths";
+  import { getDiffReport, runBackfill, type DiffReport } from "$lib/backfill";
   import { getHealthStatus, type HealthStatus } from "$lib/health";
 
   const REFRESH_INTERVAL_MS = 5_000;
+  /** Capture-completeness target from the PRD success metrics. */
+  const MISSING_PCT_TARGET = 1;
 
   let health: HealthStatus | undefined = $state();
   let errorMessage = $state("");
+
+  // "Backfill now" (task 3.5): trigger in flight + outcome message.
+  let backfillRunning = $state(false);
+  let backfillMessage = $state("");
+  let backfillFailed = $state(false);
+
+  // Capture report (task 3.5).
+  let reportWindowHours = $state(168);
+  let reportRunning = $state(false);
+  let report: DiffReport | undefined = $state();
+  let reportError = $state("");
 
   async function refresh() {
     try {
@@ -20,6 +34,39 @@
       errorMessage = "";
     } catch (err) {
       errorMessage = String(err);
+    }
+  }
+
+  async function backfillNow() {
+    backfillRunning = true;
+    backfillMessage = "";
+    backfillFailed = false;
+    try {
+      const summary = await runBackfill();
+      backfillMessage =
+        summary.requests_inserted === 0
+          ? "Pass complete: everything was already up to date."
+          : `Pass complete: recovered ${summary.requests_inserted} request${
+              summary.requests_inserted === 1 ? "" : "s"
+            } from transcripts.`;
+    } catch (err) {
+      backfillMessage = String(err);
+      backfillFailed = true;
+    } finally {
+      backfillRunning = false;
+      void refresh();
+    }
+  }
+
+  async function generateReport() {
+    reportRunning = true;
+    reportError = "";
+    try {
+      report = await getDiffReport(reportWindowHours);
+    } catch (err) {
+      reportError = String(err);
+    } finally {
+      reportRunning = false;
     }
   }
 
@@ -147,10 +194,80 @@
 
     <section class="card">
       <h2>Backfill</h2>
-      {#if health.backfill.state === "not_available"}
+      {#if health.backfill.running || backfillRunning}
+        <p class="warn">A backfill pass is running…</p>
+      {:else if health.backfill.last}
+        <p>
+          Last pass finished <strong>{formatAgo(health.backfill.last.finished_ms)}</strong>
+          <span class="muted">({formatWhen(health.backfill.last.finished_ms)})</span>: read {health
+            .backfill.last.files_read} of {health.backfill.last.files_discovered}
+          transcript files, recovered {health.backfill.last.requests_inserted} requests ({health
+            .backfill.last.requests_deduped} already captured live), healed
+          {health.backfill.last.sessions_healed} sessions.
+        </p>
+      {:else}
+        <p class="muted">No backfill pass has completed yet.</p>
+      {/if}
+      {#if backfillMessage}
+        <p class={backfillFailed ? "bad" : "good"}>{backfillMessage}</p>
+      {/if}
+      <div class="row">
+        <button
+          onclick={() => void backfillNow()}
+          disabled={backfillRunning || health.backfill.running}
+        >
+          {backfillRunning || health.backfill.running ? "Running…" : "Backfill now"}
+        </button>
+      </div>
+
+      <h3>Capture report</h3>
+      <p class="muted">
+        Compares requests captured live (OTel) against the transcripts Claude Code writes (ground
+        truth). Target: less than {MISSING_PCT_TARGET}% missing.
+      </p>
+      <div class="row">
+        <select bind:value={reportWindowHours} disabled={reportRunning}>
+          <option value={24}>Last 24 hours</option>
+          <option value={168}>Last 7 days</option>
+          <option value={720}>Last 30 days</option>
+        </select>
+        <button onclick={() => void generateReport()} disabled={reportRunning}>
+          {reportRunning ? "Generating…" : "Generate report"}
+        </button>
+      </div>
+      {#if reportError}
+        <p class="bad">{reportError}</p>
+      {:else if report}
+        <ul class="stats">
+          <li>
+            {report.transcript_requests} requests in transcripts (ground truth, since
+            {formatWhen(report.window_start_ms)})
+          </li>
+          <li>{report.matched} matched: captured live and present in transcripts</li>
+          <li>
+            {report.backfill_only} backfill-only: missed by live capture, recovered from transcripts
+          </li>
+          <li class="muted">
+            {report.otel_only} OTel-only: captured live but no longer in transcripts (normal once Claude
+            Code cleans up old files)
+          </li>
+        </ul>
+        {#if report.missing_pct === null}
+          <p class="muted">No transcript activity in this window, so there is nothing to miss.</p>
+        {:else}
+          <p class={report.missing_pct < MISSING_PCT_TARGET ? "good" : "warn"}>
+            {report.missing_pct.toFixed(2)}% of transcript requests were missed by live capture
+            (target: &lt;{MISSING_PCT_TARGET}%).
+            {#if report.missing_pct >= MISSING_PCT_TARGET}
+              Expected when history predates this app or it was recently installed; all missed
+              requests were recovered by backfill.
+            {/if}
+          </p>
+        {/if}
         <p class="muted">
-          Transcript backfill (importing history from before this app was installed) is not
-          available yet; it ships in a later release.
+          Scanned {report.files_scanned} transcript files{report.io_errors > 0
+            ? ` (${report.io_errors} unreadable, skipped)`
+            : ""}.
         </p>
       {/if}
     </section>
@@ -178,6 +295,11 @@
   h2 {
     font-size: 1.05rem;
     margin: 0 0 0.5rem;
+  }
+
+  h3 {
+    font-size: 0.95rem;
+    margin: 1rem 0 0.35rem;
   }
 
   .card {
@@ -237,6 +359,7 @@
   }
 
   button,
+  select,
   .button-link {
     border-radius: 8px;
     border: 1px solid rgba(0, 0, 0, 0.15);
@@ -252,8 +375,15 @@
   }
 
   button:hover,
+  select:hover,
   .button-link:hover {
     border-color: #396cd8;
+  }
+
+  button:disabled,
+  select:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -278,6 +408,7 @@
     }
 
     button,
+    select,
     .button-link {
       color: #ffffff;
       background-color: #0f0f0f98;

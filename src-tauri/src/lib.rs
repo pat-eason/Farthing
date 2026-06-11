@@ -74,6 +74,8 @@ pub fn run() {
             receiver::receiver_status,
             ingest::ingest_stats,
             backfill::backfill_status,
+            backfill::backfill_run,
+            backfill::backfill_diff_report,
             health::health_status,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,

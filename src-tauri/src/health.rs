@@ -11,8 +11,8 @@
 //!   (this launch) and the newest stored `requests` row (survives restarts)
 //! - the ingest counters from task 1.4 (`events_ingested`,
 //!   `ingest_failures`, `events_skipped`)
-//! - backfill progress: a [`BackfillStatus::NotAvailable`] placeholder until
-//!   the transcript backfill engine ships (Epic 3)
+//! - backfill progress: the live [`BackfillInfo`] (running flag + last pass
+//!   summary) from the Epic 3 engine
 //!
 //! It also runs the "configured but no events" detector: when the config is
 //! installed but nothing has arrived in [`NO_EVENTS_THRESHOLD_MINUTES`], the
@@ -25,6 +25,7 @@ use std::path::Path;
 use serde::Serialize;
 use tauri::{Manager, Runtime};
 
+use crate::backfill::{BackfillInfo, BackfillState};
 use crate::db::Db;
 use crate::ingest::{IngestState, IngestStatsSnapshot};
 use crate::receiver::{ReceiverState, ReceiverStatus};
@@ -92,16 +93,6 @@ pub fn config_state(settings_path: &Path) -> ConfigState {
     } else {
         ConfigState::Missing
     }
-}
-
-/// Transcript backfill progress. Placeholder until the backfill engine
-/// ships (Epic 3): the only variant is `not_available`, which the health
-/// view renders as "not available yet". Epic 3 extends this with real
-/// progress variants without changing the health view's contract.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum BackfillStatus {
-    NotAvailable,
 }
 
 /// One likely cause in a [`NoEventsDiagnosis`], with a stable machine kind
@@ -197,13 +188,22 @@ pub struct HealthStatus {
     pub last_event_ms: Option<i64>,
     /// All-time `requests` rows received live (`source = 'otel'`).
     pub events_stored: u64,
-    pub backfill: BackfillStatus,
+    /// Transcript backfill: running flag + the last completed pass.
+    pub backfill: BackfillInfo,
     /// Present when the "configured but no events" detector fired.
     pub no_events: Option<NoEventsDiagnosis>,
 }
 
+/// Count and newest event time of live-received (`source='otel'`) rows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StoredEvents {
+    pub count: u64,
+    /// Event time of the newest stored row; `None` when no rows exist.
+    pub last_event_ms: Option<i64>,
+}
+
 /// Pure assembly of [`HealthStatus`] from its inputs (testable without an
-/// app handle). `db_last_event_ms` is event time from stored rows;
+/// app handle). `stored.last_event_ms` is event time from stored rows;
 /// `ingest.last_event_ms` is the wall clock of the last live ingest (0 =
 /// never this launch). The freshest of the two is "last event received".
 pub fn compute_health(
@@ -211,13 +211,13 @@ pub fn compute_health(
     config: ConfigState,
     settings_path: String,
     ingest: IngestStatsSnapshot,
-    events_stored: u64,
-    db_last_event_ms: Option<i64>,
+    stored: StoredEvents,
+    backfill: BackfillInfo,
     now_ms: i64,
 ) -> HealthStatus {
     let last_event_ms = [
         (ingest.last_event_ms > 0).then_some(ingest.last_event_ms),
-        db_last_event_ms,
+        stored.last_event_ms,
     ]
     .into_iter()
     .flatten()
@@ -229,18 +229,23 @@ pub fn compute_health(
         settings_path,
         ingest,
         last_event_ms,
-        events_stored,
-        backfill: BackfillStatus::NotAvailable,
+        events_stored: stored.count,
+        backfill,
         no_events,
     }
 }
 
-/// Count and newest event time of live-received rows.
-fn db_event_stats(db: &Db) -> Result<(u64, Option<i64>), rusqlite::Error> {
+/// Query the [`StoredEvents`] aggregate.
+fn db_event_stats(db: &Db) -> Result<StoredEvents, rusqlite::Error> {
     db.conn().query_row(
         "SELECT COUNT(*), MAX(timestamp_ms) FROM requests WHERE source = 'otel'",
         [],
-        |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+        |row| {
+            Ok(StoredEvents {
+                count: row.get::<_, i64>(0)? as u64,
+                last_event_ms: row.get(1)?,
+            })
+        },
     )
 }
 
@@ -255,10 +260,16 @@ pub fn current_health<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<HealthSta
         .clone();
     let ingest_state = app.state::<IngestState>();
     let ingest = ingest_state.stats.snapshot();
-    let (events_stored, db_last_event_ms) = {
+    let stored = {
         let db = ingest_state.db.lock().expect("db mutex poisoned");
         db_event_stats(&db).map_err(|err| format!("cannot query event stats: {err}"))?
     };
+    let backfill = app
+        .state::<BackfillState>()
+        .0
+        .lock()
+        .expect("backfill mutex poisoned")
+        .clone();
     let settings_path = crate::onboarding::settings_path(app)?;
     let config = config_state(&settings_path);
     let now_ms = std::time::SystemTime::now()
@@ -270,8 +281,8 @@ pub fn current_health<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<HealthSta
         config,
         settings_path.display().to_string(),
         ingest,
-        events_stored,
-        db_last_event_ms,
+        stored,
+        backfill,
         now_ms,
     ))
 }
@@ -485,8 +496,11 @@ mod tests {
             ConfigState::Installed,
             "p".into(),
             snapshot(NOW_MS - MINUTE_MS),
-            10,
-            Some(NOW_MS - 5 * MINUTE_MS),
+            StoredEvents {
+                count: 10,
+                last_event_ms: Some(NOW_MS - 5 * MINUTE_MS),
+            },
+            BackfillInfo::default(),
             NOW_MS,
         );
         assert_eq!(fresher_memory.last_event_ms, Some(NOW_MS - MINUTE_MS));
@@ -498,8 +512,11 @@ mod tests {
             ConfigState::Installed,
             "p".into(),
             snapshot(0),
-            10,
-            Some(NOW_MS - 5 * MINUTE_MS),
+            StoredEvents {
+                count: 10,
+                last_event_ms: Some(NOW_MS - 5 * MINUTE_MS),
+            },
+            BackfillInfo::default(),
             NOW_MS,
         );
         assert_eq!(db_only.last_event_ms, Some(NOW_MS - 5 * MINUTE_MS));
@@ -509,13 +526,13 @@ mod tests {
             ConfigState::Installed,
             "p".into(),
             snapshot(0),
-            0,
-            None,
+            StoredEvents::default(),
+            BackfillInfo::default(),
             NOW_MS,
         );
         assert_eq!(never.last_event_ms, None);
         assert!(never.no_events.is_some(), "configured + never = detector");
-        assert_eq!(never.backfill, BackfillStatus::NotAvailable);
+        assert_eq!(never.backfill, BackfillInfo::default());
     }
 
     // ---- command wiring over a real (mock-runtime) app ----
@@ -544,6 +561,9 @@ mod tests {
             .expect("mock app");
         app.manage(ReceiverState(status_cell));
         app.manage(ingest);
+        let backfill_state = BackfillState::default();
+        backfill_state.0.lock().unwrap().running = true;
+        app.manage(backfill_state);
 
         // Point the settings resolution at the temp file (dev override).
         std::env::set_var(crate::onboarding::SETTINGS_PATH_ENV, &settings);
@@ -556,6 +576,9 @@ mod tests {
         assert_eq!(health.settings_path, settings.display().to_string());
         assert_eq!(health.events_stored, 1);
         assert_eq!(health.last_event_ms, Some(1_781_200_718_939));
+        // Backfill state is read live from the managed BackfillState.
+        assert!(health.backfill.running);
+        assert_eq!(health.backfill.last, None);
         // That event is ancient relative to the real clock: detector fires.
         let diagnosis = health.no_events.expect("detector fired");
         assert!(diagnosis.minutes_since_last.unwrap() >= NO_EVENTS_THRESHOLD_MINUTES);
@@ -575,8 +598,11 @@ mod tests {
                 events_skipped: 3,
                 last_event_ms: NOW_MS - 20 * MINUTE_MS,
             },
-            5,
-            None,
+            StoredEvents {
+                count: 5,
+                last_event_ms: None,
+            },
+            BackfillInfo::default(),
             NOW_MS,
         );
         let value = serde_json::to_value(&health).unwrap();
@@ -594,7 +620,7 @@ mod tests {
                 },
                 "last_event_ms": NOW_MS - 20 * MINUTE_MS,
                 "events_stored": 5,
-                "backfill": {"state": "not_available"},
+                "backfill": {"running": false, "last": null},
                 "no_events": {
                     "threshold_minutes": NO_EVENTS_THRESHOLD_MINUTES,
                     "minutes_since_last": 20,
