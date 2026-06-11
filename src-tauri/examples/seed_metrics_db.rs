@@ -83,7 +83,10 @@ fn seed(db: &Db, rows: i64, now_ms: i64) {
             let age_ms = if i % 8 == 0 {
                 mix % DAY_MS
             } else {
-                DAY_MS + (mix * 37) % ((DAYS - 1) * DAY_MS)
+                // The multiplier must exceed the modulus (~6.4e9) or the
+                // spread silently collapses onto the first hours of the
+                // window (`mix < 1e6`, so `mix * 37` < 10.3h).
+                DAY_MS + (mix * 6_700_417) % ((DAYS - 1) * DAY_MS)
             };
             // ~1/23 of rows reference a session with no sessions row at all:
             // the second unknown-project flavor.

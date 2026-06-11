@@ -4,7 +4,7 @@
 // exactly (asserted by the queries.rs serde tests).
 
 import { invoke } from "@tauri-apps/api/core";
-import type { FacetSelection } from "$lib/facets.svelte";
+import { UNKNOWN_PROJECT_OPTION, type FacetSelection } from "$lib/facets.svelte";
 
 /** Date-range facet: a preset or an explicit [start, end) unix-ms window. */
 export type RangeFacet =
@@ -26,13 +26,36 @@ export interface Facets {
   query_source?: "all" | "main" | "subagent";
 }
 
+/** Local midnight (unix ms) of a `yyyy-mm-dd` date plus `dayOffset` days;
+ * null when the string isn't a complete date. DST-correct: `Date` resolves
+ * calendar components in the local zone, same contract as the backend's
+ * preset boundaries. */
+function localMidnightMs(isoDate: string, dayOffset = 0): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
+  if (!match) return null;
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + dayOffset).getTime();
+}
+
+/** Resolve the range selection: presets pass through; a custom selection
+ * becomes an explicit `[start, end)` window (both picked dates inclusive,
+ * so the end bound is the next local midnight). Incomplete custom dates
+ * fall back to "all" until both are picked. */
+function toRange(selection: FacetSelection): RangeFacet {
+  if (selection.range !== "custom") return selection.range;
+  const startMs = localMidnightMs(selection.customStart);
+  const endMs = localMidnightMs(selection.customEnd, 1);
+  if (startMs === null || endMs === null) return "all";
+  return { custom: { start_ms: startMs, end_ms: endMs } };
+}
+
 /** Convert the UI facet state (task 5.1) into command parameters. */
 export function toFacets(selection: FacetSelection): Facets {
   const project = selection.project.trim();
   const model = selection.model.trim();
   return {
-    range: selection.range,
-    project: project === "" ? "all" : { cwd: project },
+    range: toRange(selection),
+    project:
+      project === "" ? "all" : project === UNKNOWN_PROJECT_OPTION ? "unknown" : { cwd: project },
     model: model === "" ? null : model,
     query_source: selection.querySource,
   };
