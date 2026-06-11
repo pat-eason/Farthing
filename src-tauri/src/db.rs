@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
@@ -105,8 +105,9 @@ pub struct Db {
 }
 
 /// Tauri-managed wrapper. `rusqlite::Connection` is `Send` but not `Sync`,
-/// so shared app state goes through a mutex.
-pub struct DbState(pub Mutex<Db>);
+/// so shared app state goes through a mutex; the `Arc` lets the ingest
+/// pipeline (axum task) share the same handle.
+pub struct DbState(pub Arc<Mutex<Db>>);
 
 impl Db {
     /// Open (creating if necessary) `usage.db` inside `dir`, creating the
