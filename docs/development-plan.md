@@ -47,7 +47,7 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
-| 1.1 | Scaffold Tauri v2 app | Tauri v2 + Svelte/TS template, repo init, basic window, dev/build scripts, CI build check | High | M | — | <!-- vk: --> |
+| 1.1 | Scaffold Tauri v2 app | Tauri v2 + Svelte/TS template, repo init, basic window, dev/build scripts, CI build check | High | M | — | done <!-- vk: --> |
 | 1.2 | SQLite layer & schema | rusqlite + WAL, App Support path resolution, embedded migrations, tables: `requests`, `sessions`, `ingest_state`, `meta` | High | M | 1.1 | <!-- vk: --> |
 | 1.3 | axum OTLP receiver | Localhost-only server on fixed port 43177, `POST /v1/logs`, `POST /v1/metrics` (accept + discard), port-in-use detection (no auto-rebind) | High | M | 1.1 | <!-- vk: --> |
 | 1.4 | OTel event ingestion | Parse `claude_code.api_request` / `api_error` from OTLP `http/json` into `requests` rows (cost_usd, 4 token counts, model, query_source, session.id, ts); version-tolerant | High | M | 1.2, 1.3 | <!-- vk: --> |
@@ -57,9 +57,9 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 ### Task Details
 
 **1.1 - Scaffold Tauri v2 app**
-- [ ] `pnpm tauri dev` opens a window; `pnpm tauri build` produces a .app with no errors
-- [ ] Repo layout: `src/` (Svelte), `src-tauri/` (Rust), `docs/`, lint + format configs for both languages
-- [ ] GitHub Actions workflow runs check/clippy/build on push
+- [x] `pnpm tauri dev` opens a window; `pnpm tauri build` produces a .app with no errors
+- [x] Repo layout: `src/` (Svelte), `src-tauri/` (Rust), `docs/`, lint + format configs for both languages
+- [x] GitHub Actions workflow runs check/clippy/build on push
 
 **1.2 - SQLite layer & schema**
 - [ ] DB created at `~/Library/Application Support/<app>/usage.db` on first boot; WAL mode confirmed via pragma
