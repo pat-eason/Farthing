@@ -159,7 +159,7 @@ Day-one history and gap recovery: JSONL parsing, pricing, dedup against live row
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
 | 3.1 | Spike: dedup identity | Verify whether `api_request` OTel events carry an identifier matching transcript `requestId`; decide exact dedup key (exact-id vs session_id+ts-window+token-signature); document | High | S | 1.6 | done <!-- vk: --> |
-| 3.2 | Transcript JSONL parser | Parse `~/.claude/projects/**/*.jsonl`: per-assistant-message usage (incl. 5m/1h cache split), model, sessionId, cwd, timestamp, isSidechain; tolerant of unknown line types | High | M | — | <!-- vk: --> |
+| 3.2 | Transcript JSONL parser | Parse `~/.claude/projects/**/*.jsonl`: per-assistant-message usage (incl. 5m/1h cache split), model, sessionId, cwd, timestamp, isSidechain; tolerant of unknown line types | High | M | — | done <!-- vk: --> |
 | 3.3 | Pricing table | Bundled versioned per-model pricing data + fail-silent remote refresh (pinned LiteLLM URL, local cache); cost computation incl. cache read/write multipliers; unknown-model → tokens-only flag | High | M | — | <!-- vk: --> |
 | 3.4 | Backfill engine | First-run full pass + incremental passes via stored byte offsets; dedup per 3.1; source tagging (otel/backfill); session→cwd self-heal from transcripts | High | L | 1.2, 3.1, 3.2, 3.3 | <!-- vk: --> |
 | 3.5 | Backfill diff report & manual trigger | "Backfill now" action; report comparing OTel rows vs transcript ground truth over a window (capture-completeness metric) | Medium | S | 3.4 | <!-- vk: --> |
@@ -172,9 +172,9 @@ Day-one history and gap recovery: JSONL parsing, pricing, dedup against live row
 - [x] PRD FR-4 dedup bullet updated with the verified answer — FR-4 bullet and the double-counting risk row now state the verified `request_id` key
 
 **3.2 - Transcript JSONL parser**
-- [ ] Extracts input/output/cache_read/cache_creation (with ephemeral_5m/1h breakdown), model, sessionId, cwd, timestamp, isSidechain from assistant messages
-- [ ] Skips non-assistant lines and unknown line types without error; malformed lines counted, not fatal
-- [ ] Fixture tests against real transcript files (sanitized) covering main + sidechain messages
+- [x] Extracts input/output/cache_read/cache_creation (with ephemeral_5m/1h breakdown), model, sessionId, cwd, timestamp, isSidechain from assistant messages — `src-tauri/src/transcript.rs`: `parse_file`/`parse_file_from(path, offset)`/`parse_reader` → `AssistantUsage` per line (RFC 3339 → unix ms, numeric-string-tolerant counts, 5m/1h split `None` when absent), plus `collapse_requests` applying the 3.1 rules (last non-zero-usage line per `requestId`, `<synthetic>`/id-less lines dropped — including the corpus case where a synthetic all-zero line *carries* the requestId). `bytes_consumed` excludes a trailing unterminated line: the byte-offset contract for 3.4 incremental passes
+- [x] Skips non-assistant lines and unknown line types without error; malformed lines counted, not fatal — any non-`assistant` `type` (known or future) → `skipped_lines`; invalid JSON / non-objects → `malformed_lines`; assistant lines missing sessionId/timestamp/usage → `invalid_assistant_lines`. Verified beyond fixtures with a full read-only corpus run (`cargo run --example parse_transcripts -- ~/.claude/projects`): 1,314 files / 186,857 lines / 84,963 assistant lines / 43,087 collapsed requests == distinct requestIds, 0 malformed, 0 invalid — every count exactly matching an independent Python scan of a frozen snapshot
+- [x] Fixture tests against real transcript files (sanitized) covering main + sidechain messages — `tests/fixtures/transcripts/{main-session,sidechain,edge-cases}.jsonl`, all derived line-for-line from real transcripts (usage/ids/timestamps verbatim, content redacted; provenance in the fixtures README): main session with 2 streaming groups, subagent sidechain lines (`isSidechain: true`, 5m-split), and the 3.1 corpus oddities (cumulative growth 5→1004, trailing synthetic-with-requestId, requestId-less synthetic, unknown future type, truncated line). 11 new tests; 99 total green
 
 **3.3 - Pricing table**
 - [ ] Bundled data file covers current model families; computation applies cache-read (~0.1×) and cache-write (1.25×/2× by TTL) multipliers
