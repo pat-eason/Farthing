@@ -52,7 +52,7 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 | 1.3 | axum OTLP receiver | Localhost-only server on fixed port 43177, `POST /v1/logs`, `POST /v1/metrics` (accept + discard), port-in-use detection (no auto-rebind) | High | M | 1.1 | done <!-- vk: --> |
 | 1.4 | OTel event ingestion | Parse `claude_code.api_request` / `api_error` from OTLP `http/json` into `requests` rows (cost_usd, 4 token counts, model, query_source, session.id, ts); version-tolerant | High | M | 1.2, 1.3 | done <!-- vk: --> |
 | 1.5 | Session mapping endpoint | `POST /session` accepting SessionStart hook stdin JSON; upsert `session_id → cwd` into `sessions` | High | S | 1.2, 1.3 | done <!-- vk: --> |
-| 1.6 | End-to-end pipeline verification | Manually configure a Claude Code session against the receiver; assert row counts/values vs the session transcript; document findings | High | M | 1.4, 1.5 | <!-- vk: --> |
+| 1.6 | End-to-end pipeline verification | Manually configure a Claude Code session against the receiver; assert row counts/values vs the session transcript; document findings | High | M | 1.4, 1.5 | done <!-- vk: --> |
 
 ### Task Details
 
@@ -85,10 +85,10 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 - [x] Responds within 100ms and never blocks on DB contention (hook curl has a 2s timeout) — handler waits ≤50ms for the write, then responds 202 and lets the write land in the background; covered by a contention test
 
 **1.6 - End-to-end pipeline verification**
-- [ ] With env vars set manually in a shell, a Claude Code session produces ≥1 row per API request in `requests`
-- [ ] Row token counts reconcile with the session's transcript `message.usage` values
-- [ ] `sessions` contains the session's cwd mapping via the manually-configured hook
-- [ ] Findings (event schema observations, request-identity fields seen) written to `docs/notes/otel-schema.md` — feeds spike 3.1
+- [x] With env vars set manually in a shell, a Claude Code session produces ≥1 row per API request in `requests` — verified via `cargo run --example e2e_receiver` + real `claude -p` runs (1-request turn → 1 row; 2-request tool-use turn → 2 rows). Signal-specific `OTEL_EXPORTER_OTLP_LOGS_{PROTOCOL,ENDPOINT}` required; generic vars alone export nothing
+- [x] Row token counts reconcile with the session's transcript `message.usage` values — all 4 token counts exact on all 3 requests; `SUM(cost_usd)` matches CLI `total_cost_usd` to the digit
+- [x] `sessions` contains the session's cwd mapping via the manually-configured hook (`--settings` file; all 5 e2e sessions mapped, source='hook')
+- [x] Findings (event schema observations, request-identity fields seen) written to `docs/notes/otel-schema.md` — feeds spike 3.1 (`request_id` == transcript `requestId` exactly; transcript lines not 1:1 with requests)
 
 ---
 
