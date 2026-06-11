@@ -37,7 +37,31 @@
 //! cleanly next pass. A file *shorter* than its stored offset was replaced
 //! or truncated; its offset resets to 0 and the unique index makes the
 //! re-read idempotent.
+//!
+//! # Manual trigger & diff report (task 3.5)
+//!
+//! [`backfill_run`] is the "Backfill now" command: the same incremental
+//! [`run_pass`], on demand, guarded so only one pass runs at a time (the
+//! `running` flag doubles as the progress signal for the UI).
+//!
+//! [`backfill_diff_report`] quantifies capture completeness (PRD success
+//! metric: <1% of API requests missing vs transcript ground truth). It
+//! re-parses the transcripts in the window from byte 0 (ground truth is
+//! independent of stored ingest offsets) and compares the collapsed
+//! `requestId` set against stored `source='otel'` rows:
+//!
+//! - **matched**: in transcripts *and* captured live
+//! - **backfill-only**: in transcripts but missed by the live pipeline
+//!   (these exist in the DB only because backfill recovered them)
+//! - **otel-only**: captured live but absent from transcripts (e.g. the
+//!   transcript file was cleaned up since)
+//!
+//! The two sources timestamp the same request slightly differently (OTel
+//! event time vs transcript line time), so set membership at the window
+//! edge uses a ±[`DIFF_BOUNDARY_SLACK_MS`] grace band to avoid spurious
+//! mismatches.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -96,9 +120,23 @@ pub struct BackfillInfo {
 }
 
 /// Tauri-managed backfill state, shared between the startup pass, the
-/// `backfill_status` command, and 3.5's manual trigger.
+/// `backfill_status` command, and the 3.5 manual trigger.
 #[derive(Clone, Default)]
 pub struct BackfillState(pub Arc<Mutex<BackfillInfo>>);
+
+impl BackfillState {
+    /// Atomically claim the running flag. `false` means a pass is already
+    /// executing (startup or manual) and the caller must not start another.
+    fn try_begin(&self) -> bool {
+        let mut info = self.0.lock().expect("backfill mutex poisoned");
+        if info.running {
+            false
+        } else {
+            info.running = true;
+            true
+        }
+    }
+}
 
 /// Query the backfill state from the frontend.
 #[tauri::command]
@@ -136,6 +174,39 @@ pub fn run_pass(
     info.running = false;
     info.last = Some(summary.clone());
     summary
+}
+
+/// "Backfill now": one incremental pass, refused while another pass is
+/// already running. The pass itself is identical to the startup pass.
+pub fn run_manual(
+    db: &Arc<Mutex<Db>>,
+    pricing: &PricingState,
+    state: &BackfillState,
+    root: &Path,
+) -> Result<BackfillSummary, String> {
+    if !state.try_begin() {
+        return Err("A backfill pass is already running.".to_string());
+    }
+    Ok(run_pass(db, pricing, state, root))
+}
+
+/// Frontend "Backfill now" trigger. Runs on a blocking thread (file I/O +
+/// DB writes); progress is observable via `backfill_status` (`running`)
+/// while the returned future is pending.
+#[tauri::command]
+pub async fn backfill_run<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    db: tauri::State<'_, crate::db::DbState>,
+    pricing: tauri::State<'_, PricingState>,
+    state: tauri::State<'_, BackfillState>,
+) -> Result<BackfillSummary, String> {
+    let db = Arc::clone(&db.0);
+    let pricing = pricing.inner().clone();
+    let state = state.inner().clone();
+    let root = projects_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || run_manual(&db, &pricing, &state, &root))
+        .await
+        .map_err(|err| format!("backfill task failed: {err}"))?
 }
 
 /// The pass itself, without state bookkeeping. A missing root (fresh
@@ -441,6 +512,162 @@ fn merge_parse_stats(total: &mut ParseStats, stats: &ParseStats) {
     total.skipped_lines += stats.skipped_lines;
     total.malformed_lines += stats.malformed_lines;
     total.invalid_assistant_lines += stats.invalid_assistant_lines;
+}
+
+// ---- capture-completeness diff report (task 3.5) ----
+
+/// Grace band at the window edge: the same request is timestamped slightly
+/// differently by OTel (event time) and the transcript (line time), so a
+/// request within this distance *outside* the window still counts for set
+/// membership (never toward the headline counts).
+pub const DIFF_BOUNDARY_SLACK_MS: i64 = 10 * 60 * 1000;
+
+/// Skip transcript files last modified this long before the window start: a
+/// line's timestamp precedes the write that appended it, so such files
+/// cannot contain in-window lines. Generous to absorb clock skew.
+const DIFF_MTIME_SLACK_MS: i64 = 60 * 60 * 1000;
+
+/// Capture-completeness report: stored live (`otel`) rows vs transcript
+/// ground truth over a window. PRD target: `missing_pct` < 1%.
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
+pub struct DiffReport {
+    pub window_hours: u32,
+    /// Unix ms of the window start (`generated_ms - window_hours`).
+    pub window_start_ms: i64,
+    pub generated_ms: i64,
+    /// Transcript files parsed for ground truth (mtime-filtered).
+    pub files_scanned: u64,
+    /// Ground truth: distinct transcript `requestId`s in the window.
+    pub transcript_requests: u64,
+    /// In transcripts *and* captured by the live OTel pipeline.
+    pub matched: u64,
+    /// In transcripts but missed live; stored only thanks to backfill.
+    pub backfill_only: u64,
+    /// Captured live but absent from transcripts (e.g. file cleaned up).
+    pub otel_only: u64,
+    /// `backfill_only / transcript_requests`, as a percentage. `None` when
+    /// the window holds no transcript ground truth.
+    pub missing_pct: Option<f64>,
+    /// Unreadable files/directories; skipped, never fatal.
+    pub io_errors: u64,
+    /// Aggregated line accounting across every file parsed.
+    pub parse: ParseStats,
+}
+
+/// Build the report. Read-only everywhere: transcripts are re-parsed from
+/// byte 0 (ground truth must not depend on stored ingest offsets) and the
+/// DB is only queried.
+pub fn diff_report(
+    db: &Arc<Mutex<Db>>,
+    root: &Path,
+    window_hours: u32,
+    now_ms: i64,
+) -> Result<DiffReport, String> {
+    let window_start_ms = now_ms - i64::from(window_hours) * 3_600_000;
+    let mut report = DiffReport {
+        window_hours,
+        window_start_ms,
+        generated_ms: now_ms,
+        ..DiffReport::default()
+    };
+
+    let mut files = Vec::new();
+    if root.is_dir() {
+        discover_jsonl(root, &mut files, &mut report.io_errors);
+    }
+
+    // Transcript ground truth: ids in the window, plus the edge band just
+    // before it (membership only).
+    let mut transcript_in = HashSet::new();
+    let mut transcript_near = HashSet::new();
+    for path in &files {
+        let mtime_ms = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        if mtime_ms.is_some_and(|m| m < window_start_ms - DIFF_MTIME_SLACK_MS) {
+            continue;
+        }
+        let parse = match transcript::parse_file(path) {
+            Ok(parse) => parse,
+            Err(_) => {
+                report.io_errors += 1;
+                continue;
+            }
+        };
+        report.files_scanned += 1;
+        merge_parse_stats(&mut report.parse, &parse.stats);
+        for request in transcript::collapse_requests(&parse.lines) {
+            let Some(id) = request.request_id else {
+                continue;
+            };
+            if request.timestamp_ms >= window_start_ms {
+                transcript_in.insert(id);
+            } else if request.timestamp_ms >= window_start_ms - DIFF_BOUNDARY_SLACK_MS {
+                transcript_near.insert(id);
+            }
+        }
+    }
+    report.transcript_requests = transcript_in.len() as u64;
+
+    // Live-captured rows, same window + edge band. `api_error` rows are
+    // excluded: transcripts only record successful assistant turns.
+    let mut otel_in = HashSet::new();
+    let mut otel_near = HashSet::new();
+    {
+        let db = db.lock().expect("db mutex poisoned");
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT request_id, timestamp_ms FROM requests
+                 WHERE source = 'otel' AND event_type = 'api_request'
+                   AND request_id IS NOT NULL AND timestamp_ms >= ?1",
+            )
+            .map_err(|err| format!("cannot query live rows: {err}"))?;
+        let rows = stmt
+            .query_map([window_start_ms - DIFF_BOUNDARY_SLACK_MS], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|err| format!("cannot query live rows: {err}"))?;
+        for row in rows {
+            let (id, timestamp_ms) = row.map_err(|err| format!("cannot read live row: {err}"))?;
+            if timestamp_ms >= window_start_ms {
+                otel_in.insert(id);
+            } else {
+                otel_near.insert(id);
+            }
+        }
+    }
+
+    report.matched = transcript_in
+        .iter()
+        .filter(|id| otel_in.contains(*id) || otel_near.contains(*id))
+        .count() as u64;
+    report.backfill_only = report.transcript_requests - report.matched;
+    report.otel_only = otel_in
+        .iter()
+        .filter(|id| !transcript_in.contains(*id) && !transcript_near.contains(*id))
+        .count() as u64;
+    report.missing_pct = (report.transcript_requests > 0)
+        .then(|| 100.0 * report.backfill_only as f64 / report.transcript_requests as f64);
+    Ok(report)
+}
+
+/// Frontend report query. Blocking work (transcript re-parse) runs on a
+/// blocking thread.
+#[tauri::command]
+pub async fn backfill_diff_report<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    db: tauri::State<'_, crate::db::DbState>,
+    window_hours: u32,
+) -> Result<DiffReport, String> {
+    let window_hours = window_hours.clamp(1, 24 * 366);
+    let db = Arc::clone(&db.0);
+    let root = projects_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || diff_report(&db, &root, window_hours, now_ms()))
+        .await
+        .map_err(|err| format!("diff report task failed: {err}"))?
 }
 
 fn now_ms() -> i64 {
@@ -791,5 +1018,165 @@ mod tests {
         assert_eq!(json["running"], false);
         assert_eq!(json["last"]["files_discovered"], 0);
         assert_eq!(json["last"]["parse"]["lines_read"], 0);
+    }
+
+    // ---- manual trigger (task 3.5) ----
+
+    #[test]
+    fn manual_trigger_runs_a_pass_and_refuses_while_one_is_running() {
+        let (db, pricing, state, dir) = test_env();
+        let root = fixture_root(dir.path());
+
+        // Simulate the startup pass mid-flight: the manual trigger refuses.
+        state.0.lock().unwrap().running = true;
+        let refused = run_manual(&db, &pricing, &state, &root);
+        assert!(refused.is_err());
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM requests"), 0);
+
+        // Once it finishes, the manual trigger is a normal incremental pass.
+        state.0.lock().unwrap().running = false;
+        let summary = run_manual(&db, &pricing, &state, &root).expect("manual pass");
+        assert_eq!(summary.requests_inserted, 4);
+        let info = state.0.lock().unwrap().clone();
+        assert!(!info.running);
+        assert_eq!(info.last, Some(summary));
+    }
+
+    // ---- capture-completeness diff report (task 3.5) ----
+
+    /// Timestamp of a stored request row (set from the transcript line).
+    fn row_ts(db: &Arc<Mutex<Db>>, request_id: &str) -> i64 {
+        let db = db.lock().unwrap();
+        db.conn()
+            .query_row(
+                "SELECT timestamp_ms FROM requests WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    const MAIN_REQ_1: &str = "req_011Cbwf9sGnBjoiZz25k4EK8";
+    const MAIN_REQ_2: &str = "req_011CbwfAFuopq3NdmbdDHmd2";
+
+    #[test]
+    fn diff_report_classifies_matched_backfill_only_and_otel_only() {
+        let (db, pricing, state, dir) = test_env();
+        let root = fixture_root(dir.path());
+        run_pass(&db, &pricing, &state, &root);
+
+        // Main request 1 was also captured live; one live row's transcript
+        // is gone (not in any fixture file).
+        let req2_ts = row_ts(&db, MAIN_REQ_2);
+        {
+            let db = db.lock().unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE requests SET source = 'otel' WHERE request_id = ?1",
+                    [MAIN_REQ_1],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO requests (request_id, session_id, timestamp_ms, source)
+                     VALUES ('req_transcript_cleaned_up', 'sess-gone', ?1, 'otel')",
+                    [req2_ts],
+                )
+                .unwrap();
+        }
+
+        // 30-day window covers all fixture activity (main + sidechain).
+        let now_ms = req2_ts + 3_600_000;
+        let report = diff_report(&db, &root, 24 * 30, now_ms).expect("report");
+        assert_eq!(report.files_scanned, 2);
+        assert_eq!(report.transcript_requests, 4);
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.backfill_only, 3);
+        assert_eq!(report.otel_only, 1);
+        assert_eq!(report.missing_pct, Some(75.0));
+        assert_eq!(report.io_errors, 0);
+        assert_eq!(report.window_start_ms, now_ms - 30 * 24 * 3_600_000);
+    }
+
+    #[test]
+    fn diff_report_window_excludes_older_requests() {
+        let (db, pricing, state, dir) = test_env();
+        let root = fixture_root(dir.path());
+        run_pass(&db, &pricing, &state, &root);
+
+        // 24h window around the main session: the two-week-older sidechain
+        // requests are outside the window and outside the edge band.
+        let now_ms = row_ts(&db, MAIN_REQ_2) + 3_600_000;
+        let report = diff_report(&db, &root, 24, now_ms).expect("report");
+        assert_eq!(report.transcript_requests, 2);
+        assert_eq!(report.matched, 0); // everything stored is backfill
+        assert_eq!(report.backfill_only, 2);
+        assert_eq!(report.otel_only, 0);
+        assert_eq!(report.missing_pct, Some(100.0));
+    }
+
+    #[test]
+    fn diff_report_edge_band_absolves_window_boundary_timestamp_skew() {
+        let (db, pricing, state, dir) = test_env();
+        let root = fixture_root(dir.path());
+        run_pass(&db, &pricing, &state, &root);
+
+        // Window starts between the two main requests (9s apart, well
+        // within the edge band): transcript ground truth = request 2 only.
+        let req1_ts = row_ts(&db, MAIN_REQ_1);
+        let req2_ts = row_ts(&db, MAIN_REQ_2);
+        let window_start_ms = (req1_ts + req2_ts) / 2;
+        let now_ms = window_start_ms + 3_600_000;
+        {
+            let db = db.lock().unwrap();
+            // Request 2 captured live, but its OTel event time fell just
+            // before the window start: still matched, not backfill-only.
+            db.conn()
+                .execute(
+                    "UPDATE requests SET source = 'otel', timestamp_ms = ?2
+                     WHERE request_id = ?1",
+                    rusqlite::params![MAIN_REQ_2, window_start_ms - 60_000],
+                )
+                .unwrap();
+            // Request 1 captured live with event time just inside the
+            // window, transcript line just before it: not otel-only.
+            db.conn()
+                .execute(
+                    "UPDATE requests SET source = 'otel', timestamp_ms = ?2
+                     WHERE request_id = ?1",
+                    rusqlite::params![MAIN_REQ_1, window_start_ms + 1_000],
+                )
+                .unwrap();
+        }
+
+        let report = diff_report(&db, &root, 1, now_ms).expect("report");
+        assert_eq!(report.transcript_requests, 1);
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.backfill_only, 0);
+        assert_eq!(report.otel_only, 0);
+        assert_eq!(report.missing_pct, Some(0.0));
+    }
+
+    #[test]
+    fn diff_report_with_no_ground_truth_has_no_missing_pct_and_serializes() {
+        let (db, _pricing, _state, dir) = test_env();
+        let report = diff_report(
+            &db,
+            &dir.path().join("never-created"),
+            24,
+            1_781_200_000_000,
+        )
+        .unwrap();
+        assert_eq!(report.transcript_requests, 0);
+        assert_eq!(report.matched, 0);
+        assert_eq!(report.backfill_only, 0);
+        assert_eq!(report.otel_only, 0);
+        assert_eq!(report.missing_pct, None);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["missing_pct"], serde_json::Value::Null);
+        assert_eq!(json["window_hours"], 24);
+        assert_eq!(json["transcript_requests"], 0);
+        assert_eq!(json["parse"]["lines_read"], 0);
     }
 }
