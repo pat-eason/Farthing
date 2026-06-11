@@ -15,9 +15,10 @@
 //! `[today 00:00 local, tomorrow 00:00 local)`, computed DST-correct via
 //! `chrono::Local` (a 23h/25h day on a DST transition stays a single day).
 //!
-//! Both queries are index-only range scans over `idx_requests_time_rollup`
-//! (schema v3), so they touch only today's index pages regardless of table
-//! size (<100ms popover budget, NFR).
+//! Both queries are index-only range scans over `idx_requests_facet_rollup`
+//! (schema v4; its key starts with the v3 `idx_requests_time_rollup`
+//! columns it replaced), so they touch only today's index pages regardless
+//! of table size (<100ms popover budget, NFR).
 //!
 //! A second command ([`daily_costs`], task 4.3) returns the per-day cost
 //! series behind the popover sparkline: one bucket per local calendar day
@@ -75,7 +76,7 @@ pub struct TodayMetrics {
 /// makes 00:00 ambiguous the earlier instant wins, and when it skips 00:00
 /// entirely (some zones spring forward at midnight) the first existing
 /// local time that day is the boundary.
-fn local_midnight_ms(date: chrono::NaiveDate) -> i64 {
+pub(crate) fn local_midnight_ms(date: chrono::NaiveDate) -> i64 {
     use chrono::{Duration, LocalResult, TimeZone};
     let naive = date.and_hms_opt(0, 0, 0).expect("00:00:00 is always valid");
     for half_hours in 0..6 {

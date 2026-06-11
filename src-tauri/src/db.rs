@@ -96,6 +96,48 @@ const MIGRATIONS: &[&str] = &[
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
     );
     ",
+    // v4: faceted-query covering index (task 5.2). The Epic 5 analysis
+    // views filter every rollup by model and query_source on top of the
+    // time window, and the tokens view reads the 5m/1h cache-creation
+    // split; none of those columns are in the v3 index, so each faceted
+    // row would cost a main-table probe. The replacement keeps the v3
+    // column order as a prefix (every query the v3 index served is served
+    // at least as well) and appends the facet/split columns so all Epic 5
+    // aggregations stay index-only scans.
+    //
+    // The session-leading twin serves the per-session/per-project rollups
+    // (GROUP BY session_id): scanning it in index order aggregates with no
+    // sorter pass, which is what keeps those rollups inside the Epic 5
+    // <500ms budget at 1M rows (a time-leading scan + sort measured ~590ms;
+    // index-ordered grouping ~260ms). `idx_requests_session_id` is dropped:
+    // its key is the leftmost prefix of the new index.
+    //
+    // `DELETE FROM ingest_state` is a one-time data heal, not a schema
+    // change: backfill rows written before v4 never recorded
+    // `query_source` (the transcript's sidechain flag is the authoritative
+    // subagent marker). Resetting the per-file offsets makes the next
+    // startup backfill pass re-read every transcript; request_id dedup
+    // keeps the re-read idempotent, and the dedup path fills the missing
+    // `query_source` on existing rows.
+    "
+    DROP INDEX idx_requests_time_rollup;
+
+    CREATE INDEX idx_requests_facet_rollup ON requests (
+        timestamp_ms, session_id, event_type, cost_usd,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+        model, query_source, cache_creation_5m_tokens, cache_creation_1h_tokens
+    );
+
+    DROP INDEX idx_requests_session_id;
+
+    CREATE INDEX idx_requests_session_rollup ON requests (
+        session_id, timestamp_ms, event_type, cost_usd,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+        model, query_source, cache_creation_5m_tokens, cache_creation_1h_tokens
+    );
+
+    DELETE FROM ingest_state;
+    ",
 ];
 
 /// Errors from opening or migrating the database.
@@ -300,13 +342,65 @@ mod tests {
 
         let indexes = index_names(db.conn());
         for index in [
-            "idx_requests_time_rollup",
-            "idx_requests_session_id",
+            "idx_requests_facet_rollup",
+            "idx_requests_session_rollup",
             "idx_requests_model",
             "idx_requests_request_id",
         ] {
             assert!(indexes.iter().any(|i| i == index), "missing index {index}");
         }
+        for replaced in ["idx_requests_time_rollup", "idx_requests_session_id"] {
+            assert!(
+                !indexes.iter().any(|i| i == replaced),
+                "v4 must replace {replaced}"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_swaps_rollup_index_and_resets_backfill_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DB_FILE_NAME);
+
+        // Boot at v3 with a stored backfill offset and a request row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            configure_connection(&conn).unwrap();
+            apply_migrations(&conn, &MIGRATIONS[..3]).unwrap();
+            conn.execute(
+                "INSERT INTO ingest_state (file_path, byte_offset, updated_at_ms)
+                 VALUES ('/projects/a/s.jsonl', 4096, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO requests (request_id, session_id, timestamp_ms)
+                 VALUES ('req_v3', 's', 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u64);
+
+        // Indexes swapped, request data intact, offsets cleared so the next
+        // backfill pass re-reads transcripts and heals query_source.
+        let indexes = index_names(db.conn());
+        assert!(indexes.iter().any(|i| i == "idx_requests_facet_rollup"));
+        assert!(indexes.iter().any(|i| i == "idx_requests_session_rollup"));
+        assert!(!indexes.iter().any(|i| i == "idx_requests_time_rollup"));
+        assert!(!indexes.iter().any(|i| i == "idx_requests_session_id"));
+        let requests: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 1);
+        let offsets: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ingest_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(offsets, 0, "v4 must clear stored backfill offsets");
     }
 
     #[test]
