@@ -98,6 +98,7 @@ pub fn run() {
             backfill::backfill_diff_report,
             health::health_status,
             metrics::today_metrics,
+            metrics::daily_costs,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,
