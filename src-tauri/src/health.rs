@@ -1,0 +1,620 @@
+//! Health & diagnostics backend (task 2.5).
+//!
+//! One read-only command ([`health_status`]) that aggregates everything the
+//! health view renders:
+//!
+//! - receiver lifecycle state ([`crate::receiver::ReceiverStatus`]),
+//!   including the port-conflict case that is never auto-rebound
+//! - settings.json config state: installed / missing / conflicting / error
+//!   (derived live from the file via [`crate::settings_merge`])
+//! - last event received: the freshest of the in-memory ingest wall clock
+//!   (this launch) and the newest stored `requests` row (survives restarts)
+//! - the ingest counters from task 1.4 (`events_ingested`,
+//!   `ingest_failures`, `events_skipped`)
+//! - backfill progress: a [`BackfillStatus::NotAvailable`] placeholder until
+//!   the transcript backfill engine ships (Epic 3)
+//!
+//! It also runs the "configured but no events" detector: when the config is
+//! installed but nothing has arrived in [`NO_EVENTS_THRESHOLD_MINUTES`], the
+//! status carries a [`NoEventsDiagnosis`] listing the likely causes (port
+//! conflict, receiver failure, sessions predating the config, or simply no
+//! Claude Code activity).
+
+use std::path::Path;
+
+use serde::Serialize;
+use tauri::{Manager, Runtime};
+
+use crate::db::Db;
+use crate::ingest::{IngestState, IngestStatsSnapshot};
+use crate::receiver::{ReceiverState, ReceiverStatus};
+use crate::settings_merge::{detect_conflicts, is_installed, read_settings, Conflict};
+
+/// How long the app waits, with config installed, before flagging the
+/// "configured but no events" state. Long enough that one slow human turn
+/// in an active session doesn't flap the warning; short enough to be useful
+/// while debugging a fresh install.
+pub const NO_EVENTS_THRESHOLD_MINUTES: i64 = 10;
+
+/// settings.json config state as the health view reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ConfigState {
+    /// All app env keys + the SessionStart hook are present, no conflicts.
+    Installed,
+    /// App config absent or partial (covers a missing file too). Telemetry
+    /// is not flowing; the fix is re-running onboarding.
+    Missing,
+    /// Pre-existing telemetry config detected. `installed` distinguishes
+    /// "ours is in place but foreign OTel keys coexist" from "not set up
+    /// and conflicting".
+    Conflicting {
+        installed: bool,
+        conflicts: Vec<Conflict>,
+    },
+    /// settings.json could not be read/parsed (malformed JSON, IO error).
+    Error { message: String },
+}
+
+impl ConfigState {
+    /// Whether the app's export config is in place (events should flow).
+    fn is_configured(&self) -> bool {
+        matches!(
+            self,
+            ConfigState::Installed
+                | ConfigState::Conflicting {
+                    installed: true,
+                    ..
+                }
+        )
+    }
+}
+
+/// Compute the config state from the settings file. Read-only.
+pub fn config_state(settings_path: &Path) -> ConfigState {
+    let current = match read_settings(settings_path) {
+        Ok(map) => map,
+        Err(err) => {
+            return ConfigState::Error {
+                message: err.to_string(),
+            }
+        }
+    };
+    let installed = is_installed(&current);
+    let conflicts = detect_conflicts(&current);
+    if !conflicts.is_empty() {
+        ConfigState::Conflicting {
+            installed,
+            conflicts,
+        }
+    } else if installed {
+        ConfigState::Installed
+    } else {
+        ConfigState::Missing
+    }
+}
+
+/// Transcript backfill progress. Placeholder until the backfill engine
+/// ships (Epic 3): the only variant is `not_available`, which the health
+/// view renders as "not available yet". Epic 3 extends this with real
+/// progress variants without changing the health view's contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BackfillStatus {
+    NotAvailable,
+}
+
+/// One likely cause in a [`NoEventsDiagnosis`], with a stable machine kind
+/// and a human remediation string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Cause {
+    /// `"port_conflict"`, `"receiver_failed"`, `"receiver_starting"`,
+    /// `"sessions_predate_config"`, or `"paused"`.
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+/// The "configured but no events in N minutes" state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NoEventsDiagnosis {
+    pub threshold_minutes: i64,
+    /// Minutes since the last event; `None` when none was ever received.
+    pub minutes_since_last: Option<i64>,
+    /// Likely causes, most definitive first.
+    pub causes: Vec<Cause>,
+}
+
+/// Run the no-events detector. Fires only when the config is installed
+/// (events *should* flow) and nothing has arrived within the threshold.
+/// A broken receiver is the definitive cause when present; with a healthy
+/// receiver the causes are the ambiguous pair the user must check
+/// (pre-config sessions still running, or Claude Code simply not in use).
+pub fn diagnose_no_events(
+    config: &ConfigState,
+    receiver: &ReceiverStatus,
+    last_event_ms: Option<i64>,
+    now_ms: i64,
+) -> Option<NoEventsDiagnosis> {
+    if !config.is_configured() {
+        return None;
+    }
+    let minutes_since_last = last_event_ms.map(|t| (now_ms - t) / 60_000);
+    if minutes_since_last.is_some_and(|m| m < NO_EVENTS_THRESHOLD_MINUTES) {
+        return None;
+    }
+    let causes = match receiver {
+        ReceiverStatus::PortInUse { port } => vec![Cause {
+            kind: "port_conflict",
+            detail: format!(
+                "Another process is holding port {port}, so Claude Code cannot deliver events. \
+                 Quit whatever is using the port and relaunch this app."
+            ),
+        }],
+        ReceiverStatus::Failed { message } => vec![Cause {
+            kind: "receiver_failed",
+            detail: format!(
+                "The receiver stopped and is not accepting events: {message}. Relaunch this app."
+            ),
+        }],
+        ReceiverStatus::Starting => vec![Cause {
+            kind: "receiver_starting",
+            detail: "The receiver is still starting up; check again in a moment.".to_string(),
+        }],
+        ReceiverStatus::Listening { .. } => vec![
+            Cause {
+                kind: "sessions_predate_config",
+                detail: "Claude Code sessions started before setup never export telemetry. \
+                         Restart any sessions that are still running."
+                    .to_string(),
+            },
+            Cause {
+                kind: "paused",
+                detail: "Claude Code may simply not be in use right now. No usage means no \
+                         events; this is normal."
+                    .to_string(),
+            },
+        ],
+    };
+    Some(NoEventsDiagnosis {
+        threshold_minutes: NO_EVENTS_THRESHOLD_MINUTES,
+        minutes_since_last,
+        causes,
+    })
+}
+
+/// Everything the health view renders, in one query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HealthStatus {
+    pub receiver: ReceiverStatus,
+    pub config: ConfigState,
+    /// Display path of the settings file the config state was read from.
+    pub settings_path: String,
+    /// Since-launch ingest counters (task 1.4), including `ingest_failures`.
+    pub ingest: IngestStatsSnapshot,
+    /// Unix ms of the most recent event received; `None` when none ever.
+    /// Freshest of the in-memory ingest clock and the stored rows, so it
+    /// survives app restarts.
+    pub last_event_ms: Option<i64>,
+    /// All-time `requests` rows received live (`source = 'otel'`).
+    pub events_stored: u64,
+    pub backfill: BackfillStatus,
+    /// Present when the "configured but no events" detector fired.
+    pub no_events: Option<NoEventsDiagnosis>,
+}
+
+/// Pure assembly of [`HealthStatus`] from its inputs (testable without an
+/// app handle). `db_last_event_ms` is event time from stored rows;
+/// `ingest.last_event_ms` is the wall clock of the last live ingest (0 =
+/// never this launch). The freshest of the two is "last event received".
+pub fn compute_health(
+    receiver: ReceiverStatus,
+    config: ConfigState,
+    settings_path: String,
+    ingest: IngestStatsSnapshot,
+    events_stored: u64,
+    db_last_event_ms: Option<i64>,
+    now_ms: i64,
+) -> HealthStatus {
+    let last_event_ms = [
+        (ingest.last_event_ms > 0).then_some(ingest.last_event_ms),
+        db_last_event_ms,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let no_events = diagnose_no_events(&config, &receiver, last_event_ms, now_ms);
+    HealthStatus {
+        receiver,
+        config,
+        settings_path,
+        ingest,
+        last_event_ms,
+        events_stored,
+        backfill: BackfillStatus::NotAvailable,
+        no_events,
+    }
+}
+
+/// Count and newest event time of live-received rows.
+fn db_event_stats(db: &Db) -> Result<(u64, Option<i64>), rusqlite::Error> {
+    db.conn().query_row(
+        "SELECT COUNT(*), MAX(timestamp_ms) FROM requests WHERE source = 'otel'",
+        [],
+        |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+    )
+}
+
+/// Gather live state from the managed receiver/ingest state and the
+/// settings file, then assemble the status. Read-only everywhere.
+pub fn current_health<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<HealthStatus, String> {
+    let receiver = app
+        .state::<ReceiverState>()
+        .0
+        .lock()
+        .expect("receiver status mutex poisoned")
+        .clone();
+    let ingest_state = app.state::<IngestState>();
+    let ingest = ingest_state.stats.snapshot();
+    let (events_stored, db_last_event_ms) = {
+        let db = ingest_state.db.lock().expect("db mutex poisoned");
+        db_event_stats(&db).map_err(|err| format!("cannot query event stats: {err}"))?
+    };
+    let settings_path = crate::onboarding::settings_path(app)?;
+    let config = config_state(&settings_path);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(compute_health(
+        receiver,
+        config,
+        settings_path.display().to_string(),
+        ingest,
+        events_stored,
+        db_last_event_ms,
+        now_ms,
+    ))
+}
+
+/// Frontend query: the full diagnostics snapshot for the health view.
+#[tauri::command]
+pub fn health_status<R: Runtime>(app: tauri::AppHandle<R>) -> Result<HealthStatus, String> {
+    current_health(&app)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::settings_merge::{apply_merge, merge_file};
+    use serde_json::{json, Map, Value};
+    use tempfile::TempDir;
+
+    const PREEXISTING_ENV: &str = include_str!("../tests/fixtures/settings/preexisting_env.json");
+    const MALFORMED: &str = include_str!("../tests/fixtures/settings/malformed.json");
+
+    const MINUTE_MS: i64 = 60_000;
+    const NOW_MS: i64 = 1_781_200_000_000;
+
+    fn listening() -> ReceiverStatus {
+        ReceiverStatus::Listening { port: 43177 }
+    }
+
+    fn snapshot(last_event_ms: i64) -> IngestStatsSnapshot {
+        IngestStatsSnapshot {
+            events_ingested: 0,
+            ingest_failures: 0,
+            events_skipped: 0,
+            last_event_ms,
+        }
+    }
+
+    fn write_settings(dir: &TempDir, contents: &str) -> std::path::PathBuf {
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, contents).expect("write settings");
+        path
+    }
+
+    fn installed_settings(dir: &TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("settings.json");
+        merge_file(&path, &dir.path().join("backups")).expect("merge");
+        path
+    }
+
+    // ---- config_state ----
+
+    #[test]
+    fn missing_file_and_unconfigured_file_are_missing() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            config_state(&dir.path().join("settings.json")),
+            ConfigState::Missing
+        );
+        let path = write_settings(&dir, r#"{"model": "sonnet"}"#);
+        assert_eq!(config_state(&path), ConfigState::Missing);
+    }
+
+    #[test]
+    fn merged_file_is_installed() {
+        let dir = TempDir::new().unwrap();
+        let path = installed_settings(&dir);
+        assert_eq!(config_state(&path), ConfigState::Installed);
+    }
+
+    #[test]
+    fn preexisting_telemetry_is_conflicting_not_installed() {
+        let dir = TempDir::new().unwrap();
+        let path = write_settings(&dir, PREEXISTING_ENV);
+        match config_state(&path) {
+            ConfigState::Conflicting {
+                installed,
+                conflicts,
+            } => {
+                assert!(!installed);
+                assert_eq!(conflicts.len(), 3);
+            }
+            other => panic!("expected Conflicting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn installed_with_foreign_otel_key_is_conflicting_installed() {
+        // App config fully in place, but the user also exports elsewhere.
+        let mut merged = apply_merge(&Map::new()).unwrap();
+        merged["env"]["OTEL_METRICS_EXPORTER"] = Value::String("otlp".into());
+        let dir = TempDir::new().unwrap();
+        let path = write_settings(
+            &dir,
+            &serde_json::to_string_pretty(&Value::Object(merged)).unwrap(),
+        );
+        match config_state(&path) {
+            ConfigState::Conflicting {
+                installed,
+                conflicts,
+            } => {
+                assert!(installed);
+                assert_eq!(conflicts.len(), 1);
+                assert_eq!(conflicts[0].key, "OTEL_METRICS_EXPORTER");
+            }
+            other => panic!("expected Conflicting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_file_is_error() {
+        let dir = TempDir::new().unwrap();
+        let path = write_settings(&dir, MALFORMED);
+        match config_state(&path) {
+            ConfigState::Error { message } => {
+                assert!(message.contains("not valid JSON"), "got: {message}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // ---- diagnose_no_events ----
+
+    #[test]
+    fn detector_silent_when_not_configured() {
+        for config in [
+            ConfigState::Missing,
+            ConfigState::Error {
+                message: "nope".into(),
+            },
+            ConfigState::Conflicting {
+                installed: false,
+                conflicts: vec![],
+            },
+        ] {
+            assert_eq!(
+                diagnose_no_events(&config, &listening(), None, NOW_MS),
+                None,
+                "must not fire for {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detector_silent_with_recent_event() {
+        let recent = NOW_MS - (NO_EVENTS_THRESHOLD_MINUTES - 1) * MINUTE_MS;
+        assert_eq!(
+            diagnose_no_events(&ConfigState::Installed, &listening(), Some(recent), NOW_MS),
+            None
+        );
+    }
+
+    #[test]
+    fn detector_fires_with_stale_event_and_healthy_receiver() {
+        let stale = NOW_MS - 45 * MINUTE_MS;
+        let diagnosis =
+            diagnose_no_events(&ConfigState::Installed, &listening(), Some(stale), NOW_MS)
+                .expect("must fire");
+        assert_eq!(diagnosis.minutes_since_last, Some(45));
+        assert_eq!(diagnosis.threshold_minutes, NO_EVENTS_THRESHOLD_MINUTES);
+        let kinds: Vec<&str> = diagnosis.causes.iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, ["sessions_predate_config", "paused"]);
+    }
+
+    #[test]
+    fn detector_fires_when_no_event_ever() {
+        let diagnosis = diagnose_no_events(&ConfigState::Installed, &listening(), None, NOW_MS)
+            .expect("must fire");
+        assert_eq!(diagnosis.minutes_since_last, None);
+        assert!(!diagnosis.causes.is_empty());
+    }
+
+    #[test]
+    fn detector_fires_for_installed_config_with_foreign_conflicts() {
+        let config = ConfigState::Conflicting {
+            installed: true,
+            conflicts: vec![],
+        };
+        assert!(diagnose_no_events(&config, &listening(), None, NOW_MS).is_some());
+    }
+
+    #[test]
+    fn port_conflict_is_the_definitive_cause() {
+        let receiver = ReceiverStatus::PortInUse { port: 43177 };
+        let diagnosis = diagnose_no_events(&ConfigState::Installed, &receiver, None, NOW_MS)
+            .expect("must fire");
+        assert_eq!(diagnosis.causes.len(), 1);
+        assert_eq!(diagnosis.causes[0].kind, "port_conflict");
+        assert!(diagnosis.causes[0].detail.contains("43177"));
+    }
+
+    #[test]
+    fn failed_receiver_is_the_definitive_cause() {
+        let receiver = ReceiverStatus::Failed {
+            message: "boom".into(),
+        };
+        let diagnosis = diagnose_no_events(&ConfigState::Installed, &receiver, None, NOW_MS)
+            .expect("must fire");
+        assert_eq!(diagnosis.causes.len(), 1);
+        assert_eq!(diagnosis.causes[0].kind, "receiver_failed");
+        assert!(diagnosis.causes[0].detail.contains("boom"));
+    }
+
+    // ---- compute_health ----
+
+    #[test]
+    fn last_event_is_freshest_of_memory_and_db() {
+        let fresher_memory = compute_health(
+            listening(),
+            ConfigState::Installed,
+            "p".into(),
+            snapshot(NOW_MS - MINUTE_MS),
+            10,
+            Some(NOW_MS - 5 * MINUTE_MS),
+            NOW_MS,
+        );
+        assert_eq!(fresher_memory.last_event_ms, Some(NOW_MS - MINUTE_MS));
+        assert_eq!(fresher_memory.no_events, None);
+
+        // Restart case: nothing ingested this launch, rows in the DB.
+        let db_only = compute_health(
+            listening(),
+            ConfigState::Installed,
+            "p".into(),
+            snapshot(0),
+            10,
+            Some(NOW_MS - 5 * MINUTE_MS),
+            NOW_MS,
+        );
+        assert_eq!(db_only.last_event_ms, Some(NOW_MS - 5 * MINUTE_MS));
+
+        let never = compute_health(
+            listening(),
+            ConfigState::Installed,
+            "p".into(),
+            snapshot(0),
+            0,
+            None,
+            NOW_MS,
+        );
+        assert_eq!(never.last_event_ms, None);
+        assert!(never.no_events.is_some(), "configured + never = detector");
+        assert_eq!(never.backfill, BackfillStatus::NotAvailable);
+    }
+
+    // ---- command wiring over a real (mock-runtime) app ----
+
+    #[test]
+    fn current_health_reads_managed_state_and_settings_file() {
+        let dir = TempDir::new().unwrap();
+        let settings = installed_settings(&dir);
+
+        // Real DB with one stored event row.
+        let db = crate::db::Db::open_in_dir(dir.path()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO requests (session_id, timestamp_ms, source)
+                 VALUES ('sess-1', 1781200718939, 'otel')",
+                [],
+            )
+            .unwrap();
+        let ingest = IngestState::new(Arc::new(Mutex::new(db)));
+
+        let status_cell = crate::receiver::new_status();
+        *status_cell.lock().unwrap() = ReceiverStatus::Listening { port: 43177 };
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        app.manage(ReceiverState(status_cell));
+        app.manage(ingest);
+
+        // Point the settings resolution at the temp file (dev override).
+        std::env::set_var(crate::onboarding::SETTINGS_PATH_ENV, &settings);
+        let health = current_health(app.handle());
+        std::env::remove_var(crate::onboarding::SETTINGS_PATH_ENV);
+
+        let health = health.expect("health");
+        assert_eq!(health.receiver, ReceiverStatus::Listening { port: 43177 });
+        assert_eq!(health.config, ConfigState::Installed);
+        assert_eq!(health.settings_path, settings.display().to_string());
+        assert_eq!(health.events_stored, 1);
+        assert_eq!(health.last_event_ms, Some(1_781_200_718_939));
+        // That event is ancient relative to the real clock: detector fires.
+        let diagnosis = health.no_events.expect("detector fired");
+        assert!(diagnosis.minutes_since_last.unwrap() >= NO_EVENTS_THRESHOLD_MINUTES);
+    }
+
+    // ---- serialization contract for the frontend ----
+
+    #[test]
+    fn health_serializes_for_frontend() {
+        let health = compute_health(
+            ReceiverStatus::PortInUse { port: 43177 },
+            ConfigState::Installed,
+            "/tmp/settings.json".into(),
+            IngestStatsSnapshot {
+                events_ingested: 2,
+                ingest_failures: 1,
+                events_skipped: 3,
+                last_event_ms: NOW_MS - 20 * MINUTE_MS,
+            },
+            5,
+            None,
+            NOW_MS,
+        );
+        let value = serde_json::to_value(&health).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "receiver": {"state": "port_in_use", "port": 43177},
+                "config": {"state": "installed"},
+                "settings_path": "/tmp/settings.json",
+                "ingest": {
+                    "events_ingested": 2,
+                    "ingest_failures": 1,
+                    "events_skipped": 3,
+                    "last_event_ms": NOW_MS - 20 * MINUTE_MS,
+                },
+                "last_event_ms": NOW_MS - 20 * MINUTE_MS,
+                "events_stored": 5,
+                "backfill": {"state": "not_available"},
+                "no_events": {
+                    "threshold_minutes": NO_EVENTS_THRESHOLD_MINUTES,
+                    "minutes_since_last": 20,
+                    "causes": [{
+                        "kind": "port_conflict",
+                        "detail": health.no_events.as_ref().unwrap().causes[0].detail,
+                    }],
+                },
+            })
+        );
+
+        // The conflicting and error variants carry their payloads.
+        let conflicting = serde_json::to_value(ConfigState::Conflicting {
+            installed: true,
+            conflicts: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            conflicting,
+            json!({"state": "conflicting", "installed": true, "conflicts": []})
+        );
+    }
+}

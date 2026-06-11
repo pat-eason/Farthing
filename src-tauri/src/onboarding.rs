@@ -148,8 +148,11 @@ pub(crate) fn diff_lines(before: &str, after: &str) -> Vec<DiffLine> {
 }
 
 /// Resolve the real settings file: the env override when set (dev/testing),
-/// otherwise `~/.claude/settings.json`. Shared with the uninstall flow.
-pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+/// otherwise `~/.claude/settings.json`. Shared with the uninstall flow and
+/// the health view (generic over the runtime so MockRuntime tests work).
+pub(crate) fn settings_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var(SETTINGS_PATH_ENV) {
         return Ok(PathBuf::from(path));
     }

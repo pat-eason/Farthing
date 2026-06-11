@@ -4,6 +4,7 @@ use tauri::Manager;
 
 pub mod autostart;
 pub mod db;
+pub mod health;
 pub mod ingest;
 pub mod onboarding;
 pub mod receiver;
@@ -43,6 +44,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             receiver::receiver_status,
             ingest::ingest_stats,
+            health::health_status,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,
