@@ -210,7 +210,7 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
 | 4.1 | Tray icon & popover shell | Tauri v2 TrayIcon, popover window anchored to tray, `ActivationPolicy::Accessory`, menu (open app / pause / quit) | High | M | 1.1 | done <!-- vk: --> |
-| 4.2 | Today-metrics queries & popover content | SQL aggregations (local-midnight day boundary, distinct session_ids), popover layout: cost, in/out/cache tokens, sessions, top 3 projects | High | M | 1.4, 4.1 | <!-- vk: --> |
+| 4.2 | Today-metrics queries & popover content | SQL aggregations (local-midnight day boundary, distinct session_ids), popover layout: cost, in/out/cache tokens, sessions, top 3 projects | High | M | 1.4, 4.1 | done <!-- vk: --> |
 | 4.3 | Sparkline | 7/30-day cost sparkline in popover (uPlot/LayerCake) | Medium | S | 4.2 | <!-- vk: --> |
 | 4.4 | Live updates & pause/resume | Rust→frontend event push on ingest; pause state (receiver 200+discard), paused badge, resume | Medium | M | 4.2 | <!-- vk: --> |
 
@@ -222,10 +222,10 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 - [x] Menu actions wired: open desktop app, pause/resume (stub ok until 4.4), quit — all three exercised via the real tray menu: open shows + focuses `main`, "Pause capture" check state toggles and mirrors into `TrayState::paused` (receiver hookup is 4.4), quit exits the process
 
 **4.2 - Today-metrics queries & popover content**
-- [ ] Day = local midnight boundary; sessions = distinct session_ids active today (resume doesn't double-count)
-- [ ] Popover shows cost, input/output/cache-read/cache-creation tokens, session count, top 3 projects by cost
-- [ ] Renders in <100ms against a DB seeded with 100k+ rows
-- [ ] Cost labeled "API-equivalent"
+- [x] Day = local midnight boundary; sessions = distinct session_ids active today (resume doesn't double-count) — `src-tauri/src/metrics.rs`: `local_day_window` computes `[today 00:00 local, tomorrow 00:00 local)` via `chrono::Local`, DST-correct (ambiguous midnight → earliest instant, skipped midnight → first existing local time); `metrics_for_window` counts `COUNT(DISTINCT session_id)` so a resumed session (same id) counts once. Unit-tested: inclusive-start/exclusive-end boundaries, 5-request resumed session counts as 1, NULL session_ids excluded, `api_error` rows count the session but not the request
+- [x] Popover shows cost, input/output/cache-read/cache-creation tokens, session count, top 3 projects by cost — `today_metrics` command + `/popover` view: cost headline, 2×2 token grid, "N sessions · M requests", top-3 projects ranked by `SUM(cost_usd)` through `sessions.cwd` (NULL cwd / missing session rows collapse into one "(unknown project)" bucket; full path in the tooltip, last segment displayed). Screenshot-verified against a seeded DB (600 sessions, 15k requests today). Refreshes on window focus (every tray open) + 5s poll; 4.4 swaps the poll for ingest push
+- [x] Renders in <100ms against a DB seeded with 100k+ rows — schema v3 adds the covering index `idx_requests_time_rollup` (replacing `idx_requests_timestamp`, its leftmost prefix), making both rollup queries index-only: warm release query on a 120k-row DB with an extreme 15k-request day went 58ms → 7.5ms. Live dev app against that DB (via new `CLAUDE_USAGE_TRACKER_DATA_DIR` override + `cargo run --example seed_metrics_db`): on-screen fetch+render instrumentation read **23.0ms** end-to-end (unoptimized dev build; release is faster). `metrics_query_under_100ms_with_150k_rows` pins the budget in CI
+- [x] Cost labeled "API-equivalent" — label sits beside the cost headline (screenshot-verified); unpriced rows (unknown model) are excluded from the total and surfaced as "N requests with unknown pricing excluded from cost (tokens counted)" rather than silently counting as $0
 
 **4.3 - Sparkline**
 - [ ] 7-day and 30-day toggle; bars/line match SQL aggregation values exactly

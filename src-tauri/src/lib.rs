@@ -7,6 +7,7 @@ pub mod backfill;
 pub mod db;
 pub mod health;
 pub mod ingest;
+pub mod metrics;
 pub mod onboarding;
 pub mod pricing;
 pub mod receiver;
@@ -34,7 +35,14 @@ pub fn run() {
         .on_window_event(tray::handle_window_event)
         .setup(|app| {
             // macOS: ~/Library/Application Support/com.peason.claude-usage-tracker
-            let data_dir = app.path().app_data_dir()?;
+            // Dev/test override: point the whole data dir (usage.db, pricing
+            // cache) at a seeded directory, e.g. one produced by
+            // `cargo run --example seed_metrics_db`, without touching the
+            // real install's data.
+            let data_dir = match std::env::var_os("CLAUDE_USAGE_TRACKER_DATA_DIR") {
+                Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+                _ => app.path().app_data_dir()?,
+            };
             let database = Arc::new(Mutex::new(db::Db::open_in_dir(&data_dir)?));
             app.manage(db::DbState(Arc::clone(&database)));
 
@@ -89,6 +97,7 @@ pub fn run() {
             backfill::backfill_run,
             backfill::backfill_diff_report,
             health::health_status,
+            metrics::today_metrics,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,
