@@ -23,7 +23,7 @@
         "url": "/popover",
         "title": "Claude Usage Tracker",
         "width": 320,
-        "height": 400,
+        "height": 480,
         "visible": false,
         "decorations": false,
         "resizable": false,
