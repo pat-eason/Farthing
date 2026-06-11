@@ -257,7 +257,7 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 | 5.3 | Cost-over-time view | Line/bar chart, day/week/month/all ranges, stack by model or project | High | M | 5.1, 5.2 | done <!-- vk: --> |
 | 5.4 | Sessions view | Sortable table (cost, tokens, duration, project, models) + per-session detail drill-in | Medium | M | 5.1, 5.2 | done <!-- vk: --> |
 | 5.5 | Tokens & cache view | In/out/cache-read/cache-creation over time; cache hit-rate trend | Medium | M | 5.1, 5.2 | done <!-- vk: --> |
-| 5.6 | Projects view | Per-directory rollups (cost, tokens, sessions), cleaned path display | Medium | S | 5.1, 5.2 | <!-- vk: --> |
+| 5.6 | Projects view | Per-directory rollups (cost, tokens, sessions), cleaned path display | Medium | S | 5.1, 5.2 | done <!-- vk: --> |
 
 ### Task Details
 
@@ -288,8 +288,8 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 - [x] 5m vs 1h cache-creation split visible where backfill data provides it — `SeriesPoint` now carries `cache_creation_5m_tokens`/`cache_creation_1h_tokens` (same NULL-when-absent semantics as `usage_summary`; both v4 covering indexes already include the columns so every scan stays index-only, and grouped series carry the split per key). The cache-creation chart stacks 5m TTL / 1h TTL / "unsplit (live capture)" per day with split totals in the card legend, falling back to a "split unavailable: transcript-backfilled data only" note when no matching row carries it. Tooltip-verified vs SQL (Jun 10: 5m 613.4k / 1h 204.6k / unsplit 5.0M ≡ 613,447/204,583/5,004,461); 2 new rust tests pin per-bucket split ≡ per-window summary split and the serde shape (206 total green)
 
 **5.6 - Projects view**
-- [ ] Directories rolled up with cost, tokens, session counts; sorted by cost
-- [ ] Paths displayed cleaned (`~/...`); click-through applies that project as a global facet
+- [x] Directories rolled up with cost, tokens, session counts; sorted by cost — `/projects` view (`src/routes/(app)/projects/+page.svelte`): one `project_rollups` fetch (SQL `ORDER BY cost DESC`, already index-only from 5.2) renders project name, cleaned path, sessions, requests, total tokens (full breakdown in the tooltip), cost (unpriced `~` chip), and a share-of-cost bar/percent; headline reconciles against the same `usage_summary` as the other views. Browser-verified through `query_bridge` on a 150k-row seed: all 13 rows (12 projects + the "(unknown project)" bucket, which legitimately tops the cost sort at $590.5106/132 sessions/6,556 requests/291,603,068 tokens) matched an independent Python/sqlite3 rollup exactly, page Σ ≡ summary ($6358.063800 / 700 sessions), empty-state card on a 2020 custom window, light/dark screenshot-verified
+- [x] Paths displayed cleaned (`~/...`); click-through applies that project as a global facet — new `home_dir` command (`src-tauri/src/queries.rs`, `app.path().home_dir()`; bridge maps it to `$HOME`) feeds `cleanPath` in `src/lib/format.ts` (home prefix → `~`, non-home and unknown-home paths pass through, absolute path kept in the hover title); verified with the bridge run under `HOME=/Users/dev` so every seed path rendered `~/Projects/…`. Clicking a row sets the shared 5.1 project facet (`UNKNOWN_PROJECT_OPTION` for the NULL-cwd bucket; clicking the active "filtered" row clears it): verified frontend-app click → FacetBar "Clear (1)" + table refetched to that single row ($496.451200/48 sessions) and /sessions inherited the filter (48 sessions, all frontend-app); unknown-project click reconciled at $590.510600/132. 206 rust tests green (home_dir contract pinned in the mock-runtime command test); the now-unused `PlannedView.svelte` stub is deleted
 
 ---
 

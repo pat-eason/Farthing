@@ -229,3 +229,9 @@ export function getProjectRollups(facets: Facets): Promise<ProjectRollup[]> {
 export function getFacetOptions(): Promise<FacetOptions> {
   return invoke<FacetOptions>("facet_options");
 }
+
+/** Read-only: the user's home directory for `~/…` path display (PRD FR-3);
+ * null when it can't be resolved (paths then display unchanged). */
+export function getHomeDir(): Promise<string | null> {
+  return invoke<string | null>("home_dir");
+}
