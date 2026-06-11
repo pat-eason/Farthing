@@ -7,6 +7,7 @@ pub mod db;
 pub mod health;
 pub mod ingest;
 pub mod onboarding;
+pub mod pricing;
 pub mod receiver;
 pub mod session;
 pub mod settings_merge;
@@ -33,6 +34,13 @@ pub fn run() {
             // via `ingest_stats` (health view, task 2.5).
             let ingest_state = ingest::IngestState::new(database);
             app.manage(ingest_state.clone());
+
+            // Pricing table for backfill cost computation (task 3.3):
+            // bundled snapshot + local cache load synchronously; the remote
+            // refresh is spawned fail-silent and never blocks startup.
+            let pricing_state = pricing::PricingState::new(pricing::PricingTable::load(&data_dir));
+            app.manage(pricing_state.clone());
+            tauri::async_runtime::spawn(pricing::refresh(pricing_state, data_dir.clone()));
 
             // OTLP receiver on 127.0.0.1:43177. A port conflict is recorded
             // in ReceiverState (queryable via `receiver_status`), never
