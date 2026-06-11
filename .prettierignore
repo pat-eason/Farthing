@@ -17,3 +17,7 @@ docs/
 # settings.json merge-engine fixtures: byte-exact test inputs, one
 # intentionally malformed (prettier cannot parse it by design)
 src-tauri/tests/fixtures/settings/
+
+# Generated pricing snapshot (filtered LiteLLM data; byte-exact to its
+# generator output, see docs/notes/pricing.md)
+src-tauri/data/

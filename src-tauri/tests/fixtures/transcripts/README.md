@@ -17,7 +17,7 @@ results, attachments collapsed to their `type`, any other string > 80 chars).
   byte-identical usage — the normal streaming shape).
 - `sidechain.jsonl` — first 8 lines of a real subagent transcript
   (`<session>/subagents/agent-….jsonl`, v2.1.154). 4 `assistant` lines, all
-  `isSidechain: true`, forming 2 groups whose `output_tokens` *grow* between
+  `isSidechain: true`, forming 2 groups whose `output_tokens` _grow_ between
   lines (3 → 136); exercises the 5m cache-creation split
   (`ephemeral_5m_input_tokens` non-zero, `1h` zero — the inverse of the main
   fixture).
