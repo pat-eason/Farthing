@@ -1,6 +1,7 @@
 // Typed wrapper around the health Tauri command (src-tauri/src/health.rs).
 
 import { invoke } from "@tauri-apps/api/core";
+import type { BackfillInfo } from "$lib/backfill";
 import type { Conflict } from "$lib/onboarding";
 
 export interface ReceiverStatus {
@@ -22,11 +23,6 @@ export interface IngestStats {
   events_skipped: number;
   /** Wall-clock ms of the last live ingest; 0 = never this launch. */
   last_event_ms: number;
-}
-
-/** Placeholder until the transcript backfill engine ships (Epic 3). */
-export interface BackfillStatus {
-  state: "not_available";
 }
 
 export interface Cause {
@@ -57,7 +53,8 @@ export interface HealthStatus {
   last_event_ms: number | null;
   /** All-time live-received event rows. */
   events_stored: number;
-  backfill: BackfillStatus;
+  /** Transcript backfill: running flag + the last completed pass. */
+  backfill: BackfillInfo;
   /** Present when the "configured but no events" detector fired. */
   no_events: NoEventsDiagnosis | null;
 }

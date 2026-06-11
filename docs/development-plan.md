@@ -162,7 +162,7 @@ Day-one history and gap recovery: JSONL parsing, pricing, dedup against live row
 | 3.2 | Transcript JSONL parser | Parse `~/.claude/projects/**/*.jsonl`: per-assistant-message usage (incl. 5m/1h cache split), model, sessionId, cwd, timestamp, isSidechain; tolerant of unknown line types | High | M | — | done <!-- vk: --> |
 | 3.3 | Pricing table | Bundled versioned per-model pricing data + fail-silent remote refresh (pinned LiteLLM URL, local cache); cost computation incl. cache read/write multipliers; unknown-model → tokens-only flag | High | M | — | done <!-- vk: --> |
 | 3.4 | Backfill engine | First-run full pass + incremental passes via stored byte offsets; dedup per 3.1; source tagging (otel/backfill); session→cwd self-heal from transcripts | High | L | 1.2, 3.1, 3.2, 3.3 | done <!-- vk: --> |
-| 3.5 | Backfill diff report & manual trigger | "Backfill now" action; report comparing OTel rows vs transcript ground truth over a window (capture-completeness metric) | Medium | S | 3.4 | <!-- vk: --> |
+| 3.5 | Backfill diff report & manual trigger | "Backfill now" action; report comparing OTel rows vs transcript ground truth over a window (capture-completeness metric) | Medium | S | 3.4 | done <!-- vk: --> |
 
 ### Task Details
 
@@ -189,8 +189,8 @@ Day-one history and gap recovery: JSONL parsing, pricing, dedup against live row
 - [x] Rows carry source tag (`otel` | `backfill`) — backfill inserts `source='backfill'` (live ingest already wrote `'otel'`; the v1 CHECK constraint admits only these two); per-source counts asserted in tests and reported by the example harness. `BackfillState`/`backfill_status` command expose the last `BackfillSummary` (files/requests/sessions/parse counters) for 3.5's manual trigger and report; 125 tests green, clippy/fmt/frontend checks clean
 
 **3.5 - Backfill diff report & manual trigger**
-- [ ] "Backfill now" runs an incremental pass on demand with progress feedback
-- [ ] Report outputs: rows in OTel-only, backfill-only, matched; percentage missing vs transcript ground truth
+- [x] "Backfill now" runs an incremental pass on demand with progress feedback — `backfill_run` command runs the same incremental `run_pass` on a blocking thread via `backfill::run_manual`, which atomically claims the `running` flag and refuses while another pass (startup or manual) is mid-flight. Progress feedback: `health_status` now carries the live `BackfillInfo` (running flag + last pass summary; the 2.5 `not_available` placeholder is gone) and the health view's Backfill card shows the running state, disables the button mid-pass, reports the recovered-request count on completion, and renders the last-pass summary line (files read, requests recovered/already-captured, sessions healed)
+- [x] Report outputs: rows in OTel-only, backfill-only, matched; percentage missing vs transcript ground truth — `backfill_diff_report(window_hours)` (24h/7d/30d selector in the UI) re-parses transcripts from byte 0 (ground truth must not depend on stored ingest offsets; mtime-pruned to the window) and compares collapsed requestIds against stored `source='otel'` api_request rows: matched / backfill-only (missed live, recovered) / otel-only (transcript since cleaned up), with `missing_pct = backfill_only / transcript_requests` rendered against the <1% PRD target; a ±10-min edge band absorbs OTel-vs-transcript timestamp skew at the window boundary. Live-verified read-only against the real corpus (`cargo run --example diff_report`): 1,333 files, 14,274 ground-truth requests in the trailing 7 days; all-backfill DB → 100% missing / 0 matched, 200 rows flipped to otel → exactly 200 matched / 0 otel-only, one orphan otel row → otel-only = 1. 130 tests green, clippy/fmt/frontend checks clean
 
 ---
 
