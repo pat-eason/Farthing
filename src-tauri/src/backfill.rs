@@ -357,8 +357,11 @@ fn stored_offset(conn: &Connection, file_key: &str) -> Result<u64, rusqlite::Err
 
 /// Insert one collapsed transcript request, deferring to any existing row
 /// per the otel-wins rule (which also makes re-reads after an offset reset
-/// idempotent). The 5m/1h split is the only thing backfill may add to an
-/// existing row — and only where it is NULL.
+/// idempotent). Backfill may add exactly two things to an existing row,
+/// both only where the stored value is NULL: the 5m/1h cache-creation
+/// split, and `query_source = 'subagent'` for sidechain lines (the
+/// transcript's sidechain flag is the authoritative subagent marker the
+/// faceted query layer filters on, task 5.2).
 fn store_request(
     conn: &Connection,
     pricing: &PricingState,
@@ -370,12 +373,16 @@ fn store_request(
         return Ok(());
     };
 
-    let existing: Option<(Option<i64>, Option<i64>)> = conn
+    let subagent_source = request
+        .is_sidechain
+        .then_some(crate::queries::SUBAGENT_QUERY_SOURCE);
+
+    let existing: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
         .query_row(
-            "SELECT cache_creation_5m_tokens, cache_creation_1h_tokens
+            "SELECT cache_creation_5m_tokens, cache_creation_1h_tokens, query_source
              FROM requests WHERE request_id = ?1",
             [request_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map(Some)
         .or_else(|err| match err {
@@ -383,25 +390,30 @@ fn store_request(
             other => Err(other),
         })?;
 
-    if let Some((existing_5m, existing_1h)) = existing {
+    if let Some((existing_5m, existing_1h, existing_source)) = existing {
         summary.requests_deduped += 1;
         let fills_5m = existing_5m.is_none() && request.cache_creation_5m_tokens.is_some();
         let fills_1h = existing_1h.is_none() && request.cache_creation_1h_tokens.is_some();
-        if fills_5m || fills_1h {
+        let fills_source = existing_source.is_none() && subagent_source.is_some();
+        if fills_5m || fills_1h || fills_source {
             conn.execute(
                 "UPDATE requests SET
                      cache_creation_5m_tokens =
                          COALESCE(cache_creation_5m_tokens, ?2),
                      cache_creation_1h_tokens =
-                         COALESCE(cache_creation_1h_tokens, ?3)
+                         COALESCE(cache_creation_1h_tokens, ?3),
+                     query_source = COALESCE(query_source, ?4)
                  WHERE request_id = ?1",
                 rusqlite::params![
                     request_id,
                     request.cache_creation_5m_tokens,
                     request.cache_creation_1h_tokens,
+                    subagent_source,
                 ],
             )?;
-            summary.splits_filled += 1;
+            if fills_5m || fills_1h {
+                summary.splits_filled += 1;
+            }
         }
         return Ok(());
     }
@@ -417,8 +429,8 @@ fn store_request(
             request_id, session_id, timestamp_ms, model, cost_usd,
             input_tokens, output_tokens, cache_read_tokens,
             cache_creation_tokens, cache_creation_5m_tokens,
-            cache_creation_1h_tokens, event_type, source
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            cache_creation_1h_tokens, query_source, event_type, source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                    'api_request', 'backfill')",
         rusqlite::params![
             request_id,
@@ -432,6 +444,7 @@ fn store_request(
             request.cache_creation_tokens,
             request.cache_creation_5m_tokens,
             request.cache_creation_1h_tokens,
+            subagent_source,
         ],
     )?;
     summary.requests_inserted += 1;
@@ -764,6 +777,22 @@ mod tests {
             ),
             2
         );
+        // Sidechain rows are tagged subagent for the query_source facet
+        // (task 5.2); main-session rows stay NULL (treated as main).
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM requests WHERE query_source = 'subagent'"
+            ),
+            2
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM requests WHERE query_source IS NULL"
+            ),
+            2
+        );
 
         // Second pass: offsets make it a no-op (files not even read).
         let second = run_pass(&db, &pricing, &state, &root);
@@ -776,6 +805,35 @@ mod tests {
         let info = state.0.lock().unwrap().clone();
         assert!(!info.running);
         assert_eq!(info.last, Some(second));
+    }
+
+    #[test]
+    fn offset_reset_rereads_and_heals_missing_query_source() {
+        let (db, pricing, state, dir) = test_env();
+        let root = fixture_root(dir.path());
+        run_pass(&db, &pricing, &state, &root);
+
+        // Simulate pre-v4 data: rows stored without query_source, then the
+        // v4 migration's one-time offset reset.
+        {
+            let db = db.lock().unwrap();
+            db.conn()
+                .execute("UPDATE requests SET query_source = NULL", [])
+                .unwrap();
+            db.conn().execute("DELETE FROM ingest_state", []).unwrap();
+        }
+
+        let heal = run_pass(&db, &pricing, &state, &root);
+        assert_eq!(heal.requests_inserted, 0);
+        assert_eq!(heal.requests_deduped, 4);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM requests WHERE query_source = 'subagent'"
+            ),
+            2,
+            "re-read must restore the subagent tag on sidechain rows"
+        );
     }
 
     #[test]

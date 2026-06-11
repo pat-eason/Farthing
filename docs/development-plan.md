@@ -253,7 +253,7 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
 | 5.1 | Desktop window shell & navigation | Full window from tray, view navigation, activation policy flip, dark/light | High | M | 4.1 | done <!-- vk: --> |
-| 5.2 | Faceted query layer | Tauri commands wrapping SQL aggregations with shared facet params (project, model, date range, query_source); seed-data script for dev | High | M | 1.2 | <!-- vk: --> |
+| 5.2 | Faceted query layer | Tauri commands wrapping SQL aggregations with shared facet params (project, model, date range, query_source); seed-data script for dev | High | M | 1.2 | done <!-- vk: --> |
 | 5.3 | Cost-over-time view | Line/bar chart, day/week/month/all ranges, stack by model or project | High | M | 5.1, 5.2 | <!-- vk: --> |
 | 5.4 | Sessions view | Sortable table (cost, tokens, duration, project, models) + per-session detail drill-in | Medium | M | 5.1, 5.2 | <!-- vk: --> |
 | 5.5 | Tokens & cache view | In/out/cache-read/cache-creation over time; cache hit-rate trend | Medium | M | 5.1, 5.2 | <!-- vk: --> |
@@ -267,10 +267,10 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 - [x] Respects system dark/light appearance — all new shell/facet/stub styles carry `prefers-color-scheme: dark` variants like the existing pages. Verified via playwright `emulateMedia` (light/dark computed colors + screenshots) and live: the running window re-rendered correctly when system appearance was toggled light↔dark via AppleScript, no restart
 
 **5.2 - Faceted query layer**
-- [ ] One shared facet struct (project, model, date range, query_source) applied across all aggregation commands
-- [ ] Queries on a 1M-row seeded DB return <500ms (indexes verified with `EXPLAIN QUERY PLAN`)
-- [ ] Seed script generates realistic multi-project/multi-model/multi-week fixture data
-- [ ] Unit tests assert aggregation correctness against hand-computed fixtures
+- [x] One shared facet struct (project, model, date range, query_source) applied across all aggregation commands — `Facets` (`src-tauri/src/queries.rs`) deserialized identically by all five new commands: `usage_summary`, `usage_series` (per-local-day buckets, optional model/project grouping for the 5.3 stacking toggle), `session_rollups` (sort/limit/offset pushed into SQL), `project_rollups` (cost-descending), `facet_options` (the bar's option lists); typed frontend wrappers + `toFacets` bridge from the 5.1 facet state in `src/lib/queries.ts`. Subagent filtering works off `query_source = 'subagent'`, which backfill now writes for sidechain lines (v4 migration resets ingest offsets once so the next pass heals pre-v4 rows)
+- [x] Queries on a 1M-row seeded DB return <500ms (indexes verified with `EXPLAIN QUERY PLAN`) — schema v4 adds two covering indexes: time-leading `idx_requests_facet_rollup` (range scans) and session-leading `idx_requests_session_rollup` (index-ordered `GROUP BY session_id`, no sorter: 226ms vs 858ms for the month sessions rollup at 1M). Project facets compile to `session_id IN (SELECT …)` subqueries, never per-request joins (a joined month summary measured 1.9s; subquery 122ms). `cargo run --release --example seed_metrics_db -- <dir> 1000000` gates every shape and passed: worst warm query 419ms (month series grouped by project), all others ≤268ms. EXPLAIN QUERY PLAN tests pin covering-index use and reject TEMP B-TREE grouping
+- [x] Seed script generates realistic multi-project/multi-model/multi-week fixture data — `seed_metrics_db` now spreads rows over 75 days across 13 projects (plus both unknown-project flavors: NULL-cwd sessions and orphan session ids), 4 models, a main/subagent/user/NULL `query_source` mix, transcript-style rows carrying the 5m/1h split, ~1/500 unpriced and ~1/400 `api_error` rows
+- [x] Unit tests assert aggregation correctness against hand-computed fixtures — a 6-row hand-computed fixture drives exact-total assertions for every command and facet (including conjunctive combinations, custom-range `[start, end)` boundaries, main+subagent partitioning, and unknown-project = NULL cwd + missing session row); cross-checks force series buckets ≡ per-window summaries and project rollups ≡ per-project summaries so the views can't disagree; serde tests pin the frontend payload shapes; 199 tests green
 
 **5.3 - Cost-over-time view**
 - [ ] Range presets (day/week/month/all) and custom range work; stacking toggles between model and project
