@@ -158,7 +158,7 @@ Day-one history and gap recovery: JSONL parsing, pricing, dedup against live row
 
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
-| 3.1 | Spike: dedup identity | Verify whether `api_request` OTel events carry an identifier matching transcript `requestId`; decide exact dedup key (exact-id vs session_id+ts-window+token-signature); document | High | S | 1.6 | <!-- vk: --> |
+| 3.1 | Spike: dedup identity | Verify whether `api_request` OTel events carry an identifier matching transcript `requestId`; decide exact dedup key (exact-id vs session_id+ts-window+token-signature); document | High | S | 1.6 | done <!-- vk: --> |
 | 3.2 | Transcript JSONL parser | Parse `~/.claude/projects/**/*.jsonl`: per-assistant-message usage (incl. 5m/1h cache split), model, sessionId, cwd, timestamp, isSidechain; tolerant of unknown line types | High | M | — | <!-- vk: --> |
 | 3.3 | Pricing table | Bundled versioned per-model pricing data + fail-silent remote refresh (pinned LiteLLM URL, local cache); cost computation incl. cache read/write multipliers; unknown-model → tokens-only flag | High | M | — | <!-- vk: --> |
 | 3.4 | Backfill engine | First-run full pass + incremental passes via stored byte offsets; dedup per 3.1; source tagging (otel/backfill); session→cwd self-heal from transcripts | High | L | 1.2, 3.1, 3.2, 3.3 | <!-- vk: --> |
@@ -167,9 +167,9 @@ Day-one history and gap recovery: JSONL parsing, pricing, dedup against live row
 ### Task Details
 
 **3.1 - Spike: dedup identity**
-- [ ] Side-by-side comparison of ≥3 real sessions' OTel event payloads vs transcript entries, focused on request-identity fields
-- [ ] Decision written to `docs/notes/dedup-key.md`: exact key, collision behavior, and fallback strategy
-- [ ] PRD FR-4 dedup bullet updated with the verified answer
+- [x] Side-by-side comparison of ≥3 real sessions' OTel event payloads vs transcript entries, focused on request-identity fields — 4 sessions / 6 requests total: 2 sessions from the 1.6 e2e runs plus 2 fresh controlled headless runs whose raw OTLP bodies were captured via a tee proxy in front of the production receiver; `request_id` == transcript `requestId` exactly in every case, token fields identical. Backed by a corpus scan of all 481 local transcript files (26,815 distinct requestIds, zero cross-file collisions)
+- [x] Decision written to `docs/notes/dedup-key.md`: exact key, collision behavior, and fallback strategy — exact `request_id` with partial unique index, otel-wins-on-conflict (authoritative `cost_usd`; backfill may fill only the 5m/1h cache split), fuzzy (session_id, model, ±2s window, token signature) demoted to fallback for id-less rows; plus transcript-collapse rules for 3.2/3.4 (last non-zero line per requestId, skip `<synthetic>`)
+- [x] PRD FR-4 dedup bullet updated with the verified answer — FR-4 bullet and the double-counting risk row now state the verified `request_id` key
 
 **3.2 - Transcript JSONL parser**
 - [ ] Extracts input/output/cache_read/cache_creation (with ephemeral_5m/1h breakdown), model, sessionId, cwd, timestamp, isSidechain from assistant messages
@@ -359,7 +359,7 @@ Public-readiness: naming, signing/notarization, CI releases, docs, final hardeni
 
 ## Open Questions
 
-- [ ] 3.1 spike outcome: exact dedup key (blocks 3.4 design detail, not Epic 1–2 work)
+- [x] 3.1 spike outcome: exact dedup key (blocks 3.4 design detail, not Epic 1–2 work) — resolved: exact `request_id` (see `docs/notes/dedup-key.md`)
 - [ ] Final project name (6.1)
 
 ## Related Documents
