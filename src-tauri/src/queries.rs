@@ -11,6 +11,8 @@
 //!   grouped by model or project (the 5.3 stacking toggle)
 //! - [`session_rollups`]: per-session rollups with sort/limit pushed into
 //!   SQL (the 5.4 table)
+//! - [`session_detail`]: one session's drill-in (per-request timeline,
+//!   model mix, cache split, source tags — the 5.4 detail panel)
 //! - [`project_rollups`]: per-cwd rollups sorted by cost (the 5.6 view)
 //! - [`facet_options`]: the distinct project/model lists the facet bar
 //!   offers (plus whether an "unknown project" bucket exists)
@@ -705,6 +707,183 @@ pub fn session_rollups<R: Runtime>(
         chrono::Local::now(),
     )
     .map_err(|err| format!("cannot query session rollups: {err}"))
+}
+
+// ---------------------------------------------------------------------------
+// session_detail
+// ---------------------------------------------------------------------------
+
+/// Cap on timeline rows returned by [`session_detail`]; the per-model mix
+/// and `total_rows` always cover every matching row so the drill-in header
+/// can say "showing first N of M".
+pub const DETAIL_REQUEST_LIMIT: usize = 1000;
+
+/// One request in a session's drill-in timeline (task 5.4).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RequestDetail {
+    pub timestamp_ms: i64,
+    pub model: Option<String>,
+    /// Request origin tag (`subagent`, `user`, `sdk`, …); `None` = never
+    /// recorded (displayed as main).
+    pub query_source: Option<String>,
+    /// `api_request` or `api_error`.
+    pub event_type: String,
+    /// Data source tag: `otel` (live) or `backfill` (transcript).
+    pub source: String,
+    /// API-equivalent cost; `None` = unpriced (or an error row).
+    pub cost_usd: Option<f64>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    /// 5m/1h cache-creation split where backfill data provides it.
+    pub cache_creation_5m_tokens: Option<i64>,
+    pub cache_creation_1h_tokens: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// One model's share of a session (the drill-in model mix), aggregated over
+/// every matching row regardless of the timeline cap.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelMix {
+    /// `None` = rows with no model recorded (typically error rows).
+    pub model: Option<String>,
+    #[serde(flatten)]
+    pub totals: Aggregates,
+}
+
+/// A session's drill-in detail. The same facets as the rollup table apply,
+/// so the drill-in always reconciles with the row that was clicked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionDetail {
+    pub session_id: String,
+    /// Project directory; `None` = unknown project (no cwd mapping) — data,
+    /// not an error (PRD FR-3).
+    pub cwd: Option<String>,
+    /// All matching rows (requests + errors) under the facets; the timeline
+    /// below is capped, this never is.
+    pub total_rows: i64,
+    /// Per-request timeline, timestamp ascending, at most the caller's cap.
+    pub requests: Vec<RequestDetail>,
+    /// Per-model aggregates over all matching rows, cost-descending.
+    pub models: Vec<ModelMix>,
+}
+
+/// Read one session's drill-in detail under the same facet selection as the
+/// rollup table. Pure DB read; an unknown `session_id` yields empty data,
+/// never an error.
+pub fn session_detail_for(
+    db: &Db,
+    session_id: &str,
+    facets: &Facets,
+    limit: usize,
+    now: chrono::DateTime<chrono::Local>,
+) -> Result<SessionDetail, rusqlite::Error> {
+    let mut filter = facets.filter(true, now);
+    filter.conditions.push("r.session_id = ?".into());
+    filter.params.push(session_id.to_owned().into());
+    let where_clause = filter.where_clause();
+
+    let conn = db.conn();
+    let cwd: Option<String> = conn
+        .query_row(
+            "SELECT cwd FROM sessions WHERE session_id = ?",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?
+        .flatten();
+
+    let total_rows: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM requests r {where_clause}"),
+        rusqlite::params_from_iter(filter.params.iter()),
+        |row| row.get(0),
+    )?;
+
+    // Timeline rows need non-indexed columns (error, duration, source), so
+    // this is a plain table read; a single session is at most a few
+    // thousand rows behind `idx_requests_session_id`.
+    let sql = format!(
+        "SELECT r.timestamp_ms, r.model, r.query_source, r.event_type,
+            r.source, r.cost_usd, r.input_tokens, r.output_tokens,
+            r.cache_read_tokens, r.cache_creation_tokens,
+            r.cache_creation_5m_tokens, r.cache_creation_1h_tokens,
+            r.duration_ms, r.error
+         FROM requests r {where_clause}
+         ORDER BY r.timestamp_ms, r.id
+         LIMIT ?"
+    );
+    let mut params = filter.params.clone();
+    params.push((limit as i64).into());
+    let mut stmt = conn.prepare(&sql)?;
+    let requests = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(RequestDetail {
+                timestamp_ms: row.get(0)?,
+                model: row.get(1)?,
+                query_source: row.get(2)?,
+                event_type: row.get(3)?,
+                source: row.get(4)?,
+                cost_usd: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                cache_read_tokens: row.get(8)?,
+                cache_creation_tokens: row.get(9)?,
+                cache_creation_5m_tokens: row.get(10)?,
+                cache_creation_1h_tokens: row.get(11)?,
+                duration_ms: row.get(12)?,
+                error: row.get(13)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let sql = format!(
+        "SELECT r.model, {AGG_COLUMNS}
+         FROM requests r {where_clause}
+         GROUP BY r.model
+         ORDER BY 2 DESC, r.model"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let models = stmt
+        .query_map(rusqlite::params_from_iter(filter.params.iter()), |row| {
+            Ok(ModelMix {
+                model: row.get(0)?,
+                totals: Aggregates::from_row(row, 1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(SessionDetail {
+        session_id: session_id.to_owned(),
+        cwd,
+        total_rows,
+        requests,
+        models,
+    })
+}
+
+/// Frontend query: one session's drill-in detail under the active facets.
+#[tauri::command]
+pub fn session_detail<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    session_id: String,
+    facets: Facets,
+) -> Result<SessionDetail, String> {
+    let state = app.state::<DbState>();
+    let db = state.0.lock().expect("db mutex poisoned");
+    session_detail_for(
+        &db,
+        &session_id,
+        &facets,
+        DETAIL_REQUEST_LIMIT,
+        chrono::Local::now(),
+    )
+    .map_err(|err| format!("cannot query session detail: {err}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,6 +1667,172 @@ mod tests {
         assert!(rollups.iter().all(|r| r.session_id != "s3"));
     }
 
+    // ---- session detail ----
+
+    #[test]
+    fn session_detail_matches_fixture_rows_in_timestamp_order() {
+        let (_dir, db) = fixture_db();
+        let detail = session_detail_for(&db, "s1", &Facets::default(), 1000, now()).unwrap();
+        assert_eq!(detail.session_id, "s1");
+        assert_eq!(detail.cwd.as_deref(), Some("/proj/alpha"));
+        assert_eq!(detail.total_rows, 3);
+        assert_eq!(detail.requests.len(), 3);
+
+        // r1: priced sonnet row with the 5m/1h split, default otel source.
+        let r1 = &detail.requests[0];
+        assert_eq!(r1.timestamp_ms, T + 1);
+        assert_eq!(r1.model.as_deref(), Some("sonnet"));
+        assert_eq!(r1.query_source, None);
+        assert_eq!(r1.event_type, "api_request");
+        assert_eq!(r1.source, "otel");
+        assert_eq!(r1.cost_usd, Some(1.0));
+        assert_eq!(
+            (
+                r1.input_tokens,
+                r1.output_tokens,
+                r1.cache_read_tokens,
+                r1.cache_creation_tokens
+            ),
+            (10, 20, 30, 40)
+        );
+        assert_eq!(r1.cache_creation_5m_tokens, Some(30));
+        assert_eq!(r1.cache_creation_1h_tokens, Some(10));
+
+        // r2: subagent source tag.
+        assert_eq!(detail.requests[1].query_source.as_deref(), Some("subagent"));
+
+        // r6: the error row keeps its event type, cost stays None.
+        let r6 = &detail.requests[2];
+        assert_eq!(r6.event_type, "api_error");
+        assert_eq!(r6.model, None);
+        assert_eq!(r6.cost_usd, None);
+
+        // Model mix covers every row, cost-descending, NULL-model last.
+        let mix: Vec<(Option<&str>, f64, i64)> = detail
+            .models
+            .iter()
+            .map(|m| (m.model.as_deref(), m.totals.cost_usd, m.totals.requests))
+            .collect();
+        assert_eq!(
+            mix,
+            vec![
+                (Some("opus"), 2.0, 1),
+                (Some("sonnet"), 1.0, 1),
+                (None, 0.0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_detail_applies_facets_and_reconciles_with_the_rollup() {
+        let (_dir, db) = fixture_db();
+        let facets = Facets {
+            model: Some("sonnet".into()),
+            ..Facets::default()
+        };
+        let detail = session_detail_for(&db, "s1", &facets, 1000, now()).unwrap();
+        assert_eq!(detail.total_rows, 1, "only r1 matches the model facet");
+        assert_eq!(detail.requests.len(), 1);
+        assert_eq!(detail.requests[0].model.as_deref(), Some("sonnet"));
+
+        // The drill-in reconciles with the rollup row for the same facets.
+        let rollups =
+            session_rollups_for(&db, &facets, SessionSort::Cost, true, 100, 0, now()).unwrap();
+        let s1 = rollups.iter().find(|r| r.session_id == "s1").unwrap();
+        let detail_cost: f64 = detail.requests.iter().filter_map(|r| r.cost_usd).sum();
+        let mix_cost: f64 = detail.models.iter().map(|m| m.totals.cost_usd).sum();
+        assert_eq!(detail_cost, s1.totals.cost_usd);
+        assert_eq!(mix_cost, s1.totals.cost_usd);
+
+        let subagent = session_detail_for(
+            &db,
+            "s1",
+            &Facets {
+                query_source: QuerySourceFacet::Subagent,
+                ..Facets::default()
+            },
+            1000,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(subagent.total_rows, 1);
+        assert_eq!(subagent.requests[0].model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn session_detail_unknown_cwd_and_unknown_session_are_data_not_errors() {
+        let (_dir, db) = fixture_db();
+        // s3 has a session row with NULL cwd; s4 has no session row at all.
+        let s3 = session_detail_for(&db, "s3", &Facets::default(), 1000, now()).unwrap();
+        assert_eq!(s3.cwd, None);
+        assert_eq!(s3.total_rows, 1);
+        let s4 = session_detail_for(&db, "s4", &Facets::default(), 1000, now()).unwrap();
+        assert_eq!(s4.cwd, None);
+        assert_eq!(s4.total_rows, 1);
+        assert_eq!(s4.requests[0].cost_usd, Some(4.0));
+
+        // A session id with no rows anywhere yields empty data.
+        let ghost = session_detail_for(&db, "nope", &Facets::default(), 1000, now()).unwrap();
+        assert_eq!(ghost.cwd, None);
+        assert_eq!(ghost.total_rows, 0);
+        assert!(ghost.requests.is_empty());
+        assert!(ghost.models.is_empty());
+    }
+
+    #[test]
+    fn session_detail_caps_the_timeline_but_not_totals_or_mix() {
+        let (_dir, db) = fixture_db();
+        let detail = session_detail_for(&db, "s1", &Facets::default(), 2, now()).unwrap();
+        assert_eq!(detail.requests.len(), 2, "timeline capped at the limit");
+        assert_eq!(
+            detail.requests[1].timestamp_ms,
+            T + 2,
+            "cap keeps the earliest rows"
+        );
+        assert_eq!(detail.total_rows, 3, "count ignores the cap");
+        assert_eq!(detail.models.len(), 3, "model mix ignores the cap");
+    }
+
+    #[test]
+    fn session_detail_serializes_flat_for_frontend() {
+        let (_dir, db) = fixture_db();
+        let detail = session_detail_for(&db, "s2", &Facets::default(), 1000, now()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&detail).unwrap(),
+            serde_json::json!({
+                "session_id": "s2",
+                "cwd": "/proj/beta",
+                "total_rows": 1,
+                "requests": [{
+                    "timestamp_ms": T + 3,
+                    "model": "sonnet",
+                    "query_source": "user",
+                    "event_type": "api_request",
+                    "source": "otel",
+                    "cost_usd": null,
+                    "input_tokens": 100,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "cache_creation_5m_tokens": null,
+                    "cache_creation_1h_tokens": null,
+                    "duration_ms": null,
+                    "error": null,
+                }],
+                "models": [{
+                    "model": "sonnet",
+                    "cost_usd": 0.0,
+                    "input_tokens": 100,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "requests": 1,
+                    "unpriced_requests": 1,
+                }],
+            })
+        );
+    }
+
     // ---- project rollups ----
 
     #[test]
@@ -1682,6 +2027,11 @@ mod tests {
             session_rollups(handle.clone(), Facets::default(), None, None, None, None).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "s");
+
+        let detail = session_detail(handle.clone(), "s".into(), Facets::default()).unwrap();
+        assert_eq!(detail.cwd.as_deref(), Some("/proj/live"));
+        assert_eq!(detail.requests.len(), 1);
+        assert_eq!(detail.models.len(), 1);
 
         let projects = project_rollups(handle, Facets::default()).unwrap();
         assert_eq!(projects.len(), 1);

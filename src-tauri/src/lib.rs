@@ -119,6 +119,7 @@ pub fn run() {
             queries::usage_summary,
             queries::usage_series,
             queries::session_rollups,
+            queries::session_detail,
             queries::project_rollups,
             capture::capture_status,
             capture::capture_set_paused,
