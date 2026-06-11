@@ -1,0 +1,15 @@
+# Build output
+build/
+.svelte-kit/
+dist/
+
+# Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Dependencies / lockfiles
+node_modules/
+pnpm-lock.yaml
+
+# Planning docs (hand-maintained tables; keep diffs minimal)
+docs/
