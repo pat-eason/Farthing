@@ -54,6 +54,7 @@ struct InvokeArgs {
     descending: Option<bool>,
     limit: Option<u32>,
     offset: Option<u32>,
+    session_id: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -112,6 +113,16 @@ async fn invoke(
             args.offset.unwrap_or(0),
             now,
         )),
+        "session_detail" => match &args.session_id {
+            Some(session_id) => to_json(queries::session_detail_for(
+                &db,
+                session_id,
+                &args.facets,
+                queries::DETAIL_REQUEST_LIMIT,
+                now,
+            )),
+            None => return cors(StatusCode::BAD_REQUEST, "missing sessionId".into()),
+        },
         "project_rollups" => to_json(queries::project_rollups_for(&db, &args.facets, now)),
         "facet_options" => to_json(queries::facet_options_for(&db)),
         other => return cors(StatusCode::NOT_FOUND, format!("unknown command: {other}")),

@@ -120,6 +120,50 @@ export interface SessionRollup {
   models: string[];
 }
 
+/** One request in a session's drill-in timeline. */
+export interface RequestDetail {
+  timestamp_ms: number;
+  model: string | null;
+  /** Request origin tag (subagent, user, sdk, …); null = main. */
+  query_source: string | null;
+  /** "api_request" or "api_error". */
+  event_type: string;
+  /** Data source tag: "otel" (live) or "backfill" (transcript). */
+  source: string;
+  /** API-equivalent cost; null = unpriced (or an error row). */
+  cost_usd: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  /** 5m/1h cache-creation split where backfill data provides it. */
+  cache_creation_5m_tokens: number | null;
+  cache_creation_1h_tokens: number | null;
+  duration_ms: number | null;
+  error: string | null;
+}
+
+/** One model's share of a session (the drill-in model mix). */
+export interface ModelMix extends Aggregates {
+  /** null = rows with no model recorded (typically error rows). */
+  model: string | null;
+}
+
+/** A session's drill-in detail; the table's facets apply, so it always
+ * reconciles with the rollup row that was clicked. */
+export interface SessionDetail {
+  session_id: string;
+  /** Project directory; null = unknown project (no cwd mapping). */
+  cwd: string | null;
+  /** All matching rows (requests + errors); the timeline is capped at
+   * 1000 rows, this count never is. */
+  total_rows: number;
+  /** Per-request timeline, timestamp ascending. */
+  requests: RequestDetail[];
+  /** Per-model aggregates over all matching rows, cost-descending. */
+  models: ModelMix[];
+}
+
 /** One project's rollup. */
 export interface ProjectRollup extends Aggregates {
   /** Project directory; null = the unknown-project bucket. */
@@ -165,6 +209,11 @@ export function getSessionRollups(
   } = {}
 ): Promise<SessionRollup[]> {
   return invoke<SessionRollup[]>("session_rollups", { facets, ...options });
+}
+
+/** Read-only: one session's drill-in detail under the same facets. */
+export function getSessionDetail(sessionId: string, facets: Facets): Promise<SessionDetail> {
+  return invoke<SessionDetail>("session_detail", { sessionId, facets });
 }
 
 /** Read-only: faceted per-project rollups, cost-descending. */

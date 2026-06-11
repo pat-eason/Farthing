@@ -43,3 +43,33 @@ export function formatDate(ms: number): string {
     day: "numeric",
   });
 }
+
+/** Local date + time, e.g. "Jun 10, 14:26" (session start column). */
+export function formatDateTime(ms: number): string {
+  return new Date(ms).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Local time of day with seconds, e.g. "14:26:44" (request timeline). */
+export function formatTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+/** Compact elapsed time: "<1s", "45s", "5m 12s", "2h 14m". */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return "<1s";
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
