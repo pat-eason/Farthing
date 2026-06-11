@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod metrics;
 pub mod onboarding;
 pub mod pricing;
+pub mod queries;
 pub mod receiver;
 pub mod session;
 pub mod settings_merge;
@@ -114,6 +115,11 @@ pub fn run() {
             health::health_status,
             metrics::today_metrics,
             metrics::daily_costs,
+            queries::facet_options,
+            queries::usage_summary,
+            queries::usage_series,
+            queries::session_rollups,
+            queries::project_rollups,
             capture::capture_status,
             capture::capture_set_paused,
             onboarding::onboarding_status,
