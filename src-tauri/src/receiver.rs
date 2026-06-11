@@ -8,6 +8,8 @@
 //!   `api_error` events as `requests` rows
 //! - `POST /v1/metrics` — accepted and discarded by design; aggregations are
 //!   derived in SQL from log events (PRD FR-1)
+//! - `POST /session` — SessionStart hook mapping endpoint, see
+//!   [`crate::session`]
 //!
 //! The port is never auto-rebound: `settings.json` holds the literal
 //! endpoint, so a different port would silently break export. A port
@@ -125,6 +127,7 @@ pub fn router(ingest: IngestState) -> Router {
     Router::new()
         .route("/v1/logs", post(post_logs))
         .route("/v1/metrics", post(post_metrics))
+        .route("/session", post(crate::session::post_session))
         .with_state(ingest)
 }
 
@@ -305,6 +308,28 @@ mod tests {
         };
         assert_eq!(count, 1);
         assert_eq!(ingest.stats.snapshot().events_ingested, 1);
+    }
+
+    /// Route wiring for the SessionStart hook endpoint; behavior details are
+    /// tested in `crate::session`.
+    #[tokio::test]
+    async fn post_session_upserts_mapping_over_http() {
+        let (addr, _status, ingest, _dir) = start_test_receiver().await;
+        let body = r#"{"session_id": "sess-hook", "cwd": "/tmp/project", "hook_event_name": "SessionStart", "source": "startup"}"#;
+        assert_eq!(http_post(addr, "/session", body).await, 200);
+
+        let cwd: String = {
+            let db = ingest.db.lock().unwrap();
+            db.conn()
+                .query_row(
+                    "SELECT cwd FROM sessions WHERE session_id = 'sess-hook' AND source = 'hook'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(cwd, "/tmp/project");
+        assert_eq!(http_post(addr, "/session", "{nope").await, 400);
     }
 
     #[tokio::test]
