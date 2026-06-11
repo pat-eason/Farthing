@@ -31,6 +31,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 axum = "0.8"
 tokio = { version = "1", features = ["net", "rt", "time"] }
+# Pricing-table remote refresh (pricing.rs): one GET against the pinned
+# LiteLLM price-list URL at app start. rustls so the binary doesn't depend
+# on the system TLS stack; already in the dependency tree via tauri.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Line diff for the onboarding before/after settings.json preview.
 similar = "2"
 
