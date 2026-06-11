@@ -9,6 +9,7 @@ pub mod onboarding;
 pub mod receiver;
 pub mod session;
 pub mod settings_merge;
+pub mod uninstall;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -45,7 +46,9 @@ pub fn run() {
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,
-            autostart::autostart_set
+            autostart::autostart_set,
+            uninstall::uninstall_status,
+            uninstall::uninstall_apply
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

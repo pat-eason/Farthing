@@ -110,7 +110,7 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 | 2.1 | settings.json merge engine | Read/parse, deep-merge of env block + SessionStart hook entry, timestamped backup, strict unmerge of app-owned keys only; fixture test suite | High | L | 1.1 | done <!-- vk: --> |
 | 2.2 | Onboarding flow | First-run UI: detect config state, render diff preview, conflict detection (existing OTel vars), apply merge, "restart your sessions" notice | High | M | 2.1 | done <!-- vk: --> |
 | 2.3 | Autostart (LaunchAgent) | `tauri-plugin-autostart` integration; enabled during onboarding, toggleable in settings | High | S | 1.1 | done <!-- vk: --> |
-| 2.4 | Uninstall flow | Reverse merge, remove LaunchAgent, optional DB deletion, confirmation UX | Medium | M | 2.1, 2.3 | <!-- vk: --> |
+| 2.4 | Uninstall flow | Reverse merge, remove LaunchAgent, optional DB deletion, confirmation UX | Medium | M | 2.1, 2.3 | done <!-- vk: --> |
 | 2.5 | Health & diagnostics view | Receiver status, last-event-at, config installed/missing/conflicting, port conflict surfacing, "configured but no events" detector with causes | Medium | M | 1.4, 2.2 | <!-- vk: --> |
 
 ### Task Details
@@ -132,9 +132,9 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 - [x] Toggle off removes the LaunchAgent; state reflected accurately in settings UI — `/settings` view with start-at-login toggle; `autostart_set(false)` removes the plist only when registered (idempotent), and the UI always re-reads `autostart_status` (live `is_enabled()`, never cached) after every action, including refusals/errors
 
 **2.4 - Uninstall flow**
-- [ ] Uninstall removes app-owned settings.json entries, the LaunchAgent, and (only if opted-in) the database
-- [ ] A Claude Code session started post-uninstall exports nothing and logs no hook errors
-- [ ] Confirmation dialog states exactly what will and won't be removed
+- [x] Uninstall removes app-owned settings.json entries, the LaunchAgent, and (only if opted-in) the database — `src-tauri/src/uninstall.rs` `uninstall_apply(delete_database)`: strict unmerge gates everything (a settings error aborts with nothing touched), then best-effort LaunchAgent removal (re-reads real state on failure) and opt-in deletion of `usage.db` + `-wal`/`-shm` sidecars under the DB mutex (safe with the connection open; data vanishes when the app exits). settings.json backups are deliberately kept
+- [x] A Claude Code session started post-uninstall exports nothing and logs no hook errors — verified live against a scratch settings file: merge → unmerge restored the exact user content, then `claude -p --settings <unmerged>` with the production receiver on 43177 yielded 0 requests/0 sessions rows and a completely empty stderr; control run with the merged file on the same harness produced 1 request + 1 session row
+- [x] Confirmation dialog states exactly what will and won't be removed — `uninstall_status` drives the dialog in `src/routes/settings/+page.svelte`: will-remove list (settings entries with the literal line diff, LaunchAgent live state, opt-in DB checkbox with size/path) and won't-remove list (rest of settings.json, backups dir, the app bundle itself with quit-and-Trash instructions)
 
 **2.5 - Health & diagnostics view**
 - [ ] Shows: receiver listening (or port-conflict error), last event received timestamp, settings.json state (installed/missing/conflicting), backfill progress
