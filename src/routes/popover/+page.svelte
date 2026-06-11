@@ -16,6 +16,7 @@
     PAUSED_CHANGED_EVENT,
     type CaptureStatus,
   } from "$lib/capture";
+  import { openMainWindow } from "$lib/window";
   import Sparkline from "$lib/Sparkline.svelte";
 
   /** Trailing debounce for ingest-push refreshes: one batched export can
@@ -54,6 +55,16 @@
   async function resume() {
     try {
       paused = (await setCapturePaused(false)).paused;
+    } catch (err) {
+      errorMessage = String(err);
+    }
+  }
+
+  // Task 5.1: hand off to the desktop window (backend hides the popover and
+  // flips the activation policy so the Dock icon appears).
+  async function openApp() {
+    try {
+      await openMainWindow();
     } catch (err) {
       errorMessage = String(err);
     }
@@ -231,6 +242,12 @@
       <p class="footnote">fetched + rendered in {renderMs.toFixed(1)}ms (dev)</p>
     {/if}
   {/if}
+
+  <footer class="open-app-row">
+    <button type="button" class="open-app" onclick={() => void openApp()}>
+      Open Claude Usage Tracker
+    </button>
+  </footer>
 </main>
 
 <style>
@@ -443,6 +460,31 @@
     line-height: 1.35;
   }
 
+  .open-app-row {
+    margin-top: 0.7rem;
+    padding-top: 0.55rem;
+    border-top: 1px solid rgba(0, 0, 0, 0.12);
+  }
+
+  .open-app {
+    appearance: none;
+    width: 100%;
+    border: none;
+    margin: 0;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: #1d1d1f;
+    background: rgba(0, 0, 0, 0.06);
+    cursor: pointer;
+  }
+
+  .open-app:hover {
+    background: rgba(0, 0, 0, 0.1);
+  }
+
   @media (prefers-color-scheme: dark) {
     .popover {
       color: #f5f5f7;
@@ -489,6 +531,19 @@
 
     .resume-button {
       background: #409cff;
+    }
+
+    .open-app-row {
+      border-top-color: rgba(255, 255, 255, 0.16);
+    }
+
+    .open-app {
+      color: #f5f5f7;
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .open-app:hover {
+      background: rgba(255, 255, 255, 0.16);
     }
   }
 </style>

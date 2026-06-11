@@ -3,7 +3,10 @@
   // settings.json diff, surface conflicts for an explicit choice, apply the
   // merge, then tell the user to restart running Claude Code sessions.
   // Nothing is written until the user confirms on the preview (or conflict)
-  // screen; re-running on a configured machine lands on "already configured".
+  // screen. Since the desktop shell exists (task 5.1), an already-configured
+  // machine forwards straight to the dashboard instead of parking on the
+  // "already configured" screen (apply is still a no-op either way).
+  import { goto } from "$app/navigation";
   import { resolve } from "$app/paths";
   import {
     applyOnboarding,
@@ -23,7 +26,13 @@
     screen = "loading";
     try {
       status = await getOnboardingStatus();
-      screen = status.changed ? "preview" : "configured";
+      if (status.changed) {
+        screen = "preview";
+      } else {
+        // Already configured: the desktop window's home is the dashboard.
+        screen = "configured";
+        await goto(resolve("/(app)/cost"), { replaceState: true });
+      }
     } catch (err) {
       errorMessage = String(err);
       screen = "error";
@@ -67,16 +76,7 @@
     </p>
     <button onclick={() => void refresh()}>Try again</button>
   {:else if screen === "configured"}
-    <h1>Already configured</h1>
-    <p>
-      <code>{status?.settings_path}</code> already contains everything this app needs. Running setup again
-      would change nothing.
-    </p>
-    <div class="row">
-      <a class="button-link" href={resolve("/health")}>Open health view</a>
-      <a class="button-link" href={resolve("/settings")}>Settings</a>
-      <button onclick={() => void refresh()}>Re-check</button>
-    </div>
+    <p class="muted">Already configured. Opening the dashboard…</p>
   {:else if screen === "preview" && status}
     <h1>Set up usage tracking</h1>
     <p>
@@ -151,19 +151,19 @@
     {#if outcome?.autostart_enabled}
       <p class="muted">
         The app is registered to start at login so the receiver is always up. You can turn this off
-        in <a href={resolve("/settings")}>settings</a>.
+        in <a href={resolve("/(app)/settings")}>settings</a>.
       </p>
     {:else}
       <p class="muted">
         Start at login is not enabled{outcome?.autostart_note
           ? ` (${outcome.autostart_note})`
-          : ""}. You can enable it in <a href={resolve("/settings")}>settings</a>.
+          : ""}. You can enable it in <a href={resolve("/(app)/settings")}>settings</a>.
       </p>
     {/if}
-    <p>
-      <a class="button-link" href={resolve("/health")}>Open the health view</a> to confirm events are
-      flowing.
-    </p>
+    <div class="row">
+      <a class="button-link" href={resolve("/(app)/cost")}>Open the dashboard</a>
+      <a class="button-link" href={resolve("/(app)/health")}>Open the health view</a>
+    </div>
   {/if}
 </main>
 

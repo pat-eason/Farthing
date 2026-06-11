@@ -187,6 +187,21 @@ pub fn sync_paused_ui<R: Runtime>(app: &AppHandle<R>, paused: bool) {
     }
 }
 
+/// Frontend command (task 5.1): the popover's "Open app" button opens the
+/// desktop window. Commands run off the main thread, and activation-policy /
+/// window mutations must happen on it (same constraint as the tray-menu
+/// mutations found in task 4.4), so the actual work is dispatched.
+#[tauri::command]
+pub fn open_main_window<R: Runtime>(app: AppHandle<R>) {
+    // The popover would hide on focus loss anyway once the main window takes
+    // focus; hiding it here makes the handoff immediate.
+    if let Some(popover) = app.get_webview_window(POPOVER_WINDOW) {
+        let _ = popover.hide();
+    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || show_main_window(&handle));
+}
+
 /// Opens (or re-focuses) the desktop window and brings back the Dock icon.
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
@@ -258,6 +273,16 @@ mod tests {
             .expect("mock app");
         sync_paused_ui(app.handle(), true);
         sync_paused_ui(app.handle(), false);
+    }
+
+    /// The command must tolerate missing windows (mock runtime has none):
+    /// it dispatches to the main thread and silently no-ops.
+    #[test]
+    fn open_main_window_tolerates_missing_windows() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        open_main_window(app.handle().clone());
     }
 
     #[test]

@@ -121,7 +121,8 @@ pub fn run() {
             autostart::autostart_status,
             autostart::autostart_set,
             uninstall::uninstall_status,
-            uninstall::uninstall_apply
+            uninstall::uninstall_apply,
+            tray::open_main_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
