@@ -13,6 +13,7 @@ pub mod receiver;
 pub mod session;
 pub mod settings_merge;
 pub mod transcript;
+pub mod tray;
 pub mod uninstall;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -25,6 +26,12 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // Anchors the popover window to the tray icon (tray.rs feeds it the
+        // tray events it positions against).
+        .plugin(tauri_plugin_positioner::init())
+        // Popover click-away dismissal + main-window close → hide +
+        // activation policy flip (tray.rs, task 4.1).
+        .on_window_event(tray::handle_window_event)
         .setup(|app| {
             // macOS: ~/Library/Application Support/com.peason.farthing
             let data_dir = app.path().app_data_dir()?;
@@ -68,6 +75,11 @@ pub fn run() {
             let status = receiver::new_status();
             app.manage(receiver::ReceiverState(Arc::clone(&status)));
             tauri::async_runtime::spawn(receiver::run(status, ingest_state));
+
+            // Menu bar presence (task 4.1): tray icon + menu, popover shell,
+            // ActivationPolicy::Accessory (no Dock icon until the desktop
+            // window opens).
+            tray::setup(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

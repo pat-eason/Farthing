@@ -12,9 +12,26 @@
   "app": {
     "windows": [
       {
-        "title": "farthing",
+        "label": "main",
+        "title": "Claude Usage Tracker",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "visible": false
+      },
+      {
+        "label": "popover",
+        "url": "/popover",
+        "title": "Claude Usage Tracker",
+        "width": 320,
+        "height": 400,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {
