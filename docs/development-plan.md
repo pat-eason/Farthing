@@ -107,7 +107,7 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
-| 2.1 | settings.json merge engine | Read/parse, deep-merge of env block + SessionStart hook entry, timestamped backup, strict unmerge of app-owned keys only; fixture test suite | High | L | 1.1 | <!-- vk: --> |
+| 2.1 | settings.json merge engine | Read/parse, deep-merge of env block + SessionStart hook entry, timestamped backup, strict unmerge of app-owned keys only; fixture test suite | High | L | 1.1 | done <!-- vk: --> |
 | 2.2 | Onboarding flow | First-run UI: detect config state, render diff preview, conflict detection (existing OTel vars), apply merge, "restart your sessions" notice | High | M | 2.1 | <!-- vk: --> |
 | 2.3 | Autostart (LaunchAgent) | `tauri-plugin-autostart` integration; enabled during onboarding, toggleable in settings | High | S | 1.1 | <!-- vk: --> |
 | 2.4 | Uninstall flow | Reverse merge, remove LaunchAgent, optional DB deletion, confirmation UX | Medium | M | 2.1, 2.3 | <!-- vk: --> |
@@ -116,10 +116,10 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 ### Task Details
 
 **2.1 - settings.json merge engine**
-- [ ] Merge adds exactly: 5 `env` keys + 1 `SessionStart` hook entry; all other content byte-preserved (key order/formatting changes acceptable, data loss is not)
-- [ ] Timestamped backup written to a backups dir before any write; restore-from-backup function works
-- [ ] Unmerge removes only app-owned keys/hook entries and leaves user content intact, including when the user edited adjacent config after install
-- [ ] Fixture suite covers: missing file, empty file, real-world large settings.json, pre-existing env block, pre-existing SessionStart hooks, malformed JSON (abort, never write)
+- [x] Merge adds exactly: 5 `env` keys + 1 `SessionStart` hook entry; all other content byte-preserved (key order/formatting changes acceptable, data loss is not) — `src-tauri/src/settings_merge.rs` `APP_ENV` (1.6-verified 4-key block + generic `OTEL_EXPORTER_OTLP_PROTOCOL`, see `docs/notes/otel-schema.md`); key order kept via serde_json `preserve_order`
+- [x] Timestamped backup written to a backups dir before any write; restore-from-backup function works — `settings-<UTC ts>.json`, byte-exact copy, collision-safe; no-op merges take no backup
+- [x] Unmerge removes only app-owned keys/hook entries and leaves user content intact, including when the user edited adjacent config after install — env keys removed only at the exact app value (user-edited value = user ownership); hooks matched on the `/session` endpoint marker
+- [x] Fixture suite covers: missing file, empty file, real-world large settings.json, pre-existing env block, pre-existing SessionStart hooks, malformed JSON (abort, never write) — 20 tests, fixtures in `src-tauri/tests/fixtures/settings/` (realworld.json is an anonymized real settings.json)
 
 **2.2 - Onboarding flow**
 - [ ] First launch shows a literal before/after diff of settings.json changes; nothing is written until the user confirms

@@ -13,3 +13,7 @@ pnpm-lock.yaml
 
 # Planning docs (hand-maintained tables; keep diffs minimal)
 docs/
+
+# settings.json merge-engine fixtures: byte-exact test inputs, one
+# intentionally malformed (prettier cannot parse it by design)
+src-tauri/tests/fixtures/settings/
