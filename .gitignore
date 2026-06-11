@@ -8,3 +8,6 @@ node_modules
 !.env.example
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# task 1.6 e2e harness scratch dir (see docs/notes/otel-schema.md)
+/.e2e
