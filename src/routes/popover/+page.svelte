@@ -17,6 +17,7 @@
     type CaptureStatus,
   } from "$lib/capture";
   import { openMainWindow } from "$lib/window";
+  import { formatCost, formatTokens, projectName } from "$lib/format";
   import Sparkline from "$lib/Sparkline.svelte";
 
   /** Trailing debounce for ingest-push refreshes: one batched export can
@@ -77,28 +78,6 @@
   }
 
   const sparklineTotal = $derived((dailyCosts ?? []).reduce((sum, day) => sum + day.cost_usd, 0));
-
-  function formatCost(value: number): string {
-    if (value === 0) return "$0.00";
-    if (value < 0.01) return "<$0.01";
-    if (value >= 1000) return `$${Math.round(value).toLocaleString()}`;
-    if (value >= 100) return `$${value.toFixed(0)}`;
-    return `$${value.toFixed(2)}`;
-  }
-
-  function formatTokens(value: number): string {
-    if (value < 1_000) return String(value);
-    if (value < 1_000_000) return `${(value / 1_000).toFixed(1)}k`;
-    if (value < 1_000_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-    return `${(value / 1_000_000_000).toFixed(1)}B`;
-  }
-
-  /** Display name for a project: the last path segment of the session cwd. */
-  function projectName(cwd: string | null): string {
-    if (cwd === null) return "(unknown project)";
-    const segments = cwd.split("/").filter((s) => s.length > 0);
-    return segments[segments.length - 1] ?? cwd;
-  }
 
   function dayLabel(ms: number): string {
     return new Date(ms).toLocaleDateString(undefined, {
