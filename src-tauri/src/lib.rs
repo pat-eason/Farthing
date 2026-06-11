@@ -4,15 +4,10 @@ use tauri::Manager;
 
 pub mod db;
 pub mod ingest;
+pub mod onboarding;
 pub mod receiver;
 pub mod session;
 pub mod settings_merge;
-
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -38,9 +33,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             receiver::receiver_status,
-            ingest::ingest_stats
+            ingest::ingest_stats,
+            onboarding::onboarding_status,
+            onboarding::onboarding_apply
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

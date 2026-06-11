@@ -28,6 +28,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 axum = "0.8"
 tokio = { version = "1", features = ["net", "rt", "time"] }
+# Line diff for the onboarding before/after settings.json preview.
+similar = "2"
 
 
 [lints.clippy]
