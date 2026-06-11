@@ -21,7 +21,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: the settings.json merge engine (settings_merge.rs) rewrites
+# the user's ~/.claude/settings.json and must keep their key order stable so
+# rewrites produce minimal, reviewable diffs.
+serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 axum = "0.8"
 tokio = { version = "1", features = ["net", "rt", "time"] }

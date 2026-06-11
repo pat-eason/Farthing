@@ -1,0 +1,81 @@
+{
+  "model": "fable",
+  "statusLine": {
+    "type": "command",
+    "command": "npx -y ccstatusline@latest",
+    "padding": 0,
+    "refreshInterval": 10
+  },
+  "enabledPlugins": {
+    "compound-engineering@compound-engineering-plugin": true,
+    "rust-analyzer-lsp@claude-plugins-official": true,
+    "local-plugin@local-marketplace": true
+  },
+  "extraKnownMarketplaces": {
+    "compound-engineering-plugin": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/EveryInc/every-marketplace.git"
+      }
+    },
+    "local-marketplace": {
+      "source": {
+        "source": "directory",
+        "path": "/Users/someone/Projects/local-plugin"
+      }
+    }
+  },
+  "spinnerVerbs": {
+    "mode": "replace",
+    "verbs": [
+      "Implicating",
+      "Demonstrating Value",
+      "Engaging Physically",
+      "Nurturing Dependence",
+      "Neglecting Emotionally",
+      "Inspiring Hope",
+      "Separating Entirely",
+      "Offering Eggs in Trying Times",
+      "Becoming a Golden God",
+      "Doing a Thing",
+      "Getting Real Weird with It",
+      "Cultivating Mass",
+      "Harvesting Mass",
+      "Bird Law-ing",
+      "Making Paddy's Great Again",
+      "Employing Ocular Patdowns",
+      "Karate Chopping the Air",
+      "Day Manning",
+      "Fighting the Night Man",
+      "Defending the Sun",
+      "Making Rum Ham",
+      "Paying the Troll Toll",
+      "Achieving Boy's Soul",
+      "Starting a Scheme",
+      "Scheming Uncontrollably",
+      "Going America All Over Everybody",
+      "Popping Off Shirts",
+      "Reading Good and Other Things Too",
+      "Milking Cats",
+      "Huffing Glue",
+      "Smashing Rats",
+      "Wildcarding",
+      "Intervening Aggressively",
+      "Ceasing Investigations",
+      "Peaking Spectacularly",
+      "Untethering Rage",
+      "Savaging Idiots",
+      "Pulling Up Bootstraps",
+      "Operating Paddy's Pub",
+      "Generating Revenue",
+      "Establishing Dominance",
+      "Boiling Denim",
+      "Banging Trash Cans",
+      "Employing the DENIS method"
+    ]
+  },
+  "alwaysThinkingEnabled": true,
+  "effortLevel": "xhigh",
+  "autoMemoryDirectory": "~/.claude/memory",
+  "skipDangerousModePermissionPrompt": true
+}
