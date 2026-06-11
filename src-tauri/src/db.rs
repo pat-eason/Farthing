@@ -80,6 +80,22 @@ const MIGRATIONS: &[&str] = &[
         ON requests (request_id)
         WHERE request_id IS NOT NULL;
     ",
+    // v3: covering index for time-windowed rollups (popover today-metrics,
+    // task 4.2; the 4.3 sparkline and Epic 5 cost-over-time queries hit the
+    // same shape). With only `(timestamp_ms)` indexed, every row in the
+    // window costs a main-table probe (~58ms for a 15k-request day at 120k
+    // total rows; the popover budget is <100ms). This index makes the
+    // rollup queries index-only scans (~1ms). `idx_requests_timestamp` is
+    // dropped: its key is the leftmost prefix of this one, so every query
+    // it served is served at least as well here.
+    "
+    DROP INDEX idx_requests_timestamp;
+
+    CREATE INDEX idx_requests_time_rollup ON requests (
+        timestamp_ms, session_id, event_type, cost_usd,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+    );
+    ",
 ];
 
 /// Errors from opening or migrating the database.
@@ -284,7 +300,7 @@ mod tests {
 
         let indexes = index_names(db.conn());
         for index in [
-            "idx_requests_timestamp",
+            "idx_requests_time_rollup",
             "idx_requests_session_id",
             "idx_requests_model",
             "idx_requests_request_id",

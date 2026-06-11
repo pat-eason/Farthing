@@ -41,6 +41,9 @@ tokio = { version = "1", features = ["net", "rt", "time"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Line diff for the onboarding before/after settings.json preview.
 similar = "2"
+# Local-midnight day boundaries for the popover metrics (metrics.rs): the
+# PRD defines "today" as the user's local calendar day, DST-correct.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 
 [lints.clippy]
