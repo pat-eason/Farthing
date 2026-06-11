@@ -256,7 +256,7 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 | 5.2 | Faceted query layer | Tauri commands wrapping SQL aggregations with shared facet params (project, model, date range, query_source); seed-data script for dev | High | M | 1.2 | done <!-- vk: --> |
 | 5.3 | Cost-over-time view | Line/bar chart, day/week/month/all ranges, stack by model or project | High | M | 5.1, 5.2 | done <!-- vk: --> |
 | 5.4 | Sessions view | Sortable table (cost, tokens, duration, project, models) + per-session detail drill-in | Medium | M | 5.1, 5.2 | done <!-- vk: --> |
-| 5.5 | Tokens & cache view | In/out/cache-read/cache-creation over time; cache hit-rate trend | Medium | M | 5.1, 5.2 | <!-- vk: --> |
+| 5.5 | Tokens & cache view | In/out/cache-read/cache-creation over time; cache hit-rate trend | Medium | M | 5.1, 5.2 | done <!-- vk: --> |
 | 5.6 | Projects view | Per-directory rollups (cost, tokens, sessions), cleaned path display | Medium | S | 5.1, 5.2 | <!-- vk: --> |
 
 ### Task Details
@@ -283,9 +283,9 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 - [x] Sessions with no cwd mapping display as "unknown project," not errors — `SessionRollup.cwd`/`SessionDetail.cwd` stay NULL through the query layer (unit test covers NULL-cwd sessions, orphan session ids, and fully unknown ids returning empty data, never an error); the table renders them via `projectName(null)` = "(unknown project)" (italicized) and the drill-in header does the same. Browser-verified: seed's NULL-cwd sessions and `seed-orphan-27` (no sessions row at all) both listed, sorted, and drilled into normally
 
 **5.5 - Tokens & cache view**
-- [ ] Four token series charted over time with same range controls as 5.3
-- [ ] Cache hit-rate trend (cache_read / (cache_read + input)) defined in UI copy and matches SQL
-- [ ] 5m vs 1h cache-creation split visible where backfill data provides it
+- [x] Four token series charted over time with same range controls as 5.3 — `/tokens` view (`src/routes/(app)/tokens/+page.svelte`): four small-multiple `StackedBarChart`s (Input/Output/Cache read/Cache creation) over one ungrouped `usage_series` fetch, headline totals from the same `usage_summary` the other views reconcile against; the shared FacetBar supplies the identical range controls (day/week/month/all/custom) and facets. Browser-verified through `query_bridge` on a 150k-row seed: presets rendered 1/7/30/76 buckets, custom 2026-05-20→05-29 rendered 10; summary ≡ Σseries for all four counters in every window, and the month window matched an independent Python/sqlite3 scan exactly (in 15,303,327 / out 76,674,527 / cr 2,733,118,527 / cc 278,830,527); 2020 custom window rendered the empty-state card; light/dark screenshot-verified
+- [x] Cache hit-rate trend (cache_read / (cache_read + input)) defined in UI copy and matches SQL — dedicated trend chart with the definition printed beneath it ("Cache hit rate = cache read ÷ (cache read + input) tokens: the share of prompt tokens served from cache"); days with no prompt tokens draw no bar (rate null, not zero) and the header carries the overall rate. Browser-verified against SQL: overall 99.4432% unfaceted month (SQL: 99.4432%), per-day tooltips 99.5%/99.4% for Jun 10/11 (SQL: 99.5/99.4), custom window 99.4430% (SQL: 99.4430%), and month+sonnet+subagent 99.4431% with split 26,054,941/8,689,320 (SQL identical), so the trend holds under facets too
+- [x] 5m vs 1h cache-creation split visible where backfill data provides it — `SeriesPoint` now carries `cache_creation_5m_tokens`/`cache_creation_1h_tokens` (same NULL-when-absent semantics as `usage_summary`; both v4 covering indexes already include the columns so every scan stays index-only, and grouped series carry the split per key). The cache-creation chart stacks 5m TTL / 1h TTL / "unsplit (live capture)" per day with split totals in the card legend, falling back to a "split unavailable: transcript-backfilled data only" note when no matching row carries it. Tooltip-verified vs SQL (Jun 10: 5m 613.4k / 1h 204.6k / unsplit 5.0M ≡ 613,447/204,583/5,004,461); 2 new rust tests pin per-bucket split ≡ per-window summary split and the serde shape (206 total green)
 
 **5.6 - Projects view**
 - [ ] Directories rolled up with cost, tokens, session counts; sorted by cost
