@@ -209,7 +209,7 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
-| 4.1 | Tray icon & popover shell | Tauri v2 TrayIcon, popover window anchored to tray, `ActivationPolicy::Accessory`, menu (open app / pause / quit) | High | M | 1.1 | <!-- vk: --> |
+| 4.1 | Tray icon & popover shell | Tauri v2 TrayIcon, popover window anchored to tray, `ActivationPolicy::Accessory`, menu (open app / pause / quit) | High | M | 1.1 | done <!-- vk: --> |
 | 4.2 | Today-metrics queries & popover content | SQL aggregations (local-midnight day boundary, distinct session_ids), popover layout: cost, in/out/cache tokens, sessions, top 3 projects | High | M | 1.4, 4.1 | <!-- vk: --> |
 | 4.3 | Sparkline | 7/30-day cost sparkline in popover (uPlot/LayerCake) | Medium | S | 4.2 | <!-- vk: --> |
 | 4.4 | Live updates & pause/resume | Rust→frontend event push on ingest; pause state (receiver 200+discard), paused badge, resume | Medium | M | 4.2 | <!-- vk: --> |
@@ -217,9 +217,9 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 ### Task Details
 
 **4.1 - Tray icon & popover shell**
-- [ ] Tray icon visible; click opens popover positioned at the tray; click-away dismisses
-- [ ] No Dock icon while only the popover exists; Dock icon appears when the desktop window opens and disappears when it closes
-- [ ] Menu actions wired: open desktop app, pause/resume (stub ok until 4.4), quit
+- [x] Tray icon visible; click opens popover positioned at the tray; click-away dismisses — live-verified with synthetic CGEvent clicks on the status item: popover shows anchored under the icon (screenshot-confirmed), a click elsewhere hides it, and a second tray click closes instead of reopening (300ms auto-hide suppression window)
+- [x] No Dock icon while only the popover exists; Dock icon appears when the desktop window opens and disappears when it closes — `lsappinfo` ApplicationType observed as `UIElement` at startup and with the popover open, `Foreground` after the open-app menu item, back to `UIElement` after closing the window (close is intercepted: hide + policy flip, app stays resident)
+- [x] Menu actions wired: open desktop app, pause/resume (stub ok until 4.4), quit — all three exercised via the real tray menu: open shows + focuses `main`, "Pause capture" check state toggles and mirrors into `TrayState::paused` (receiver hookup is 4.4), quit exits the process
 
 **4.2 - Today-metrics queries & popover content**
 - [ ] Day = local midnight boundary; sessions = distinct session_ids active today (resume doesn't double-count)
