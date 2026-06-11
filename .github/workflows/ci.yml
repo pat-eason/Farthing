@@ -68,5 +68,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+      - name: Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
       - name: Tauri build
         run: pnpm tauri build --bundles app
