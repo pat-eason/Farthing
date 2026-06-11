@@ -18,8 +18,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon: menu bar status item (tray.rs, task 4.1).
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+# Positions the popover window under the tray icon (multi-monitor and
+# scale-factor aware); fed by forwarding tray events in tray.rs.
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 # Login-item registration. macOS launcher mode is LaunchAgent (per PRD):
 # enable() writes ~/Library/LaunchAgents/<app>.plist, disable() removes it.
 tauri-plugin-autostart = "2"
