@@ -10,6 +10,7 @@ pub mod onboarding;
 pub mod receiver;
 pub mod session;
 pub mod settings_merge;
+pub mod transcript;
 pub mod uninstall;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
