@@ -48,6 +48,14 @@ Note the signal-specific endpoint is used **as-is** (it must include the
 `/v1/logs` path), unlike the generic endpoint which gets the path appended
 per the OTLP spec.
 
+**Task 2.1 implementation note**: the merge engine
+(`src/settings_merge.rs`, `APP_ENV`) writes these 4 keys plus the generic
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/json` (5 total, per the plan's acceptance
+criterion) as belt-and-suspenders for Claude Code versions that fall back to
+the generic protocol var. The generic `OTEL_EXPORTER_OTLP_ENDPOINT` is
+deliberately **not** written so the app never redirects other OTel signals a
+user may export elsewhere.
+
 ## Row-vs-transcript reconciliation
 
 Transcript files at

@@ -6,6 +6,7 @@ pub mod db;
 pub mod ingest;
 pub mod receiver;
 pub mod session;
+pub mod settings_merge;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]

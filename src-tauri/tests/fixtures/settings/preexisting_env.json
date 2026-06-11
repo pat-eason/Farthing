@@ -1,0 +1,16 @@
+{
+  "model": "sonnet",
+  "env": {
+    "MY_CUSTOM_VAR": "keep-me",
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_LOGS_EXPORTER": "console",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.internal:4318",
+    "OTEL_METRICS_EXPORTER": "otlp"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(npm run lint)",
+      "Bash(npm run test:*)"
+    ]
+  }
+}
