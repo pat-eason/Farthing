@@ -23,6 +23,8 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+axum = "0.8"
+tokio = { version = "1", features = ["net"] }
 
 
 [lints.clippy]
@@ -30,3 +32,4 @@ all = { level = "warn", priority = -1 }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
