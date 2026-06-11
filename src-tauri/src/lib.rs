@@ -121,6 +121,7 @@ pub fn run() {
             queries::session_rollups,
             queries::session_detail,
             queries::project_rollups,
+            queries::home_dir,
             capture::capture_status,
             capture::capture_set_paused,
             onboarding::onboarding_status,
