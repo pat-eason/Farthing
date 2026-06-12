@@ -328,6 +328,251 @@ pub fn alert_config_set<R: Runtime>(
     Ok(saved)
 }
 
+// ---- evaluation engine (Unit 4) ----
+//
+// The decision core is a *pure* function: [`evaluate`] takes the current instant,
+// the config, the prior runtime, and the already-queried spend sums, and returns
+// the notifications to show plus the runtime to persist. It touches no clock and
+// no database — the live-vs-historical discrimination lives in the query assembly
+// (the `process_start_ms` event-time floor passed into the Unit 2 priced-spend
+// query), *not* here, so `evaluate` simply consumes the already-floored sums and
+// stays deterministically testable. The helpers it leans on (`month_key`,
+// `in_quiet_hours`, the delta step math) are the shared primitives the Budgets
+// plan reuses for its approach/breach groups.
+
+/// The spend inputs [`evaluate`] consumes, already shaped by the query assembly
+/// (Unit 5 fills these from the Unit 2 priced-spend queries).
+///
+/// Both sums are *priced-only* (NULL-cost rows excluded, per `docs/notes/pricing.md`)
+/// and *event-time floored at `process_start_ms`* by the query, so spend recovered
+/// from before this process launched can never reach the engine. `evaluate` does
+/// not re-derive that floor; it trusts the caller assembled the windows correctly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sums {
+    /// Priced spend inside the burst rolling window, floored at
+    /// `max(now - window, process_start_ms)`. Compared against `threshold_usd`.
+    pub burst_window_priced_sum: f64,
+    /// Priced month-to-date spend counting only post-launch rows
+    /// (floored at `process_start_ms`). Drives the delta step ladder.
+    pub post_launch_priced_mtd: f64,
+}
+
+/// Which rule produced a [`Notification`]; mirrors the `rule_type` vocabulary in
+/// [`crate::notify`] so Unit 5 can route copy/test parity off one tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RuleType {
+    /// The session/burst rate alert.
+    Burst,
+    /// The recurring-delta milestone alert.
+    Delta,
+}
+
+/// A decision the engine made to alert: the title/body Unit 5 hands to
+/// [`crate::notify::show`], tagged with the rule that produced it. `evaluate`
+/// builds these; it never delivers them (no clock, no OS, no DB).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    pub rule_type: RuleType,
+    pub title: String,
+    pub body: String,
+}
+
+/// Wall-clock month key for `now_local`, e.g. `"2026-06"`. Derived from local
+/// time so a month rollover is observed the instant local midnight on the first
+/// passes, never from a tick count. The delta baseline keys on this so steps
+/// never carry across calendar months.
+pub fn month_key(now_local: chrono::DateTime<chrono::Local>) -> String {
+    now_local.format("%Y-%m").to_string()
+}
+
+/// Whether `now_local` falls inside a quiet-hours window, wrap-aware.
+///
+/// Membership is computed in *local* minutes-since-midnight (quiet hours are a
+/// wall-clock concept; cooldown durations are UTC ms and handled separately).
+/// A same-day window (`start <= end`) is the half-open interval `[start, end)`;
+/// an overnight window (`start > end`, e.g. 22:00–07:00) is `[start, 24:00) ∪
+/// [00:00, end)`. A degenerate `start == end` is treated as "unset" → never
+/// quiet (the UI never stores such a window, but a hand-edited config might).
+/// An unparseable `"HH:MM"` end is treated as not-quiet rather than panicking.
+pub fn in_quiet_hours(now_local: chrono::DateTime<chrono::Local>, quiet: &QuietWindow) -> bool {
+    let (Some(start), Some(end)) = (parse_hhmm(&quiet.start), parse_hhmm(&quiet.end)) else {
+        return false;
+    };
+    if start == end {
+        return false; // unset
+    }
+    let t = local_minutes(now_local);
+    if start < end {
+        (start..end).contains(&t)
+    } else {
+        t >= start || t < end
+    }
+}
+
+/// Parse `"HH:MM"` 24-hour local time to minutes-since-midnight (`0..=1439`).
+/// Returns `None` on anything malformed so a bad config row degrades to
+/// not-quiet rather than panicking on parse.
+fn parse_hhmm(value: &str) -> Option<u32> {
+    let (h, m) = value.split_once(':')?;
+    let h: u32 = h.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    if h >= 24 || m >= 60 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+/// Minutes since local midnight for `now_local` (`0..=1439`).
+fn local_minutes(now_local: chrono::DateTime<chrono::Local>) -> u32 {
+    use chrono::Timelike;
+    now_local.hour() * 60 + now_local.minute()
+}
+
+/// Highest milestone step crossed by `mtd` at `step_usd` increments:
+/// `floor(mtd / step_usd)`. A non-positive step (disabled/garbage config) yields
+/// `0` so the ladder never divides by zero or runs away.
+fn delta_step(mtd: f64, step_usd: f64) -> i64 {
+    if step_usd <= 0.0 || mtd <= 0.0 {
+        return 0;
+    }
+    (mtd / step_usd).floor() as i64
+}
+
+/// The pure decision core: given the current instant, the config, the prior
+/// runtime, and the already-floored spend sums, return the notifications to show
+/// and the runtime to persist.
+///
+/// `now_local` carries both halves the engine needs: `now_local.timestamp_millis()`
+/// is the UTC-ms instant used for cooldown arithmetic (DST-safe — a fall-back
+/// repeated local hour does not rewind monotonic UTC ms), and the local wall-clock
+/// fields drive quiet-hours membership and the month key. No other clock is read.
+///
+/// **Delta.** Re-baselines on a month rollover (the stored `month_key` differs
+/// from the current one): `last_step` resets to the step the current MTD already
+/// sits at, so the new month never replays the prior month's milestones. Within a
+/// month it fires once per newly-crossed step (`step > last_step`), and always
+/// advances `last_step` to the new step — even when quiet hours suppress the
+/// *notification* — so a suppressed milestone is dropped silently and never
+/// re-fires later (R17, no pending flag). A pre-bumped `last_step` (Unit 5's
+/// backfill re-baseline) is honored verbatim, so only post-bump live growth fires
+/// (C6/C7).
+///
+/// **Burst.** Fires when the floored rolling-window sum meets the threshold, the
+/// cooldown has elapsed (`now_ms >= cooldown_until_ms`), and it is not quiet. A
+/// fire arms the cooldown (`cooldown_until_ms = now_ms + cooldown`); a suppressed
+/// (quiet) or cooled-down crossing fires nothing and leaves the cooldown intact.
+pub fn evaluate(
+    now_local: chrono::DateTime<chrono::Local>,
+    config: &AlertConfig,
+    runtime: &AlertRuntime,
+    sums: Sums,
+) -> (Vec<Notification>, AlertRuntime) {
+    let now_ms = now_local.timestamp_millis();
+    let mut notifications = Vec::new();
+    let mut next = runtime.clone();
+
+    // ---- delta ----
+    let current_month = month_key(now_local);
+    let current_step = delta_step(sums.post_launch_priced_mtd, config.delta.step_usd);
+    if next.delta.month_key != current_month {
+        // Month rollover (or first-ever evaluation): re-baseline to where MTD
+        // already sits so the new month never replays passed milestones. No fire.
+        next.delta.month_key = current_month;
+        next.delta.last_step = current_step;
+    } else if config.delta.enabled && current_step > next.delta.last_step {
+        // A new milestone crossed by live, post-launch growth. Quiet hours
+        // suppress the notification but the baseline still advances, so the
+        // suppressed step is dropped silently and cannot re-fire later.
+        let quiet = config
+            .delta
+            .quiet
+            .as_ref()
+            .is_some_and(|q| in_quiet_hours(now_local, q));
+        if !quiet {
+            notifications.push(delta_notification(config, current_step));
+        }
+        next.delta.last_step = current_step;
+    }
+
+    // ---- burst ----
+    if config.burst.enabled
+        && sums.burst_window_priced_sum >= config.burst.threshold_usd
+        && now_ms >= next.burst.cooldown_until_ms
+    {
+        let quiet = config
+            .burst
+            .quiet
+            .as_ref()
+            .is_some_and(|q| in_quiet_hours(now_local, q));
+        if !quiet {
+            notifications.push(burst_notification(config, sums.burst_window_priced_sum));
+            // Arm the cooldown in UTC ms (durations never use local time).
+            next.burst.cooldown_until_ms =
+                now_ms + i64::from(config.burst.cooldown_minutes) * 60_000;
+        }
+        // A quiet crossing fires nothing and leaves the cooldown unarmed: the
+        // next non-quiet crossing is free to fire (R17 drop, no pending flag).
+    }
+
+    (notifications, next)
+}
+
+/// Build the delta milestone copy. Amount = `step * step_usd` (the milestone the
+/// user just crossed). Copy switches to real-money wording when `api_billing` is
+/// set, neutral usage wording otherwise.
+fn delta_notification(config: &AlertConfig, step: i64) -> Notification {
+    let amount = step as f64 * config.delta.step_usd;
+    let (title, body) = if config.api_billing {
+        (
+            "Spend milestone",
+            format!("You've spent ${} this month", fmt_usd(amount)),
+        )
+    } else {
+        (
+            "Usage milestone",
+            format!("${} of usage this month", fmt_usd(amount)),
+        )
+    };
+    Notification {
+        rule_type: RuleType::Delta,
+        title: title.to_string(),
+        body,
+    }
+}
+
+/// Build the burst copy. `sum` is the priced spend in the rolling window that
+/// armed the alert; `window_minutes` frames it. Real-money vs neutral per
+/// `api_billing`.
+fn burst_notification(config: &AlertConfig, sum: f64) -> Notification {
+    let minutes = config.burst.window_minutes;
+    let (title, body) = if config.api_billing {
+        (
+            "Spend spike",
+            format!("${} spent in the last {minutes} minutes", fmt_usd(sum)),
+        )
+    } else {
+        (
+            "Usage spike",
+            format!("${} of usage in the last {minutes} minutes", fmt_usd(sum)),
+        )
+    };
+    Notification {
+        rule_type: RuleType::Burst,
+        title: title.to_string(),
+        body,
+    }
+}
+
+/// Format a USD amount for notification copy: whole dollars render without a
+/// decimal (`$50`), fractional amounts keep two places (`$12.40`).
+fn fmt_usd(amount: f64) -> String {
+    if amount.fract() == 0.0 {
+        format!("{}", amount as i64)
+    } else {
+        format!("{amount:.2}")
+    }
+}
+
 /// Re-evaluation seam invoked by [`alert_config_set`] after a config save.
 ///
 /// **Unit 5 fills this in.** It will acquire the [`AlertState`] eval lock and run
@@ -615,5 +860,449 @@ mod tests {
         // Defaults surface through the command.
         assert!(config.burst.enabled);
         assert_eq!(config.delta.step_usd, 50.0);
+    }
+
+    // ---- evaluation engine (Unit 4) ----
+    //
+    // `evaluate` is pure; these table-driven cases ARE the spec (the flow-analysis
+    // edge cases C6, C7, I1, R17, M2 and the cooldown/process-start scenarios).
+    // Sums arrive already event-time-floored by the query assembly, so a
+    // "pre-launch spend" case just means a small `burst_window_priced_sum`.
+
+    /// A fixed local instant for cases that don't care about the wall clock
+    /// (no quiet windows, mid-month so no rollover surprises). 2026-06-15 12:00.
+    fn at_noon() -> chrono::DateTime<chrono::Local> {
+        local_at(2026, 6, 15, 12, 0)
+    }
+
+    /// Build a `DateTime<Local>` for a wall-clock local date/time. Used so quiet
+    /// and rollover cases pin the *local* fields the engine reads.
+    fn local_at(
+        y: i32,
+        mo: u32,
+        d: u32,
+        h: u32,
+        mi: u32,
+    ) -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap();
+        chrono::Local.from_local_datetime(&naive).single().unwrap()
+    }
+
+    /// Delta-only config at `step_usd`, no quiet hours.
+    fn delta_config(step_usd: f64) -> AlertConfig {
+        AlertConfig {
+            delta: DeltaConfig {
+                enabled: true,
+                step_usd,
+                quiet: None,
+            },
+            burst: BurstConfig {
+                enabled: false,
+                ..BurstConfig::default()
+            },
+            api_billing: false,
+        }
+    }
+
+    /// Burst-only config; delta disabled.
+    fn burst_config(threshold_usd: f64, window_minutes: u32, cooldown_minutes: u32) -> AlertConfig {
+        AlertConfig {
+            delta: DeltaConfig {
+                enabled: false,
+                ..DeltaConfig::default()
+            },
+            burst: BurstConfig {
+                enabled: true,
+                threshold_usd,
+                window_minutes,
+                cooldown_minutes,
+                quiet: None,
+            },
+            api_billing: false,
+        }
+    }
+
+    /// Runtime whose delta baseline already keys on the evaluation month, so the
+    /// first `evaluate` exercises step logic rather than the rollover re-baseline.
+    fn runtime_for(now: chrono::DateTime<chrono::Local>, last_step: i64) -> AlertRuntime {
+        AlertRuntime {
+            delta: DeltaRuntime {
+                month_key: month_key(now),
+                last_step,
+            },
+            burst: BurstRuntime::default(),
+            permission_lost: false,
+        }
+    }
+
+    fn sums(burst: f64, mtd: f64) -> Sums {
+        Sums {
+            burst_window_priced_sum: burst,
+            post_launch_priced_mtd: mtd,
+        }
+    }
+
+    // ---- month_key & quiet-hours primitives ----
+
+    #[test]
+    fn month_key_is_year_dash_month() {
+        assert_eq!(month_key(local_at(2026, 6, 15, 12, 0)), "2026-06");
+        assert_eq!(month_key(local_at(2026, 12, 1, 0, 0)), "2026-12");
+        assert_eq!(month_key(local_at(2027, 1, 31, 23, 59)), "2027-01");
+    }
+
+    /// I1: a wrap-around quiet window classifies the overnight hours as quiet and
+    /// daytime as not-quiet.
+    #[test]
+    fn quiet_hours_wrap_window_classifies_overnight() {
+        let quiet = QuietWindow {
+            start: "22:00".into(),
+            end: "07:00".into(),
+        };
+        assert!(in_quiet_hours(local_at(2026, 6, 15, 23, 30), &quiet), "23:30 is quiet");
+        assert!(in_quiet_hours(local_at(2026, 6, 16, 2, 0), &quiet), "02:00 is quiet");
+        assert!(!in_quiet_hours(local_at(2026, 6, 15, 8, 0), &quiet), "08:00 is awake");
+        // Boundaries: start inclusive, end exclusive.
+        assert!(in_quiet_hours(local_at(2026, 6, 15, 22, 0), &quiet), "22:00 start inclusive");
+        assert!(!in_quiet_hours(local_at(2026, 6, 15, 7, 0), &quiet), "07:00 end exclusive");
+    }
+
+    #[test]
+    fn quiet_hours_same_day_window_is_half_open() {
+        let quiet = QuietWindow {
+            start: "09:00".into(),
+            end: "17:00".into(),
+        };
+        assert!(in_quiet_hours(local_at(2026, 6, 15, 9, 0), &quiet));
+        assert!(in_quiet_hours(local_at(2026, 6, 15, 12, 0), &quiet));
+        assert!(!in_quiet_hours(local_at(2026, 6, 15, 17, 0), &quiet), "end exclusive");
+        assert!(!in_quiet_hours(local_at(2026, 6, 15, 8, 59), &quiet));
+    }
+
+    #[test]
+    fn quiet_hours_equal_start_end_is_unset() {
+        let quiet = QuietWindow {
+            start: "00:00".into(),
+            end: "00:00".into(),
+        };
+        assert!(!in_quiet_hours(local_at(2026, 6, 15, 0, 0), &quiet));
+        assert!(!in_quiet_hours(local_at(2026, 6, 15, 13, 0), &quiet));
+    }
+
+    #[test]
+    fn quiet_hours_malformed_window_is_not_quiet() {
+        let quiet = QuietWindow {
+            start: "nonsense".into(),
+            end: "07:00".into(),
+        };
+        assert!(!in_quiet_hours(at_noon(), &quiet), "unparseable window never suppresses");
+    }
+
+    // ---- delta ----
+
+    #[test]
+    fn delta_fires_once_per_crossed_step_then_silent_at_same_step() {
+        let config = delta_config(50.0);
+        // Crossing $50 from a baseline of step 0 fires exactly one delta.
+        let runtime = runtime_for(at_noon(), 0);
+        let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(0.0, 55.0));
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].rule_type, RuleType::Delta);
+        assert_eq!(after.delta.last_step, 1, "baseline advanced to step 1");
+
+        // Immediate re-eval at the same MTD: no new step, silent.
+        let (notes2, after2) = evaluate(at_noon(), &config, &after, sums(0.0, 55.0));
+        assert!(notes2.is_empty(), "same step must not re-fire");
+        assert_eq!(after2.delta.last_step, 1);
+    }
+
+    #[test]
+    fn delta_below_first_step_does_not_fire() {
+        let config = delta_config(50.0);
+        let runtime = runtime_for(at_noon(), 0);
+        let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(0.0, 49.99));
+        assert!(notes.is_empty());
+        assert_eq!(after.delta.last_step, 0);
+    }
+
+    /// C6: `last_step` pre-bumped (Unit 5's backfill re-baseline) — only post-bump
+    /// live growth fires, no retroactive flood of the already-passed steps.
+    #[test]
+    fn delta_honors_prebumped_baseline_no_retroactive_flood() {
+        let config = delta_config(50.0);
+        // Backfill silently re-baselined to step 4 ($200 MTD). MTD now reads $230;
+        // still step 4 — nothing fires despite four "passed" milestones.
+        let runtime = runtime_for(at_noon(), 4);
+        let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(0.0, 230.0));
+        assert!(notes.is_empty(), "passed milestones must not flood");
+        assert_eq!(after.delta.last_step, 4);
+
+        // Now live growth crosses $250 (step 5): exactly one fire.
+        let (notes2, after2) = evaluate(at_noon(), &config, &after, sums(0.0, 250.0));
+        assert_eq!(notes2.len(), 1, "only the newly-crossed step fires");
+        assert_eq!(after2.delta.last_step, 5);
+    }
+
+    /// C7: shrinking the step size re-baselines via the same step math — the
+    /// engine never replays steps the old size already passed (the caller persists
+    /// the advanced `last_step`; a smaller step recomputes the current step and
+    /// fires at most once for the new ladder position, not once per passed step).
+    #[test]
+    fn delta_step_size_edit_does_not_flood_passed_steps() {
+        // $100 MTD already at step 1 of a $100 ladder.
+        let runtime = runtime_for(at_noon(), 1);
+        // User shrinks the step to $25: $100 MTD now sits at step 4. A single
+        // evaluation advances to step 4 with one notification, not four.
+        let config = delta_config(25.0);
+        let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(0.0, 100.0));
+        assert_eq!(notes.len(), 1, "edit fires at most one milestone, not a flood");
+        assert_eq!(after.delta.last_step, 4);
+        // Re-eval at the same MTD is silent.
+        let (notes2, _) = evaluate(at_noon(), &config, &after, sums(0.0, 100.0));
+        assert!(notes2.is_empty());
+    }
+
+    #[test]
+    fn delta_month_rollover_rebaselines_without_firing() {
+        let config = delta_config(50.0);
+        // Last month ended at step 6; the stored key is the prior month.
+        let runtime = AlertRuntime {
+            delta: DeltaRuntime {
+                month_key: "2026-05".into(),
+                last_step: 6,
+            },
+            ..AlertRuntime::default()
+        };
+        // New month's MTD already sits at $120 (step 2) from pre-launch carryover;
+        // rollover re-baselines silently to step 2 — no replay of the new month's
+        // first two milestones.
+        let now = local_at(2026, 6, 15, 12, 0);
+        let (notes, after) = evaluate(now, &config, &runtime, sums(0.0, 120.0));
+        assert!(notes.is_empty(), "rollover never fires");
+        assert_eq!(after.delta.month_key, "2026-06");
+        assert_eq!(after.delta.last_step, 2, "re-baselined to current MTD step");
+
+        // Subsequent live growth into step 3 fires once.
+        let (notes2, after2) = evaluate(now, &config, &after, sums(0.0, 150.0));
+        assert_eq!(notes2.len(), 1);
+        assert_eq!(after2.delta.last_step, 3);
+    }
+
+    #[test]
+    fn delta_disabled_never_fires_but_still_tracks_rollover() {
+        let mut config = delta_config(50.0);
+        config.delta.enabled = false;
+        // Same month, growth crosses a step: disabled means no fire and no advance.
+        let runtime = runtime_for(at_noon(), 0);
+        let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(0.0, 200.0));
+        assert!(notes.is_empty());
+        assert_eq!(after.delta.last_step, 0, "disabled rule does not advance mid-month");
+    }
+
+    /// R17: a delta milestone that would fire but lands in quiet hours is dropped
+    /// silently — no notification — yet the baseline still advances so it never
+    /// re-fires once quiet hours end (no pending flag).
+    #[test]
+    fn delta_in_quiet_hours_drops_silently_but_advances_state() {
+        let mut config = delta_config(50.0);
+        config.delta.quiet = Some(QuietWindow {
+            start: "22:00".into(),
+            end: "07:00".into(),
+        });
+        // 23:30 is inside quiet hours; MTD crosses $100 (step 2 from step 1).
+        let now = local_at(2026, 6, 15, 23, 30);
+        let runtime = runtime_for(now, 1);
+        let (notes, after) = evaluate(now, &config, &runtime, sums(0.0, 100.0));
+        assert!(notes.is_empty(), "quiet hours suppress the notification");
+        assert_eq!(after.delta.last_step, 2, "state advances so it never re-fires later");
+
+        // After quiet hours (08:00) at the same MTD: nothing pending, stays silent.
+        let later = local_at(2026, 6, 16, 8, 0);
+        let (notes2, _) = evaluate(later, &config, &after, sums(0.0, 100.0));
+        assert!(notes2.is_empty(), "suppressed step is gone, not deferred");
+    }
+
+    // ---- burst ----
+
+    /// R14/R15: a rolling sum at/over threshold fires and arms the cooldown; an
+    /// over-threshold eval inside the cooldown does not fire; after the cooldown
+    /// elapses it fires again.
+    #[test]
+    fn burst_fires_arms_cooldown_then_refires_after_it_elapses() {
+        let config = burst_config(10.0, 10, 15);
+        let t0 = at_noon();
+        let runtime = AlertRuntime::default();
+        let (notes, after) = evaluate(t0, &config, &runtime, sums(12.0, 0.0));
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].rule_type, RuleType::Burst);
+        let armed_until = t0.timestamp_millis() + 15 * 60_000;
+        assert_eq!(after.burst.cooldown_until_ms, armed_until);
+
+        // 5 minutes later, still over threshold, but inside the cooldown: silent.
+        let t1 = local_at(2026, 6, 15, 12, 5);
+        let (notes2, after2) = evaluate(t1, &config, &after, sums(20.0, 0.0));
+        assert!(notes2.is_empty(), "cooldown suppresses a second fire");
+        assert_eq!(after2.burst.cooldown_until_ms, armed_until, "cooldown unchanged");
+
+        // 16 minutes after the first fire: cooldown elapsed, fires again.
+        let t2 = local_at(2026, 6, 15, 12, 16);
+        let (notes3, after3) = evaluate(t2, &config, &after2, sums(11.0, 0.0));
+        assert_eq!(notes3.len(), 1, "fires again once cooldown elapses");
+        assert_eq!(
+            after3.burst.cooldown_until_ms,
+            t2.timestamp_millis() + 15 * 60_000
+        );
+    }
+
+    /// Storm guard: the query floored pre-launch spend out, so the window sum the
+    /// engine sees is below threshold — no fire. (The floor itself is a Unit 2
+    /// concern; here we assert the engine doesn't fire on a sub-threshold sum.)
+    #[test]
+    fn burst_below_threshold_does_not_fire() {
+        let config = burst_config(10.0, 10, 15);
+        // Only pre-launch spend existed; the floored query returns $0.50.
+        let (notes, after) = evaluate(at_noon(), &config, &AlertRuntime::default(), sums(0.5, 0.0));
+        assert!(notes.is_empty(), "sub-threshold floored sum must not fire");
+        assert_eq!(after.burst.cooldown_until_ms, 0, "no fire leaves cooldown unarmed");
+    }
+
+    #[test]
+    fn burst_exactly_at_threshold_fires() {
+        let config = burst_config(10.0, 10, 15);
+        let (notes, _) = evaluate(at_noon(), &config, &AlertRuntime::default(), sums(10.0, 0.0));
+        assert_eq!(notes.len(), 1, "threshold is inclusive (>=)");
+    }
+
+    #[test]
+    fn burst_disabled_never_fires() {
+        let mut config = burst_config(10.0, 10, 15);
+        config.burst.enabled = false;
+        let (notes, _) = evaluate(at_noon(), &config, &AlertRuntime::default(), sums(99.0, 0.0));
+        assert!(notes.is_empty());
+    }
+
+    /// R17 (burst): an over-threshold crossing inside quiet hours fires nothing
+    /// and leaves the cooldown unarmed, so the next non-quiet crossing is free.
+    #[test]
+    fn burst_in_quiet_hours_drops_silently_and_leaves_cooldown_unarmed() {
+        let mut config = burst_config(10.0, 10, 15);
+        config.burst.quiet = Some(QuietWindow {
+            start: "22:00".into(),
+            end: "07:00".into(),
+        });
+        let quiet_now = local_at(2026, 6, 15, 23, 0);
+        let (notes, after) = evaluate(quiet_now, &config, &AlertRuntime::default(), sums(50.0, 0.0));
+        assert!(notes.is_empty(), "quiet hours suppress the burst notification");
+        assert_eq!(after.burst.cooldown_until_ms, 0, "no fire, no cooldown armed");
+
+        // After quiet hours, a fresh over-threshold crossing fires (no pending).
+        let awake = local_at(2026, 6, 16, 8, 0);
+        let (notes2, _) = evaluate(awake, &config, &after, sums(50.0, 0.0));
+        assert_eq!(notes2.len(), 1);
+    }
+
+    /// M2: the cooldown is compared in UTC ms, so a DST fall-back that repeats a
+    /// local hour cannot reopen the cooldown early. We arm a cooldown and then
+    /// evaluate at a UTC instant that is *inside* the cooldown even though the
+    /// local wall clock would read an hour earlier on a repeated hour.
+    #[test]
+    fn burst_cooldown_is_utc_ms_unaffected_by_dst_fallback() {
+        let config = burst_config(10.0, 10, 15);
+        // Arm a cooldown ending 15 minutes from a reference UTC instant.
+        let armed_until = at_noon().timestamp_millis() + 15 * 60_000;
+        let runtime = AlertRuntime {
+            burst: BurstRuntime {
+                cooldown_until_ms: armed_until,
+            },
+            ..AlertRuntime::default()
+        };
+        // An instant whose UTC ms is 5 minutes before the cooldown ends: even if a
+        // DST fall-back made the *local* hour repeat, the UTC-ms comparison still
+        // sees it inside the cooldown, so it must not fire.
+        use chrono::TimeZone;
+        let inside = chrono::Local
+            .timestamp_millis_opt(armed_until - 5 * 60_000)
+            .unwrap();
+        let (notes, _) = evaluate(inside, &config, &runtime, sums(99.0, 0.0));
+        assert!(notes.is_empty(), "UTC-ms cooldown ignores any repeated local hour");
+
+        // One ms past the cooldown (UTC) fires.
+        let past = chrono::Local.timestamp_millis_opt(armed_until).unwrap();
+        let (notes2, _) = evaluate(past, &config, &runtime, sums(99.0, 0.0));
+        assert_eq!(notes2.len(), 1, "cooldown end is inclusive of now >= until");
+    }
+
+    // ---- combined + copy ----
+
+    #[test]
+    fn delta_and_burst_can_both_fire_in_one_evaluation() {
+        let config = AlertConfig {
+            delta: DeltaConfig {
+                enabled: true,
+                step_usd: 50.0,
+                quiet: None,
+            },
+            burst: BurstConfig {
+                enabled: true,
+                threshold_usd: 10.0,
+                window_minutes: 10,
+                cooldown_minutes: 15,
+                quiet: None,
+            },
+            api_billing: false,
+        };
+        let runtime = runtime_for(at_noon(), 0);
+        let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(15.0, 60.0));
+        let kinds: Vec<RuleType> = notes.iter().map(|n| n.rule_type).collect();
+        assert!(kinds.contains(&RuleType::Delta));
+        assert!(kinds.contains(&RuleType::Burst));
+        assert_eq!(after.delta.last_step, 1);
+        assert!(after.burst.cooldown_until_ms > 0);
+    }
+
+    #[test]
+    fn copy_switches_to_real_money_under_api_billing() {
+        let mut config = delta_config(50.0);
+        config.api_billing = true;
+        let runtime = runtime_for(at_noon(), 0);
+        let (notes, _) = evaluate(at_noon(), &config, &runtime, sums(0.0, 50.0));
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].title.contains("Spend") && notes[0].body.contains("spent"),
+            "api_billing copy is real-money framed: {:?}",
+            notes[0]
+        );
+
+        // Neutral framing when api_billing is off.
+        config.api_billing = false;
+        let (notes2, _) = evaluate(at_noon(), &config, &runtime, sums(0.0, 50.0));
+        assert!(notes2[0].title.contains("Usage") && notes2[0].body.contains("usage"));
+    }
+
+    #[test]
+    fn delta_copy_states_the_crossed_milestone_amount() {
+        let config = delta_config(50.0);
+        let runtime = runtime_for(at_noon(), 0);
+        // $130 MTD crosses step 2 ($100) — copy names $100, the milestone crossed,
+        // not the raw MTD.
+        let (notes, _) = evaluate(at_noon(), &config, &runtime, sums(0.0, 130.0));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].body.contains("100"), "names the crossed milestone: {:?}", notes[0]);
+    }
+
+    #[test]
+    fn notification_serializes_rule_type_to_variant_name() {
+        assert_eq!(
+            serde_json::to_value(RuleType::Burst).unwrap(),
+            serde_json::json!("Burst")
+        );
+        assert_eq!(
+            serde_json::to_value(RuleType::Delta).unwrap(),
+            serde_json::json!("Delta")
+        );
     }
 }
