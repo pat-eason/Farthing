@@ -56,6 +56,55 @@ pub fn format_title(cost_usd: f64, paused: bool) -> String {
     }
 }
 
+/// Monochrome warning prefix: U+26A0 plus the text variation selector
+/// (U+FE0E) so macOS renders the flat glyph, not the colored emoji.
+const WARN_PREFIX: &str = "⚠\u{FE0E} ";
+
+/// Render the tray title with the optional budget readout folded in.
+///
+/// Starts from [`format_title`] (cost + pause badge). When `status` is
+/// present and `show_in_tray` is set with at least one budget line, appends
+/// the budget percents separated from the cost by two spaces, each as
+/// `D {pct}%` / `M {pct}%` (daily before monthly, only the present ones).
+/// Independently, when the worst band is Amber or Red, prepends the
+/// monochrome warning glyph — even with `show_in_tray` off. With no status,
+/// or nothing extra to show, returns the plain title unchanged.
+pub fn format_budget_title(
+    cost_usd: f64,
+    paused: bool,
+    status: Option<&crate::budgets::BudgetStatus>,
+) -> String {
+    use crate::budgets::Band;
+
+    let base = format_title(cost_usd, paused);
+    let Some(status) = status else {
+        return base;
+    };
+
+    let warn = matches!(status.worst_band, Band::Amber | Band::Red);
+
+    let mut percents: Vec<String> = Vec::new();
+    if status.show_in_tray {
+        if let Some(daily) = status.daily.as_ref() {
+            percents.push(format!("D {}%", daily.percent));
+        }
+        if let Some(monthly) = status.monthly.as_ref() {
+            percents.push(format!("M {}%", monthly.percent));
+        }
+    }
+
+    let mut title = String::new();
+    if warn {
+        title.push_str(WARN_PREFIX);
+    }
+    title.push_str(&base);
+    if !percents.is_empty() {
+        title.push_str("  ");
+        title.push_str(&percents.join(" "));
+    }
+    title
+}
+
 /// Recompute today's cost and set the tray title. Safe from any thread:
 /// the query runs on the caller, the `set_title` is dispatched to the main
 /// thread (tray mutations elsewhere are silently dropped, live-verified in
@@ -69,10 +118,16 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
         .try_state::<CaptureState>()
         .map(|state| state.paused())
         .unwrap_or(false);
-    let (day_start_ms, day_end_ms) = crate::metrics::local_day_window(chrono::Local::now());
-    let cost_usd = {
+    // Optional: a budget readout the formatter folds into the title. Missing
+    // managed state (tests, startup ordering) => behave exactly as today.
+    let budget_config = app
+        .try_state::<crate::budgets::BudgetState>()
+        .map(|state| state.config());
+    let now = chrono::Local::now();
+    let (day_start_ms, day_end_ms) = crate::metrics::local_day_window(now);
+    let (cost_usd, status) = {
         let db = db_state.0.lock().expect("db mutex poisoned");
-        match cost_for_window(&db, day_start_ms, day_end_ms) {
+        let cost_usd = match cost_for_window(&db, day_start_ms, day_end_ms) {
             Ok(cost) => cost,
             Err(err) => {
                 // Keep the previous (correct-at-the-time) title rather than
@@ -80,9 +135,21 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
                 eprintln!("tray title: cannot query today's cost: {err}");
                 return;
             }
-        }
+        };
+        let status = budget_config.as_ref().and_then(|config| {
+            match crate::budgets::evaluate(&db, config, now) {
+                Ok(status) => Some(status),
+                Err(err) => {
+                    // Budget readout is best-effort: drop it and still render
+                    // the cost rather than failing the whole title refresh.
+                    eprintln!("tray title: cannot evaluate budgets: {err}");
+                    None
+                }
+            }
+        });
+        (cost_usd, status)
     };
-    let title = format_title(cost_usd, paused);
+    let title = format_budget_title(cost_usd, paused, status.as_ref());
     let ui_app = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
@@ -127,6 +194,109 @@ mod tests {
         // cost_usd should never be negative, but the title must not render
         // "$-0.01" if a bad row ever sneaks in.
         assert_eq!(format_title(-0.5, false), "$0.00");
+    }
+
+    // ---- budget title formatting ----
+
+    use crate::budgets::{Band, BudgetLine, BudgetStatus};
+
+    /// A budget line at a given rounded percent / band; spend/amount values
+    /// don't affect the title, so they're placeholders.
+    fn line(percent: i64, band: Band) -> BudgetLine {
+        BudgetLine {
+            amount_usd: 100.0,
+            spent_priced_usd: percent as f64,
+            unpriced_requests: 0,
+            percent,
+            band,
+            exceeded: false,
+        }
+    }
+
+    fn status(
+        daily: Option<BudgetLine>,
+        monthly: Option<BudgetLine>,
+        show_in_tray: bool,
+        worst_band: Band,
+    ) -> BudgetStatus {
+        BudgetStatus {
+            daily,
+            monthly,
+            show_in_tray,
+            worst_band,
+        }
+    }
+
+    #[test]
+    fn no_status_returns_plain_title() {
+        assert_eq!(format_budget_title(12.34, false, None), "$12.34");
+    }
+
+    #[test]
+    fn both_under_amber_shown_appends_percents_no_warn() {
+        let s = status(
+            Some(line(40, Band::Green)),
+            Some(line(20, Band::Green)),
+            true,
+            Band::Green,
+        );
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "$12.34  D 40% M 20%"
+        );
+    }
+
+    #[test]
+    fn daily_amber_prepends_warn() {
+        let s = status(
+            Some(line(80, Band::Amber)),
+            Some(line(20, Band::Green)),
+            true,
+            Band::Amber,
+        );
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "⚠\u{FE0E} $12.34  D 80% M 20%"
+        );
+    }
+
+    #[test]
+    fn warn_without_show_in_tray_drops_percents() {
+        // Red worst band warns even with the tray readout off, but no percents.
+        let s = status(Some(line(120, Band::Red)), None, false, Band::Red);
+        assert_eq!(format_budget_title(12.34, false, Some(&s)), "⚠\u{FE0E} $12.34");
+    }
+
+    #[test]
+    fn no_budget_lines_returns_plain_title() {
+        let s = status(None, None, true, Band::Green);
+        assert_eq!(format_budget_title(12.34, false, Some(&s)), "$12.34");
+    }
+
+    #[test]
+    fn paused_with_amber_budget_keeps_badge_and_percents() {
+        let s = status(
+            Some(line(95, Band::Amber)),
+            Some(line(20, Band::Green)),
+            true,
+            Band::Amber,
+        );
+        assert_eq!(
+            format_budget_title(12.34, true, Some(&s)),
+            "⚠\u{FE0E} Paused · $12.34  D 95% M 20%"
+        );
+    }
+
+    #[test]
+    fn only_monthly_set_appends_just_monthly() {
+        let s = status(None, Some(line(25, Band::Green)), true, Band::Green);
+        assert_eq!(format_budget_title(12.34, false, Some(&s)), "$12.34  M 25%");
+    }
+
+    #[test]
+    fn only_monthly_amber_tray_off_warns_without_percents() {
+        let s = status(None, Some(line(80, Band::Amber)), false, Band::Amber);
+        assert_eq!(format_budget_title(12.34, false, Some(&s)), "⚠\u{FE0E} $12.34");
     }
 
     // ---- today-cost query ----
