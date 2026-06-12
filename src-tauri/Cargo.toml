@@ -19,7 +19,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # tray-icon: menu bar status item (tray.rs, task 4.1).
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 # Positions the popover window under the tray icon (multi-monitor and
 # scale-factor aware); fed by forwarding tray events in tray.rs.
