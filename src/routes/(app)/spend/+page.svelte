@@ -12,6 +12,15 @@
   // stored, not what was typed. A validation failure blocks the save and shows
   // an inline error WITHOUT reverting (so the user can fix the value); a backend
   // failure reverts the field to the last confirmed value and shows the error.
+  //
+  // Race mitigations:
+  //   - Per-rule edit generation counters: a save captures its generation at
+  //     dispatch; if the user edits the rule during the round-trip (generation
+  //     advances), the server echo is discarded for that rule's inputs.
+  //   - Scoped sync helpers (syncDelta/syncBurst/syncMeta): a delta save/revert
+  //     only touches delta mirrors; burst mirrors are left alone, and vice versa.
+  //   - Blur guards: blur clears the pending debounce timer and bails if the
+  //     rule is already busy (no double-save on blur + pending debounce).
   import { getAutostartStatus, setAutostart, type AutostartStatus } from "$lib/autostart";
   import {
     getAlertConfig,
@@ -78,7 +87,9 @@
   // Permission request transient + error.
   let permissionBusy = $state(false);
   let permissionError = $state("");
-  let testError = $state("");
+  // Separate test-notification errors per rule so each card-foot shows its own.
+  let deltaTestError = $state("");
+  let burstTestError = $state("");
 
   // Residency (autostart) toggle state.
   let residencyBusy = $state(false);
@@ -88,17 +99,28 @@
   let deltaTimer: ReturnType<typeof setTimeout> | undefined;
   let burstTimer: ReturnType<typeof setTimeout> | undefined;
 
-  /** Hydrate the local input mirrors from a confirmed config. */
-  function syncFromConfig(c: AlertConfig) {
-    config = c;
-    apiBilling = c.api_billing;
+  // Per-rule monotonic edit-generation counters. Incremented on every user
+  // input event. A save captures the current generation at dispatch; if it has
+  // advanced by the time the await resolves, the user edited during the round-
+  // trip and we discard the server echo for that rule's numeric/time mirrors.
+  let deltaGen = 0;
+  let burstGen = 0;
 
+  // --- Scoped sync helpers --------------------------------------------------
+
+  /** Hydrate delta mirrors only from a confirmed config. */
+  function syncDelta(c: AlertConfig) {
+    config = c;
     deltaEnabled = c.delta.enabled;
     deltaStep = String(c.delta.step_usd);
     deltaQuietStart = c.delta.quiet?.start ?? "";
     deltaQuietEnd = c.delta.quiet?.end ?? "";
     deltaQuietOpen = deltaQuietOpen || c.delta.quiet !== null;
+  }
 
+  /** Hydrate burst mirrors only from a confirmed config. */
+  function syncBurst(c: AlertConfig) {
+    config = c;
     burstEnabled = c.burst.enabled;
     burstThreshold = String(c.burst.threshold_usd);
     burstWindow = String(c.burst.window_minutes);
@@ -106,6 +128,19 @@
     burstQuietStart = c.burst.quiet?.start ?? "";
     burstQuietEnd = c.burst.quiet?.end ?? "";
     burstQuietOpen = burstQuietOpen || c.burst.quiet !== null;
+  }
+
+  /** Hydrate the api_billing mirror only from a confirmed config. */
+  function syncMeta(c: AlertConfig) {
+    config = c;
+    apiBilling = c.api_billing;
+  }
+
+  /** Full hydration for the initial mount load. */
+  function syncAll(c: AlertConfig) {
+    syncMeta(c);
+    syncDelta(c);
+    syncBurst(c);
   }
 
   async function refresh() {
@@ -116,7 +151,7 @@
         getNotificationPermission(),
         getAutostartStatus(),
       ]);
-      syncFromConfig(c);
+      syncAll(c);
       permission = p;
       autostart = a;
     } catch (err) {
@@ -160,8 +195,9 @@
 
   /**
    * Persist the whole config (the backend takes the full object). On success,
-   * re-hydrate the mirrors from the returned config and clear `errorTarget`. On
-   * failure, run `revert` (which restores the field) and surface the error.
+   * run `applyEcho` with the returned config (caller decides which mirrors to
+   * update, taking into account whether the user edited during the round-trip).
+   * On failure, run `revert` (which restores the field) and surface the error.
    * `validationError`, when set, blocks the save and shows inline WITHOUT
    * reverting so the user can correct the bad value in place.
    */
@@ -170,6 +206,7 @@
     setBusy: (b: boolean) => void,
     setError: (s: string) => void,
     revert: () => void,
+    applyEcho: (saved: AlertConfig) => void,
     validationError?: string
   ) {
     if (validationError) {
@@ -180,7 +217,7 @@
     setError("");
     try {
       const saved = await setAlertConfig(next);
-      syncFromConfig(saved);
+      applyEcho(saved);
     } catch (err) {
       revert();
       setError(String(err));
@@ -213,16 +250,28 @@
   }
 
   function revertDelta() {
-    if (config) syncFromConfig(config);
+    if (config) syncDelta(config);
   }
 
   function saveDelta() {
     const { next, validation } = buildDelta();
+    // Capture the generation at dispatch; discard server echo if the user edits
+    // during the round-trip (generation will have advanced).
+    const genAtDispatch = deltaGen;
     void save(
       next,
       (b) => (deltaBusy = b),
       (s) => (deltaError = s),
       revertDelta,
+      (saved) => {
+        // Always update the authoritative config reference; only overwrite the
+        // numeric/time mirrors if the user hasn't typed since dispatch.
+        if (deltaGen === genAtDispatch) {
+          syncDelta(saved);
+        } else {
+          config = saved;
+        }
+      },
       validation
     );
   }
@@ -236,13 +285,19 @@
 
   /** Debounced save for the delta numeric/time fields. */
   function deltaChanged() {
+    deltaGen++;
     clearTimeout(deltaTimer);
     deltaTimer = setTimeout(saveDelta, SAVE_DEBOUNCE_MS);
   }
 
-  /** Blur flushes the pending debounce immediately. */
+  /**
+   * Blur flushes a pending debounce immediately; bails if a save is already
+   * in flight so blur + a live timer don't double-save.
+   */
   function deltaBlur() {
+    if (deltaBusy) return;
     clearTimeout(deltaTimer);
+    deltaTimer = undefined;
     saveDelta();
   }
 
@@ -272,16 +327,24 @@
   }
 
   function revertBurst() {
-    if (config) syncFromConfig(config);
+    if (config) syncBurst(config);
   }
 
   function saveBurst() {
     const { next, validation } = buildBurst();
+    const genAtDispatch = burstGen;
     void save(
       next,
       (b) => (burstBusy = b),
       (s) => (burstError = s),
       revertBurst,
+      (saved) => {
+        if (burstGen === genAtDispatch) {
+          syncBurst(saved);
+        } else {
+          config = saved;
+        }
+      },
       validation
     );
   }
@@ -293,12 +356,19 @@
   }
 
   function burstChanged() {
+    burstGen++;
     clearTimeout(burstTimer);
     burstTimer = setTimeout(saveBurst, SAVE_DEBOUNCE_MS);
   }
 
+  /**
+   * Blur flushes a pending debounce immediately; bails if a save is already
+   * in flight so blur + a live timer don't double-save.
+   */
   function burstBlur() {
+    if (burstBusy) return;
     clearTimeout(burstTimer);
+    burstTimer = undefined;
     saveBurst();
   }
 
@@ -313,8 +383,9 @@
       () => {},
       (s) => (loadError = s),
       () => {
-        if (config) syncFromConfig(config);
-      }
+        if (config) syncMeta(config);
+      },
+      (saved) => syncMeta(saved)
     );
   }
 
@@ -348,11 +419,20 @@
   }
 
   async function sendTest(rule: AlertRuleType) {
-    testError = "";
-    try {
-      await sendTestNotification(rule);
-    } catch (err) {
-      testError = String(err);
+    if (rule === "delta") {
+      deltaTestError = "";
+      try {
+        await sendTestNotification(rule);
+      } catch (err) {
+        deltaTestError = String(err);
+      }
+    } else {
+      burstTestError = "";
+      try {
+        await sendTestNotification(rule);
+      } catch (err) {
+        burstTestError = String(err);
+      }
     }
   }
 
@@ -391,6 +471,12 @@
 
   $effect(() => {
     void refresh();
+    // Return teardown so pending debounce timers don't fire into a torn-down
+    // component after navigation.
+    return () => {
+      clearTimeout(deltaTimer);
+      clearTimeout(burstTimer);
+    };
   });
 </script>
 
@@ -562,6 +648,9 @@
         <button disabled={!permissionGranted} onclick={() => void sendTest("delta")}>
           Send a test
         </button>
+        {#if deltaTestError}
+          <span class="error-inline">{deltaTestError}</span>
+        {/if}
       </div>
     </section>
 
@@ -681,8 +770,8 @@
         <button disabled={!permissionGranted} onclick={() => void sendTest("burst")}>
           Send a test
         </button>
-        {#if testError}
-          <span class="error-inline">{testError}</span>
+        {#if burstTestError}
+          <span class="error-inline">{burstTestError}</span>
         {/if}
       </div>
     </section>

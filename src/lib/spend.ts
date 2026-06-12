@@ -128,3 +128,14 @@ export function requestNotificationPermission(): Promise<string> {
 export function sendTestNotification(ruleType: AlertRuleType): Promise<void> {
   return invoke<void>("notification_send_test", { ruleType });
 }
+
+// --- Alert runtime -----------------------------------------------------------
+
+/**
+ * Read-only: the current alert runtime state (edge-trigger bookkeeping,
+ * cooldown deadlines, and the permission-lost signal). Use to surface whether
+ * a prior notification could not be delivered (`permission_lost`).
+ */
+export function getAlertRuntime(): Promise<AlertRuntime> {
+  return invoke<AlertRuntime>("alert_runtime_get");
+}
