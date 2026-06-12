@@ -58,14 +58,22 @@ jobs:
 
       # Release only when this push actually bumped the version (i.e. the
       # Version PR just merged) and that version has not already been tagged.
-      # Plain pushes and changeset-adding pushes leave the version untouched.
+      # Read the COMMITTED package.json from git, not the working tree: the
+      # changesets/action step above runs `pnpm run version`, which mutates the
+      # working-tree package.json to the next version even on changeset-adding
+      # pushes. Comparing committed HEAD vs HEAD~1 blobs is immune to that.
       - name: Decide whether to release
         id: gate
         run: |
-          VER="$(node -p "require('./package.json').version")"
+          blobver() {
+            git show "$1:package.json" 2>/dev/null \
+              | node -pe "try { JSON.parse(require('fs').readFileSync(0, 'utf8')).version } catch { '' }" \
+              || true
+          }
+          VER="$(blobver HEAD)"
+          OLD="$(blobver HEAD~1)"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-          OLD="$(git show HEAD~1:package.json 2>/dev/null | node -pe "try { JSON.parse(require('fs').readFileSync(0, 'utf8')).version } catch { '' }" || true)"
-          if [ "$VER" != "$OLD" ] && ! git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
+          if [ -n "$VER" ] && [ "$VER" != "$OLD" ] && ! git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
             echo "should_release=true" >> "$GITHUB_OUTPUT"
             echo "Version changed $OLD -> $VER and v$VER is untagged: releasing."
           else
