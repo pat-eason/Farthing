@@ -18,6 +18,8 @@
   } from "$lib/capture";
   import { openMainWindow } from "$lib/window";
   import { formatCost, formatTokens, projectName } from "$lib/format";
+  // Same 128px downscale the sidebar uses; rendered at 18px here.
+  import farthingIcon from "$lib/assets/farthing-icon.png";
   import Sparkline from "$lib/Sparkline.svelte";
 
   /** Trailing debounce for ingest-push refreshes: one batched export can
@@ -119,7 +121,10 @@
 
 <main class="popover">
   <header>
-    <h1>Today</h1>
+    <div class="title">
+      <img class="app-icon" src={farthingIcon} alt="" />
+      <h1>Today</h1>
+    </div>
     {#if metrics}
       <span class="muted">{dayLabel(metrics.day_start_ms)}</span>
     {/if}
@@ -248,10 +253,22 @@
 
   header {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
     border-bottom: 1px solid rgba(0, 0, 0, 0.12);
     padding-bottom: 0.5rem;
+  }
+
+  .title {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+
+  .app-icon {
+    width: 18px;
+    height: 18px;
+    object-fit: contain;
   }
 
   h1 {
