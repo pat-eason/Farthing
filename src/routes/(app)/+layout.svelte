@@ -9,6 +9,9 @@
   import { resolve } from "$app/paths";
   import { page } from "$app/state";
   import FacetBar from "$lib/FacetBar.svelte";
+  // 128px downscale of art/farthing-icon.png (scripts/generate-icons.py);
+  // hashed + bundled by Vite, displayed at 22px so retina stays crisp.
+  import farthingIcon from "$lib/assets/farthing-icon.png";
 
   let { children } = $props();
 
@@ -34,7 +37,10 @@
 
 <div class="shell">
   <nav class="sidebar" aria-label="Views">
-    <p class="app-name">Farthing</p>
+    <p class="app-name">
+      <img class="app-icon" src={farthingIcon} alt="" />
+      <span>Farthing</span>
+    </p>
     <ul>
       {#each views as view (view.route)}
         <li>
@@ -93,6 +99,9 @@
   }
 
   .app-name {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
     margin: 0 0 0.9rem;
     padding: 0 0.5rem;
     font-size: 0.72rem;
@@ -100,6 +109,13 @@
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: #6b6b6b;
+  }
+
+  .app-icon {
+    width: 22px;
+    height: 22px;
+    object-fit: contain;
+    flex: none;
   }
 
   .sidebar ul {
