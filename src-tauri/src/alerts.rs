@@ -309,12 +309,18 @@ impl AlertState {
 
     /// Current config (cheap clone of the cached value; no DB read).
     pub fn config(&self) -> AlertConfig {
-        self.config.lock().expect("alert config mutex poisoned").clone()
+        self.config
+            .lock()
+            .expect("alert config mutex poisoned")
+            .clone()
     }
 
     /// Current runtime (cheap clone of the cached value; no DB read).
     pub fn runtime(&self) -> AlertRuntime {
-        self.runtime.lock().expect("alert runtime mutex poisoned").clone()
+        self.runtime
+            .lock()
+            .expect("alert runtime mutex poisoned")
+            .clone()
     }
 
     /// Persist `config` then update the cache. Write-first (like
@@ -345,11 +351,9 @@ impl AlertState {
 fn read_json<T: Default + serde::de::DeserializeOwned>(db: &Mutex<Db>, key: &str) -> T {
     let db = db.lock().expect("db mutex poisoned");
     db.conn()
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            [key],
-            |row| row.get::<_, String>(0),
-        )
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
         .ok()
         .and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or_default()
@@ -1250,7 +1254,7 @@ mod tests {
         // eval_guard must recover from the poisoned state and return a usable guard
         // (no panic, not permanently stuck).
         let _guard = state.eval_guard(); // must not panic
-        // The guard is exclusive: a concurrent try_lock fails while held.
+                                         // The guard is exclusive: a concurrent try_lock fails while held.
         assert!(
             state.eval_lock.try_lock().is_err(),
             "recovered guard still exclusive"
@@ -1326,7 +1330,10 @@ mod tests {
         app.manage(state);
 
         let returned = alert_runtime_get(app.state::<AlertState>());
-        assert_eq!(returned, runtime, "alert_runtime_get must return the current managed runtime");
+        assert_eq!(
+            returned, runtime,
+            "alert_runtime_get must return the current managed runtime"
+        );
     }
 
     // #12: try_begin_eval/end_eval: only one eval task in flight at a time.
@@ -1338,11 +1345,17 @@ mod tests {
         // First claim succeeds.
         assert!(state.try_begin_eval(), "first try_begin_eval must succeed");
         // A second attempt while in-flight is rejected.
-        assert!(!state.try_begin_eval(), "second try_begin_eval must fail while in-flight");
+        assert!(
+            !state.try_begin_eval(),
+            "second try_begin_eval must fail while in-flight"
+        );
         // Releasing clears the flag.
         state.end_eval();
         // Now a fresh claim succeeds again.
-        assert!(state.try_begin_eval(), "try_begin_eval must succeed after end_eval");
+        assert!(
+            state.try_begin_eval(),
+            "try_begin_eval must succeed after end_eval"
+        );
         state.end_eval();
     }
 
@@ -1384,13 +1397,7 @@ mod tests {
 
     /// Build a `DateTime<Local>` for a wall-clock local date/time. Used so quiet
     /// and rollover cases pin the *local* fields the engine reads.
-    fn local_at(
-        y: i32,
-        mo: u32,
-        d: u32,
-        h: u32,
-        mi: u32,
-    ) -> chrono::DateTime<chrono::Local> {
+    fn local_at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::Local> {
         use chrono::TimeZone;
         let naive = chrono::NaiveDate::from_ymd_opt(y, mo, d)
             .unwrap()
@@ -1470,12 +1477,27 @@ mod tests {
             start: "22:00".into(),
             end: "07:00".into(),
         };
-        assert!(in_quiet_hours(local_at(2026, 6, 15, 23, 30), &quiet), "23:30 is quiet");
-        assert!(in_quiet_hours(local_at(2026, 6, 16, 2, 0), &quiet), "02:00 is quiet");
-        assert!(!in_quiet_hours(local_at(2026, 6, 15, 8, 0), &quiet), "08:00 is awake");
+        assert!(
+            in_quiet_hours(local_at(2026, 6, 15, 23, 30), &quiet),
+            "23:30 is quiet"
+        );
+        assert!(
+            in_quiet_hours(local_at(2026, 6, 16, 2, 0), &quiet),
+            "02:00 is quiet"
+        );
+        assert!(
+            !in_quiet_hours(local_at(2026, 6, 15, 8, 0), &quiet),
+            "08:00 is awake"
+        );
         // Boundaries: start inclusive, end exclusive.
-        assert!(in_quiet_hours(local_at(2026, 6, 15, 22, 0), &quiet), "22:00 start inclusive");
-        assert!(!in_quiet_hours(local_at(2026, 6, 15, 7, 0), &quiet), "07:00 end exclusive");
+        assert!(
+            in_quiet_hours(local_at(2026, 6, 15, 22, 0), &quiet),
+            "22:00 start inclusive"
+        );
+        assert!(
+            !in_quiet_hours(local_at(2026, 6, 15, 7, 0), &quiet),
+            "07:00 end exclusive"
+        );
     }
 
     #[test]
@@ -1486,7 +1508,10 @@ mod tests {
         };
         assert!(in_quiet_hours(local_at(2026, 6, 15, 9, 0), &quiet));
         assert!(in_quiet_hours(local_at(2026, 6, 15, 12, 0), &quiet));
-        assert!(!in_quiet_hours(local_at(2026, 6, 15, 17, 0), &quiet), "end exclusive");
+        assert!(
+            !in_quiet_hours(local_at(2026, 6, 15, 17, 0), &quiet),
+            "end exclusive"
+        );
         assert!(!in_quiet_hours(local_at(2026, 6, 15, 8, 59), &quiet));
     }
 
@@ -1506,7 +1531,10 @@ mod tests {
             start: "nonsense".into(),
             end: "07:00".into(),
         };
-        assert!(!in_quiet_hours(at_noon(), &quiet), "unparseable window never suppresses");
+        assert!(
+            !in_quiet_hours(at_noon(), &quiet),
+            "unparseable window never suppresses"
+        );
     }
 
     // ---- delta ----
@@ -1566,7 +1594,11 @@ mod tests {
         // evaluation advances to step 4 with one notification, not four.
         let config = delta_config(25.0);
         let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(0.0, 100.0));
-        assert_eq!(notes.len(), 1, "edit fires at most one milestone, not a flood");
+        assert_eq!(
+            notes.len(),
+            1,
+            "edit fires at most one milestone, not a flood"
+        );
         assert_eq!(after.delta.last_step, 4);
         // Re-eval at the same MTD is silent.
         let (notes2, _) = evaluate(at_noon(), &config, &after, sums(0.0, 100.0));
@@ -1607,7 +1639,10 @@ mod tests {
         let runtime = runtime_for(at_noon(), 0);
         let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(0.0, 200.0));
         assert!(notes.is_empty());
-        assert_eq!(after.delta.last_step, 0, "disabled rule does not advance mid-month");
+        assert_eq!(
+            after.delta.last_step, 0,
+            "disabled rule does not advance mid-month"
+        );
 
         // Month rollover with a disabled rule: the rollover re-baseline branch
         // fires unconditionally (it is not gated on `enabled`) so the new
@@ -1623,7 +1658,10 @@ mod tests {
         let now_june = local_at(2026, 6, 15, 12, 0);
         // MTD in the new month is $150 → step 3 at $50/step.
         let (notes2, after2) = evaluate(now_june, &config, &prior_month_runtime, sums(0.0, 150.0));
-        assert!(notes2.is_empty(), "rollover with disabled delta never fires");
+        assert!(
+            notes2.is_empty(),
+            "rollover with disabled delta never fires"
+        );
         assert_eq!(
             after2.delta.month_key, "2026-06",
             "rollover updates the month key even when delta is disabled"
@@ -1649,7 +1687,10 @@ mod tests {
         let runtime = runtime_for(now, 1);
         let (notes, after) = evaluate(now, &config, &runtime, sums(0.0, 100.0));
         assert!(notes.is_empty(), "quiet hours suppress the notification");
-        assert_eq!(after.delta.last_step, 2, "state advances so it never re-fires later");
+        assert_eq!(
+            after.delta.last_step, 2,
+            "state advances so it never re-fires later"
+        );
 
         // After quiet hours (08:00) at the same MTD: nothing pending, stays silent.
         let later = local_at(2026, 6, 16, 8, 0);
@@ -1677,7 +1718,10 @@ mod tests {
         let t1 = local_at(2026, 6, 15, 12, 5);
         let (notes2, after2) = evaluate(t1, &config, &after, sums(20.0, 0.0));
         assert!(notes2.is_empty(), "cooldown suppresses a second fire");
-        assert_eq!(after2.burst.cooldown_until_ms, armed_until, "cooldown unchanged");
+        assert_eq!(
+            after2.burst.cooldown_until_ms, armed_until,
+            "cooldown unchanged"
+        );
 
         // 16 minutes after the first fire: cooldown elapsed, fires again.
         let t2 = local_at(2026, 6, 15, 12, 16);
@@ -1698,13 +1742,21 @@ mod tests {
         // Only pre-launch spend existed; the floored query returns $0.50.
         let (notes, after) = evaluate(at_noon(), &config, &AlertRuntime::default(), sums(0.5, 0.0));
         assert!(notes.is_empty(), "sub-threshold floored sum must not fire");
-        assert_eq!(after.burst.cooldown_until_ms, 0, "no fire leaves cooldown unarmed");
+        assert_eq!(
+            after.burst.cooldown_until_ms, 0,
+            "no fire leaves cooldown unarmed"
+        );
     }
 
     #[test]
     fn burst_exactly_at_threshold_fires() {
         let config = burst_config(10.0, 10, 15);
-        let (notes, _) = evaluate(at_noon(), &config, &AlertRuntime::default(), sums(10.0, 0.0));
+        let (notes, _) = evaluate(
+            at_noon(),
+            &config,
+            &AlertRuntime::default(),
+            sums(10.0, 0.0),
+        );
         assert_eq!(notes.len(), 1, "threshold is inclusive (>=)");
     }
 
@@ -1712,7 +1764,12 @@ mod tests {
     fn burst_disabled_never_fires() {
         let mut config = burst_config(10.0, 10, 15);
         config.burst.enabled = false;
-        let (notes, _) = evaluate(at_noon(), &config, &AlertRuntime::default(), sums(99.0, 0.0));
+        let (notes, _) = evaluate(
+            at_noon(),
+            &config,
+            &AlertRuntime::default(),
+            sums(99.0, 0.0),
+        );
         assert!(notes.is_empty());
     }
 
@@ -1726,9 +1783,20 @@ mod tests {
             end: "07:00".into(),
         });
         let quiet_now = local_at(2026, 6, 15, 23, 0);
-        let (notes, after) = evaluate(quiet_now, &config, &AlertRuntime::default(), sums(50.0, 0.0));
-        assert!(notes.is_empty(), "quiet hours suppress the burst notification");
-        assert_eq!(after.burst.cooldown_until_ms, 0, "no fire, no cooldown armed");
+        let (notes, after) = evaluate(
+            quiet_now,
+            &config,
+            &AlertRuntime::default(),
+            sums(50.0, 0.0),
+        );
+        assert!(
+            notes.is_empty(),
+            "quiet hours suppress the burst notification"
+        );
+        assert_eq!(
+            after.burst.cooldown_until_ms, 0,
+            "no fire, no cooldown armed"
+        );
 
         // After quiet hours, a fresh over-threshold crossing fires (no pending).
         let awake = local_at(2026, 6, 16, 8, 0);
@@ -1759,7 +1827,10 @@ mod tests {
             .timestamp_millis_opt(armed_until - 5 * 60_000)
             .unwrap();
         let (notes, _) = evaluate(inside, &config, &runtime, sums(99.0, 0.0));
-        assert!(notes.is_empty(), "UTC-ms cooldown ignores any repeated local hour");
+        assert!(
+            notes.is_empty(),
+            "UTC-ms cooldown ignores any repeated local hour"
+        );
 
         // One ms past the cooldown (UTC) fires.
         let past = chrono::Local.timestamp_millis_opt(armed_until).unwrap();
@@ -1822,7 +1893,11 @@ mod tests {
         // not the raw MTD.
         let (notes, _) = evaluate(at_noon(), &config, &runtime, sums(0.0, 130.0));
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].body.contains("100"), "names the crossed milestone: {:?}", notes[0]);
+        assert!(
+            notes[0].body.contains("100"),
+            "names the crossed milestone: {:?}",
+            notes[0]
+        );
     }
 
     #[test]
@@ -1885,10 +1960,15 @@ mod tests {
             },
         ];
         let mut shown = 0;
-        let out = deliver_and_record(&notes, AlertRuntime::default(), PermissionState::Granted, |_| {
-            shown += 1;
-            crate::notify::ShowOutcome::Delivered
-        });
+        let out = deliver_and_record(
+            &notes,
+            AlertRuntime::default(),
+            PermissionState::Granted,
+            |_| {
+                shown += 1;
+                crate::notify::ShowOutcome::Delivered
+            },
+        );
         assert_eq!(shown, 2, "every notification is delivered");
         assert!(!out.permission_lost);
     }
@@ -1912,13 +1992,18 @@ mod tests {
         let mut first = true;
         // current_permission is Granted but one show() returns PermissionDenied —
         // belt-and-suspenders path: the individual denial still flips the flag.
-        let out = deliver_and_record(&notes, AlertRuntime::default(), PermissionState::Granted, |_| {
-            if std::mem::take(&mut first) {
-                crate::notify::ShowOutcome::Delivered
-            } else {
-                crate::notify::ShowOutcome::PermissionDenied
-            }
-        });
+        let out = deliver_and_record(
+            &notes,
+            AlertRuntime::default(),
+            PermissionState::Granted,
+            |_| {
+                if std::mem::take(&mut first) {
+                    crate::notify::ShowOutcome::Delivered
+                } else {
+                    crate::notify::ShowOutcome::PermissionDenied
+                }
+            },
+        );
         assert!(out.permission_lost);
     }
 
@@ -2167,9 +2252,7 @@ mod tests {
                 break; // eval completed and fired
             }
             if std::time::Instant::now() >= deadline {
-                panic!(
-                    "a config save re-evaluates and can fire immediately (timed out waiting)"
-                );
+                panic!("a config save re-evaluates and can fire immediately (timed out waiting)");
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -2211,6 +2294,9 @@ mod tests {
         // A subsequent live eval at the same MTD fires nothing (already baselined).
         gather_and_apply(app.handle());
         let after = app.state::<AlertState>().runtime();
-        assert_eq!(after.delta.last_step, 4, "no retroactive flood after re-baseline");
+        assert_eq!(
+            after.delta.last_step, 4,
+            "no retroactive flood after re-baseline"
+        );
     }
 }
