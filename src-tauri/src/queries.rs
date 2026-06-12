@@ -1048,9 +1048,17 @@ mod tests {
     use tempfile::TempDir;
 
     const DAY_MS: i64 = 86_400_000;
-    /// Opening instant of the hand-computed fixture window. Tests that need
-    /// real local-midnight alignment use `chrono::Local::now()` instead.
-    const T: i64 = 1_781_150_400_000;
+    /// Opening instant of the hand-computed fixture window: local midnight
+    /// on a fixed date, computed at runtime so the series bucketer (which
+    /// snaps to `chrono::Local` midnight) aligns regardless of the runner's
+    /// timezone. A hardcoded epoch would only be midnight in one zone, so
+    /// the per-day bucket assertions would break under UTC CI. June 11 is
+    /// clear of US/EU DST transitions, keeping every day a clean 24h.
+    fn t() -> i64 {
+        metrics::local_midnight_ms(
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 11).expect("valid date"),
+        )
+    }
 
     fn test_db() -> (TempDir, Db) {
         let dir = TempDir::new().unwrap();
@@ -1063,7 +1071,7 @@ mod tests {
             .execute(
                 "INSERT INTO sessions (session_id, cwd, first_seen_ms)
                  VALUES (?1, ?2, ?3)",
-                params![session_id, cwd, T],
+                params![session_id, cwd, t()],
             )
             .unwrap();
     }
@@ -1124,12 +1132,12 @@ mod tests {
         let z = (None, None);
         #[rustfmt::skip]
         {
-            insert_request(&db, Some("s1"), T + 1, Some("sonnet"), None, Some(1.0), (10, 20, 30, 40), (Some(30), Some(10)), "api_request");
-            insert_request(&db, Some("s1"), T + 2, Some("opus"), Some("subagent"), Some(2.0), (1, 2, 3, 4), z, "api_request");
-            insert_request(&db, Some("s2"), T + 3, Some("sonnet"), Some("user"), None, (100, 0, 0, 0), z, "api_request");
-            insert_request(&db, Some("s3"), T + 2 * DAY_MS + 4, Some("haiku"), Some("sdk"), Some(0.5), (5, 5, 5, 5), z, "api_request");
-            insert_request(&db, Some("s4"), T + 5, Some("sonnet"), Some("subagent"), Some(4.0), (7, 0, 0, 0), z, "api_request");
-            insert_request(&db, Some("s1"), T + 6, None, None, None, (0, 0, 0, 0), z, "api_error");
+            insert_request(&db, Some("s1"), t() + 1, Some("sonnet"), None, Some(1.0), (10, 20, 30, 40), (Some(30), Some(10)), "api_request");
+            insert_request(&db, Some("s1"), t() + 2, Some("opus"), Some("subagent"), Some(2.0), (1, 2, 3, 4), z, "api_request");
+            insert_request(&db, Some("s2"), t() + 3, Some("sonnet"), Some("user"), None, (100, 0, 0, 0), z, "api_request");
+            insert_request(&db, Some("s3"), t() + 2 * DAY_MS + 4, Some("haiku"), Some("sdk"), Some(0.5), (5, 5, 5, 5), z, "api_request");
+            insert_request(&db, Some("s4"), t() + 5, Some("sonnet"), Some("subagent"), Some(4.0), (7, 0, 0, 0), z, "api_request");
+            insert_request(&db, Some("s1"), t() + 6, None, None, None, (0, 0, 0, 0), z, "api_error");
         };
         (dir, db)
     }
@@ -1147,8 +1155,8 @@ mod tests {
 
     fn full_window() -> RangeFacet {
         RangeFacet::Custom {
-            start_ms: T,
-            end_ms: T + 3 * DAY_MS,
+            start_ms: t(),
+            end_ms: t() + 3 * DAY_MS,
         }
     }
 
@@ -1307,20 +1315,20 @@ mod tests {
     #[test]
     fn summary_custom_range_is_inclusive_start_exclusive_end() {
         let (_dir, db) = fixture_db();
-        // [T, T + 1 day) excludes r4 on day 2.
+        // [t(), t() + 1 day) excludes r4 on day 2.
         let summary = summary_for(
             &db,
             &facets(RangeFacet::Custom {
-                start_ms: T,
-                end_ms: T + DAY_MS,
+                start_ms: t(),
+                end_ms: t() + DAY_MS,
             }),
             now(),
         )
         .unwrap();
         assert_eq!(summary.totals.cost_usd, 7.0);
         assert_eq!(summary.totals.requests, 4);
-        assert_eq!(summary.start_ms, Some(T));
-        assert_eq!(summary.end_ms, Some(T + DAY_MS));
+        assert_eq!(summary.start_ms, Some(t()));
+        assert_eq!(summary.end_ms, Some(t() + DAY_MS));
     }
 
     #[test]
@@ -1405,7 +1413,7 @@ mod tests {
         // Every bucket equals the summary for its window: the chart can
         // never disagree with the headline totals.
         for (i, point) in series.iter().enumerate() {
-            assert_eq!(point.bucket_start_ms, T + i as i64 * DAY_MS);
+            assert_eq!(point.bucket_start_ms, t() + i as i64 * DAY_MS);
             let window = summary_for(
                 &db,
                 &facets(RangeFacet::Custom {
@@ -1447,7 +1455,7 @@ mod tests {
         let grouped = series_for(&db, &facets(full_window()), SeriesGroupBy::Model, now()).unwrap();
         let day0: Vec<(Option<&str>, Option<i64>, Option<i64>)> = grouped
             .iter()
-            .filter(|p| p.bucket_start_ms == T)
+            .filter(|p| p.bucket_start_ms == t())
             .map(|p| {
                 (
                     p.key.as_deref(),
@@ -1527,7 +1535,7 @@ mod tests {
         let series = series_for(&db, &facets(full_window()), SeriesGroupBy::Model, now()).unwrap();
         let day0: Vec<(Option<&str>, f64, i64)> = series
             .iter()
-            .filter(|p| p.bucket_start_ms == T)
+            .filter(|p| p.bucket_start_ms == t())
             .map(|p| (p.key.as_deref(), p.totals.cost_usd, p.totals.requests))
             .collect();
         // NULL model (the error row) sorts first, then opus, then sonnet.
@@ -1548,7 +1556,7 @@ mod tests {
             series_for(&db, &facets(full_window()), SeriesGroupBy::Project, now()).unwrap();
         let day0: Vec<(Option<&str>, f64)> = series
             .iter()
-            .filter(|p| p.bucket_start_ms == T)
+            .filter(|p| p.bucket_start_ms == t())
             .map(|p| (p.key.as_deref(), p.totals.cost_usd))
             .collect();
         assert_eq!(
@@ -1617,8 +1625,8 @@ mod tests {
         let inverted = series_for(
             &db,
             &facets(RangeFacet::Custom {
-                start_ms: T + DAY_MS,
-                end_ms: T,
+                start_ms: t() + DAY_MS,
+                end_ms: t(),
             }),
             SeriesGroupBy::None,
             now(),
@@ -1696,8 +1704,8 @@ mod tests {
 
         let s1 = &rollups[1];
         assert_eq!(s1.cwd.as_deref(), Some("/proj/alpha"));
-        assert_eq!(s1.first_ms, T + 1);
-        assert_eq!(s1.last_ms, T + 6);
+        assert_eq!(s1.first_ms, t() + 1);
+        assert_eq!(s1.last_ms, t() + 6);
         assert_eq!(s1.totals.requests, 2);
         assert_eq!(s1.errors, 1);
         assert_eq!(s1.totals.input_tokens, 11);
@@ -1725,7 +1733,7 @@ mod tests {
         let ids: Vec<&str> = by_start.iter().map(|r| r.session_id.as_str()).collect();
         assert_eq!(ids, vec!["s1", "s2", "s4", "s3"]);
 
-        // s1 spans T+1..T+6; everything else is a single instant.
+        // s1 spans t()+1..t()+6; everything else is a single instant.
         let by_duration = session_rollups_for(
             &db,
             &Facets::default(),
@@ -1803,7 +1811,7 @@ mod tests {
 
         // r1: priced sonnet row with the 5m/1h split, default otel source.
         let r1 = &detail.requests[0];
-        assert_eq!(r1.timestamp_ms, T + 1);
+        assert_eq!(r1.timestamp_ms, t() + 1);
         assert_eq!(r1.model.as_deref(), Some("sonnet"));
         assert_eq!(r1.query_source, None);
         assert_eq!(r1.event_type, "api_request");
@@ -1909,7 +1917,7 @@ mod tests {
         assert_eq!(detail.requests.len(), 2, "timeline capped at the limit");
         assert_eq!(
             detail.requests[1].timestamp_ms,
-            T + 2,
+            t() + 2,
             "cap keeps the earliest rows"
         );
         assert_eq!(detail.total_rows, 3, "count ignores the cap");
@@ -1927,7 +1935,7 @@ mod tests {
                 "cwd": "/proj/beta",
                 "total_rows": 1,
                 "requests": [{
-                    "timestamp_ms": T + 3,
+                    "timestamp_ms": t() + 3,
                     "model": "sonnet",
                     "query_source": "user",
                     "event_type": "api_request",
