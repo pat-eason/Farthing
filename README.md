@@ -1,5 +1,9 @@
 # Farthing
 
+<div style="padding: 1rem; text-align:center;">
+  <img src="art/farthing-icon.png" height="200" />
+</div>
+
 > Keeps count of every farthing of your Claude Code spend.
 
 A macOS menu bar app that makes Claude Code token and dollar usage visible with **zero manual configuration**. Install it, click "Set up" once, and every Claude Code session on your machine starts reporting per-request usage: cost, tokens (input/output/cache read/cache creation), model, project, and session, surfaced through a menu bar popover and a full desktop UI.
