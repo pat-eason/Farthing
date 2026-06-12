@@ -913,6 +913,172 @@ pub fn session_detail<R: Runtime>(
 }
 
 // ---------------------------------------------------------------------------
+// export_raw_rows (Report Export — raw CSV)
+// ---------------------------------------------------------------------------
+
+/// Cap on the exported `error` text (chars). The stored value is an upstream
+/// API error string (see [`export_raw_rows_for`]); it carries no local paths
+/// or token material, but it is free-form and the export artifact is shared,
+/// so we bound the cell length defensively.
+pub const EXPORT_ERROR_MAX_CHARS: usize = 500;
+
+/// One underlying request row for the raw export CSV (R8). Request-level, not
+/// aggregated: every matching `api_request` and `api_error` row appears once.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RawExportRow {
+    pub timestamp_ms: i64,
+    pub model: Option<String>,
+    /// Request origin tag (`subagent`, `user`, `sdk`, …); `None` = main.
+    pub query_source: Option<String>,
+    /// `api_request` or `api_error`.
+    pub event_type: String,
+    /// Data source tag: `otel` (live) or `backfill` (transcript).
+    pub source: String,
+    /// API-equivalent cost; `None` = unpriced (or an error row).
+    pub cost_usd: Option<f64>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub duration_ms: Option<i64>,
+    /// Upstream API error text for `api_error` rows, home-relativization not
+    /// applicable; truncated to [`EXPORT_ERROR_MAX_CHARS`].
+    pub error: Option<String>,
+    /// The owning session; `None` for session-less rows.
+    pub session_id: Option<String>,
+    /// Project directory, home-relativized to `~/…` (R8); `None` = no cwd
+    /// mapping (unknown project).
+    pub cwd: Option<String>,
+}
+
+/// Replace a leading `home` prefix in `path` with `~`, matching the frontend
+/// `cleanPath` so exported paths never leak the user's home directory (R8).
+fn relativize_home(path: &str, home: Option<&str>) -> String {
+    match home {
+        Some(home) if !home.is_empty() && path == home => "~".to_string(),
+        Some(home) if !home.is_empty() => {
+            // Match a `home/` prefix (with the separator) so `/home/bobby`
+            // never matches `/home/bob`.
+            let prefix = if home.ends_with('/') {
+                home.to_string()
+            } else {
+                format!("{home}/")
+            };
+            match path.strip_prefix(&prefix) {
+                Some(rest) => format!("~/{rest}"),
+                None => path.to_string(),
+            }
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// Stream every underlying request row for one facet selection to `on_row`,
+/// in deterministic order, without materializing a `Vec` (R4/R8/R9/R11).
+///
+/// `exclude_sessionless`: when `true`, only rows with a `session_id` are
+/// emitted and rows are ordered `session_id, timestamp_ms` — so the sessions
+/// view's raw CSV matches its session-rollup row set (R16). The other three
+/// views pass `false` and rows order by `timestamp_ms, id`.
+///
+/// `home` home-relativizes the joined `cwd` (R8); pass the resolved home dir
+/// (`app.path().home_dir()`) or `None` to leave paths absolute.
+///
+/// This is a plain main-table read (the export needs the non-indexed `error`,
+/// `duration_ms`, and `source` columns, none of which any covering index
+/// carries), like the [`session_detail`] timeline — but unbounded.
+///
+/// `error` carries the upstream Claude Code OTLP `error` attribute, an API
+/// error message such as `API Error: 529 {"type":"error",…}` (see
+/// `ingest.rs::parse_event`). It is a category/message string from the API,
+/// not a request/response body, local file path, or token material, so it is
+/// safe to export; we only truncate it to [`EXPORT_ERROR_MAX_CHARS`].
+pub fn export_raw_rows_for<F>(
+    db: &Db,
+    facets: &Facets,
+    exclude_sessionless: bool,
+    home: Option<&str>,
+    now: chrono::DateTime<chrono::Local>,
+    mut on_row: F,
+) -> Result<(), rusqlite::Error>
+where
+    F: FnMut(&RawExportRow) -> Result<(), rusqlite::Error>,
+{
+    let mut filter = facets.filter(true, now);
+    if exclude_sessionless {
+        filter.conditions.push("r.session_id IS NOT NULL".into());
+    }
+    let where_clause = filter.where_clause();
+
+    // Pin the access path so the primary sort key comes from an index walk,
+    // never a full materialize-and-sort. This is a main-table read
+    // (`error`/`duration_ms`/`source` are in no covering index), so the planner
+    // has no covering shortcut; pinning the leading index keeps the dominant
+    // ordering free. The non-sessions views walk the timestamp-leading
+    // `idx_requests_facet_rollup`; the sessions view walks the session-leading
+    // `idx_requests_session_rollup` (its key is `session_id, timestamp_ms, …`),
+    // which matches the session-rollup row set (R16). `r.id` (the PK) is the
+    // deterministic final tiebreaker for equal-timestamp rows; SQLite resolves
+    // it with a partial sort over only those ties, not a full ORDER BY sorter.
+    let (from_clause, order_by) = if exclude_sessionless {
+        (
+            "FROM requests r INDEXED BY idx_requests_session_rollup",
+            "ORDER BY r.session_id, r.timestamp_ms, r.id",
+        )
+    } else {
+        (
+            "FROM requests r INDEXED BY idx_requests_facet_rollup",
+            "ORDER BY r.timestamp_ms, r.id",
+        )
+    };
+
+    let sql = format!(
+        "SELECT r.timestamp_ms, r.model, r.query_source, r.event_type,
+            r.source, r.cost_usd, r.input_tokens, r.output_tokens,
+            r.cache_read_tokens, r.cache_creation_tokens, r.duration_ms,
+            r.error, r.session_id, s.cwd
+         {from_clause}
+         LEFT JOIN sessions s ON s.session_id = r.session_id
+         {where_clause}
+         {order_by}"
+    );
+
+    let conn = db.conn();
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(filter.params.iter()))?;
+    while let Some(row) = rows.next()? {
+        let error: Option<String> = row.get::<_, Option<String>>(11)?.map(|err| {
+            if err.chars().count() > EXPORT_ERROR_MAX_CHARS {
+                err.chars().take(EXPORT_ERROR_MAX_CHARS).collect()
+            } else {
+                err
+            }
+        });
+        let cwd: Option<String> = row
+            .get::<_, Option<String>>(13)?
+            .map(|cwd| relativize_home(&cwd, home));
+        let export_row = RawExportRow {
+            timestamp_ms: row.get(0)?,
+            model: row.get(1)?,
+            query_source: row.get(2)?,
+            event_type: row.get(3)?,
+            source: row.get(4)?,
+            cost_usd: row.get(5)?,
+            input_tokens: row.get(6)?,
+            output_tokens: row.get(7)?,
+            cache_read_tokens: row.get(8)?,
+            cache_creation_tokens: row.get(9)?,
+            duration_ms: row.get(10)?,
+            error,
+            session_id: row.get(12)?,
+            cwd,
+        };
+        on_row(&export_row)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // project_rollups
 // ---------------------------------------------------------------------------
 
@@ -1961,6 +2127,349 @@ mod tests {
                     "unpriced_requests": 1,
                 }],
             })
+        );
+    }
+
+    // ---- export_raw_rows (raw CSV) ----
+
+    /// Collect every exported row for a facet selection into a `Vec` for
+    /// assertion (the production path streams; tests buffer).
+    fn collect_export(
+        db: &Db,
+        facets: &Facets,
+        exclude_sessionless: bool,
+        home: Option<&str>,
+    ) -> Vec<RawExportRow> {
+        let mut rows = Vec::new();
+        export_raw_rows_for(db, facets, exclude_sessionless, home, now(), |row| {
+            rows.push(row.clone());
+            Ok(())
+        })
+        .unwrap();
+        rows
+    }
+
+    /// Insert a request with explicit `error`, `duration_ms`, and `source`
+    /// (the shared [`insert_request`] fixture leaves all three at defaults).
+    fn insert_request_with_error(
+        db: &Db,
+        session_id: Option<&str>,
+        timestamp_ms: i64,
+        error: &str,
+        duration_ms: Option<i64>,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO requests (
+                    session_id, timestamp_ms, event_type, error, duration_ms
+                 ) VALUES (?1, ?2, 'api_error', ?3, ?4)",
+                params![session_id, timestamp_ms, error, duration_ms],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn export_raw_rows_returns_every_row_in_timestamp_order() {
+        let (_dir, db) = fixture_db();
+        let rows = collect_export(&db, &facets(full_window()), false, None);
+        // Fixture rows r1,r2,r3,r5,r6 fall on day 0 (r4 is two days later,
+        // inside the 3-day window). All six match the full window.
+        assert_eq!(rows.len(), 6, "every matching request + error row appears");
+        let timestamps: Vec<i64> = rows.iter().map(|r| r.timestamp_ms).collect();
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        assert_eq!(
+            timestamps, sorted,
+            "rows are ordered by timestamp ascending"
+        );
+    }
+
+    #[test]
+    fn export_raw_rows_home_relativizes_cwd() {
+        let (_dir, db) = fixture_db();
+        let rows = collect_export(&db, &facets(full_window()), false, Some("/proj"));
+        // s1/s2 sessions map to /proj/alpha and /proj/beta.
+        let alpha = rows
+            .iter()
+            .find(|r| r.session_id.as_deref() == Some("s1"))
+            .unwrap();
+        assert_eq!(alpha.cwd.as_deref(), Some("~/alpha"));
+        let beta = rows
+            .iter()
+            .find(|r| r.session_id.as_deref() == Some("s2"))
+            .unwrap();
+        assert_eq!(beta.cwd.as_deref(), Some("~/beta"));
+    }
+
+    #[test]
+    fn relativize_home_only_matches_on_segment_boundary() {
+        assert_eq!(relativize_home("/home/bob", Some("/home/bob")), "~");
+        assert_eq!(relativize_home("/home/bob/x", Some("/home/bob")), "~/x");
+        // A sibling whose name shares a prefix must not be rewritten.
+        assert_eq!(
+            relativize_home("/home/bobby/x", Some("/home/bob")),
+            "/home/bobby/x"
+        );
+        // No home resolved: paths pass through unchanged.
+        assert_eq!(relativize_home("/proj/x", None), "/proj/x");
+    }
+
+    #[test]
+    fn export_raw_rows_facets_restrict_identically_to_aggregations() {
+        let (_dir, db) = fixture_db();
+        // Model facet: only sonnet api_request rows (r1, r3, r5).
+        let model_facets = Facets {
+            range: full_window(),
+            model: Some("sonnet".into()),
+            ..Facets::default()
+        };
+        let rows = collect_export(&db, &model_facets, false, None);
+        assert!(rows.iter().all(|r| r.model.as_deref() == Some("sonnet")));
+        let summary = summary_for(&db, &model_facets, now()).unwrap();
+        // requests + errors over the facet equals the exported row count.
+        assert_eq!(
+            rows.len() as i64,
+            summary.totals.requests + summary.errors,
+            "row count matches requests + errors for the same facets"
+        );
+
+        // Project facet over /proj/alpha (session s1): r1, r2 (requests) + r6
+        // (error) all belong to s1.
+        let project_facets = Facets {
+            range: full_window(),
+            project: ProjectFacet::Cwd("/proj/alpha".into()),
+            ..Facets::default()
+        };
+        let rows = collect_export(&db, &project_facets, false, None);
+        assert!(rows.iter().all(|r| r.session_id.as_deref() == Some("s1")));
+        let summary = summary_for(&db, &project_facets, now()).unwrap();
+        assert_eq!(rows.len() as i64, summary.totals.requests + summary.errors);
+    }
+
+    #[test]
+    fn export_raw_rows_empty_window_yields_no_rows() {
+        let (_dir, db) = fixture_db();
+        let empty = Facets {
+            range: RangeFacet::Custom {
+                start_ms: t() - 10 * DAY_MS,
+                end_ms: t() - 5 * DAY_MS,
+            },
+            ..Facets::default()
+        };
+        let rows = collect_export(&db, &empty, false, None);
+        assert!(rows.is_empty(), "no rows in a window before any data");
+    }
+
+    #[test]
+    fn export_raw_rows_includes_api_error_rows() {
+        let (_dir, db) = fixture_db();
+        let rows = collect_export(&db, &facets(full_window()), false, None);
+        let errors: Vec<&RawExportRow> = rows
+            .iter()
+            .filter(|r| r.event_type == "api_error")
+            .collect();
+        assert_eq!(errors.len(), 1, "fixture has one api_error row (r6)");
+        let err = errors[0];
+        assert_eq!(err.cost_usd, None, "error rows carry no cost");
+        assert_eq!(err.model, None, "error rows carry no model");
+    }
+
+    #[test]
+    fn export_raw_rows_truncates_error_text() {
+        let (_dir, db) = test_db();
+        insert_session(&db, "s1", Some("/proj/alpha"));
+        let long_error = "x".repeat(EXPORT_ERROR_MAX_CHARS + 100);
+        insert_request_with_error(&db, Some("s1"), t() + 1, &long_error, Some(42));
+        let rows = collect_export(&db, &Facets::default(), false, None);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.error.as_deref().map(str::len),
+            Some(EXPORT_ERROR_MAX_CHARS),
+            "error text is truncated to the cap"
+        );
+        assert_eq!(row.duration_ms, Some(42), "duration_ms surfaces");
+    }
+
+    #[test]
+    fn export_raw_rows_exclude_sessionless_toggle() {
+        let (_dir, db) = fixture_db();
+        // s4 has a session_id but no `sessions` row; insert a row with a NULL
+        // session_id to exercise the truly session-less case.
+        insert_request(
+            &db,
+            None,
+            t() + 7,
+            Some("sonnet"),
+            None,
+            Some(0.25),
+            (1, 1, 0, 0),
+            (None, None),
+            "api_request",
+        );
+
+        // false: the session-less row appears with no project (cwd None).
+        let included = collect_export(&db, &facets(full_window()), false, None);
+        let sessionless: Vec<&RawExportRow> =
+            included.iter().filter(|r| r.session_id.is_none()).collect();
+        assert_eq!(sessionless.len(), 1, "session-less row is included");
+        assert_eq!(sessionless[0].cwd, None, "session-less row has no project");
+
+        // true: session-less rows excluded; the set matches the session
+        // rollups' row coverage (requests + errors) over the same facets.
+        let excluded = collect_export(&db, &facets(full_window()), true, None);
+        assert!(
+            excluded.iter().all(|r| r.session_id.is_some()),
+            "exclude_sessionless drops NULL session rows"
+        );
+        let rollups = session_rollups_for(
+            &db,
+            &facets(full_window()),
+            SessionSort::Cost,
+            true,
+            MAX_SESSION_LIMIT,
+            0,
+            now(),
+        )
+        .unwrap();
+        let rollup_rows: i64 = rollups.iter().map(|s| s.totals.requests + s.errors).sum();
+        assert_eq!(
+            excluded.len() as i64,
+            rollup_rows,
+            "raw row set matches the session rollups' request + error coverage"
+        );
+    }
+
+    #[test]
+    fn export_raw_rows_sessions_order_by_session_then_time() {
+        let (_dir, db) = fixture_db();
+        let rows = collect_export(&db, &facets(full_window()), true, None);
+        // Primary key session_id ascending, secondary timestamp ascending.
+        let mut prev: Option<(&str, i64)> = None;
+        for row in &rows {
+            let sid = row.session_id.as_deref().unwrap();
+            let key = (sid, row.timestamp_ms);
+            if let Some(prev) = prev {
+                assert!(prev <= key, "rows ordered by (session_id, timestamp_ms)");
+            }
+            prev = Some(key);
+        }
+    }
+
+    #[test]
+    fn export_raw_rows_cost_reconciles_with_summary() {
+        let (_dir, db) = fixture_db();
+        let f = facets(full_window());
+        // Sum unrounded cost over api_request rows, treating unpriced (NULL)
+        // as 0 — must equal the summary cost for the same facets (R9).
+        let mut cost = 0.0_f64;
+        export_raw_rows_for(&db, &f, false, None, now(), |row| {
+            if row.event_type == "api_request" {
+                cost += row.cost_usd.unwrap_or(0.0);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let summary = summary_for(&db, &f, now()).unwrap();
+        assert_eq!(cost, summary.totals.cost_usd, "raw cost sum reconciles");
+    }
+
+    #[test]
+    fn export_raw_rows_serializes_flat_for_frontend() {
+        let (_dir, db) = test_db();
+        insert_session(&db, "s1", Some("/proj/alpha"));
+        insert_request(
+            &db,
+            Some("s1"),
+            t() + 1,
+            Some("sonnet"),
+            Some("user"),
+            Some(1.5),
+            (10, 20, 30, 40),
+            (None, None),
+            "api_request",
+        );
+        let rows = collect_export(&db, &Facets::default(), false, Some("/proj"));
+        assert_eq!(
+            serde_json::to_value(&rows[0]).unwrap(),
+            serde_json::json!({
+                "timestamp_ms": t() + 1,
+                "model": "sonnet",
+                "query_source": "user",
+                "event_type": "api_request",
+                "source": "otel",
+                "cost_usd": 1.5,
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_read_tokens": 30,
+                "cache_creation_tokens": 40,
+                "duration_ms": null,
+                "error": null,
+                "session_id": "s1",
+                "cwd": "~/alpha",
+            })
+        );
+    }
+
+    #[test]
+    fn export_raw_rows_scans_in_timestamp_order_without_a_sort_step() {
+        let (_dir, db) = fixture_db();
+        let filter = facets(full_window()).filter(true, now());
+        // Mirror the production non-sessions SELECT (timestamp-ordered,
+        // time-windowed).
+        let sql = format!(
+            "SELECT r.timestamp_ms, r.model, r.query_source, r.event_type,
+                r.source, r.cost_usd, r.input_tokens, r.output_tokens,
+                r.cache_read_tokens, r.cache_creation_tokens, r.duration_ms,
+                r.error, r.session_id, s.cwd
+             FROM requests r INDEXED BY idx_requests_facet_rollup
+             LEFT JOIN sessions s ON s.session_id = r.session_id
+             {} ORDER BY r.timestamp_ms, r.id",
+            filter.where_clause(),
+        );
+        let sql = sql.replacen('?', "0", 1);
+        let sql = sql.replacen('?', "9999999999999", 1);
+        let plan = plan_for(&db, &sql);
+        // It is a main-table read by design (error/duration_ms/source are in
+        // no covering index), but the timestamp-leading index supplies the
+        // dominant ordering, so there is NO full materialize-and-sort
+        // regression. `timestamp_ms` (the leading index column) is satisfied by
+        // the index walk; only the `id` tiebreaker for equal-timestamp ties may
+        // use a partial sort — never a full ORDER BY sorter, which would mean
+        // the planner abandoned the index entirely.
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "timestamp-leading index must drive the order, not a full sorter:\n{plan}"
+        );
+        assert!(
+            plan.contains("idx_requests_facet_rollup"),
+            "scan must walk the timestamp-leading index, not the table:\n{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN r\n") && !plan.ends_with("SCAN r"),
+            "must not be a full table scan:\n{plan}"
+        );
+
+        // The sessions path orders by session then time off the session-leading
+        // index, also without a full sorter.
+        let sql = format!(
+            "SELECT r.timestamp_ms, r.id, s.cwd
+             FROM requests r INDEXED BY idx_requests_session_rollup
+             LEFT JOIN sessions s ON s.session_id = r.session_id
+             {} AND r.session_id IS NOT NULL
+             ORDER BY r.session_id, r.timestamp_ms, r.id",
+            filter.where_clause(),
+        );
+        let sql = sql.replacen('?', "0", 1);
+        let sql = sql.replacen('?', "9999999999999", 1);
+        let plan = plan_for(&db, &sql);
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "session-leading index must drive the order, not a full sorter:\n{plan}"
+        );
+        assert!(
+            plan.contains("idx_requests_session_rollup"),
+            "sessions scan must walk the session-leading index:\n{plan}"
         );
     }
 

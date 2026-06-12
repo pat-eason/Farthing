@@ -16,15 +16,26 @@
     getUsageSeries,
     getUsageSummary,
     toFacets,
+    type Facets,
     type SeriesPoint,
     type UsageSummary,
   } from "$lib/queries";
   import { facets } from "$lib/facets.svelte";
-  import { formatDate, formatDay, formatTokens } from "$lib/format";
+  import { formatDate, formatDay, formatTokens, projectName } from "$lib/format";
   import StackedBarChart, {
     type ChartBucket,
     type ChartSegment,
   } from "$lib/StackedBarChart.svelte";
+  import { page } from "$app/state";
+  import { isExporting, runExport, type PreparedExport } from "$lib/export.svelte";
+  import { buildChartSvg, type ChartLegendEntry } from "$lib/report/chartSvg";
+  import {
+    buildReportHtml,
+    buildSummaryCsv,
+    type AggregatedCsv,
+    type ReportFilter,
+    type ReportTotals,
+  } from "$lib/report/buildReport";
 
   const TOKEN_KINDS = [
     { key: "input_tokens", label: "Input", color: "#0a84ff" },
@@ -159,11 +170,152 @@
     if (s.start_ms === null || s.end_ms === null) return "All time";
     return `${formatDate(s.start_ms)} – ${formatDate(s.end_ms - 1)}`;
   }
+
+  // ---- export (R1/R2/R4/R15) ----
+  //
+  // GROUPING (R15): the tokens view has NO grouping toggle. The on-screen
+  // breakdown is fixed — four token kinds (input/output/cache-read/cache-
+  // creation) plus the cache hit-rate trend — driven solely by the global
+  // facets, not a per-view toggle. So the export carries no `grouping`
+  // segment in the filename and the report header states no grouping chip;
+  // the report chart stacks the four token kinds (one segment per kind) over
+  // the day skeleton, mirroring the on-screen counters, and the aggregated
+  // CSV is one row per day with a column per token kind.
+
+  /** Identity-header filter chips for the report (R6): source, project, model
+   * where they differ from the defaults. No grouping chip (R15). */
+  function reportFilters(snapFacets: Facets): ReportFilter[] {
+    const filters: ReportFilter[] = [];
+    if (snapFacets.query_source && snapFacets.query_source !== "all") {
+      filters.push({ label: "Source", value: snapFacets.query_source });
+    }
+    const project = snapFacets.project;
+    if (project === "unknown") {
+      filters.push({ label: "Project", value: "(unknown)" });
+    } else if (project && typeof project === "object") {
+      filters.push({ label: "Project", value: projectName(project.cwd) });
+    }
+    if (snapFacets.model) {
+      filters.push({ label: "Model", value: snapFacets.model });
+    }
+    return filters;
+  }
+
+  /** One stacked bucket per day; segments are the four token kinds in the
+   * same order/colors as the on-screen counters (R15). */
+  function tokenStackedBuckets(points: SeriesPoint[]): ChartBucket[] {
+    return points.map((point) => ({
+      start_ms: point.bucket_start_ms,
+      label: formatDay(point.bucket_start_ms),
+      segments: TOKEN_KINDS.map((kind) => ({
+        id: kind.key,
+        label: kind.label,
+        color: kind.color,
+        value: point[kind.key],
+      })),
+    }));
+  }
+
+  /** Aggregated CSV/table datapoints (R7): one row per day, a column per
+   * token kind. Matches the on-screen per-kind charts exactly. */
+  function aggregatedFromSeries(points: SeriesPoint[]): AggregatedCsv {
+    return {
+      columns: ["Day", ...TOKEN_KINDS.map((k) => `${k.label} tokens`)],
+      rows: points.map((point) => [
+        formatDate(point.bucket_start_ms),
+        ...TOKEN_KINDS.map((k) => String(point[k.key])),
+      ]),
+    };
+  }
+
+  /** Reconciliation totals for the report (R9): from the consistent read. */
+  function reportTotals(s: UsageSummary): ReportTotals {
+    return {
+      costUsd: s.cost_usd,
+      requests: s.requests,
+      unpricedRequests: s.unpriced_requests,
+      errors: s.errors,
+      inputTokens: s.input_tokens,
+      outputTokens: s.output_tokens,
+      cacheReadTokens: s.cache_read_tokens,
+      cacheCreationTokens: s.cache_creation_tokens,
+    };
+  }
+
+  function onExport(): void {
+    // Synchronous snapshot (R2/R4): capture the resolved facets and the
+    // originating route before any await. Tokens has no toggle to snapshot.
+    const snapFacets = toFacets(facets);
+    const originRoute = page.url.pathname;
+
+    void runExport({
+      view: "tokens",
+      facets: snapFacets,
+      originRoute,
+      prepare: async (): Promise<PreparedExport> => {
+        // Consistent point-in-time read (R9): re-fetch summary + ungrouped
+        // series on the snapshotted facets, not the view's loaded `$state`.
+        const [snapSummary, snapSeries] = await Promise.all([
+          getUsageSummary(snapFacets),
+          getUsageSeries(snapFacets, "none"),
+        ]);
+
+        if (snapSummary.requests === 0 && snapSummary.errors === 0) {
+          return {
+            requests: 0,
+            errors: 0,
+            reportHtml: "",
+            summaryCsv: "",
+            excludeSessionless: false,
+          };
+        }
+
+        const buckets = tokenStackedBuckets(snapSeries);
+        const aggregated = aggregatedFromSeries(snapSeries);
+        const chartLegend: ChartLegendEntry[] = TOKEN_KINDS.map((k) => ({
+          id: k.key,
+          label: k.label,
+          color: k.color,
+        }));
+        const chartSvg = buildChartSvg({
+          buckets,
+          legend: chartLegend,
+          formatValue: formatTokens,
+          ariaLabel: `Daily tokens by kind, ${buckets.length} day${buckets.length === 1 ? "" : "s"}`,
+        });
+        const reportHtml = buildReportHtml({
+          title: "Tokens & cache",
+          rangeLabel: windowLabel(snapSummary),
+          filters: reportFilters(snapFacets),
+          totals: reportTotals(snapSummary),
+          chartSvg,
+          aggregated,
+          generatedAtMs: Date.now(),
+        });
+
+        return {
+          requests: snapSummary.requests,
+          errors: snapSummary.errors,
+          reportHtml,
+          summaryCsv: buildSummaryCsv(aggregated),
+          excludeSessionless: false,
+        };
+      },
+    });
+  }
 </script>
 
 <div class="tokens-view">
   <header class="view-header">
     <h1>Tokens & cache</h1>
+    <button
+      type="button"
+      class="export-button"
+      onclick={onExport}
+      disabled={isExporting() || loading}
+    >
+      Export
+    </button>
   </header>
 
   {#if errorMessage}
@@ -298,6 +450,28 @@
     line-height: 1.4;
   }
 
+  .export-button {
+    appearance: none;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    border-radius: 6px;
+    margin: 0;
+    padding: 0.25rem 0.85rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: #1c1c1e;
+    background: #fff;
+    cursor: pointer;
+  }
+
+  .export-button:hover:not(:disabled) {
+    background: #f2f2f4;
+  }
+
+  .export-button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   .totals {
     display: flex;
     flex-wrap: wrap;
@@ -416,6 +590,16 @@
 
     .error {
       color: #ffa198;
+    }
+
+    .export-button {
+      color: #e7e7ea;
+      background: #2a2a2c;
+      border-color: rgba(255, 255, 255, 0.22);
+    }
+
+    .export-button:hover:not(:disabled) {
+      background: #333335;
     }
 
     .chart-card {
