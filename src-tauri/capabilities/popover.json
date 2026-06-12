@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "popover",
+  "description": "Lets the popover size its window to fit its content (resizeToContent)",
+  "windows": ["popover"],
+  "permissions": ["core:window:allow-set-size"]
+}

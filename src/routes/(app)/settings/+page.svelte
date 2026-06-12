@@ -14,6 +14,17 @@
     type UninstallOutcome,
     type UninstallStatus,
   } from "$lib/uninstall";
+  import { getBudgetConfig, setBudgetConfig, type BudgetConfig } from "$lib/budgets";
+
+  // --- Budgets (configured here in Settings) ---
+  // The config also carries notify/approach_pct for the deferred
+  // cost-notifications work; we never surface controls for them but preserve
+  // their defaults on every save.
+  const NOTIFY_DEFAULT = true;
+  const APPROACH_PCT_DEFAULT = 76;
+  const MIN_AMOUNT = 1;
+  const SAVE_DEBOUNCE_MS = 400;
+  type Period = "daily" | "monthly";
 
   let status: AutostartStatus | undefined = $state();
   let busy = $state(false);
@@ -25,6 +36,14 @@
   let uninstallOutcome: UninstallOutcome | undefined = $state();
   let uninstallError = $state("");
   let deleteDatabase = $state(false);
+
+  // `budgetConfig` is the working/optimistic copy bound to the inputs;
+  // `budgetConfirmed` is the last value the backend accepted (revert target).
+  let budgetConfig: BudgetConfig | undefined = $state();
+  let budgetConfirmed: BudgetConfig | undefined = $state();
+  let budgetError = $state("");
+  let fieldError: Record<Period, string> = $state({ daily: "", monthly: "" });
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
   async function refresh() {
     errorMessage = "";
@@ -88,13 +107,178 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  function cloneBudget(c: BudgetConfig): BudgetConfig {
+    return {
+      daily: { ...c.daily },
+      monthly: { ...c.monthly },
+      show_in_tray: c.show_in_tray,
+      approach_pct: c.approach_pct,
+    };
+  }
+
+  async function loadBudgets() {
+    budgetError = "";
+    try {
+      const loaded = await getBudgetConfig();
+      budgetConfirmed = loaded;
+      budgetConfig = cloneBudget(loaded);
+    } catch (err) {
+      budgetError = String(err);
+    }
+  }
+
+  // Enabled budgets need a finite amount >= $1; disabled budgets never block.
+  function amountValid(period: Period): boolean {
+    if (!budgetConfig) return false;
+    const budget = budgetConfig[period];
+    if (!budget.enabled) return true;
+    return Number.isFinite(budget.amount_usd) && budget.amount_usd >= MIN_AMOUNT;
+  }
+
+  function validate(period: Period): boolean {
+    const ok = amountValid(period);
+    fieldError[period] = ok ? "" : `Budget must be at least $${MIN_AMOUNT}`;
+    return ok;
+  }
+
+  function revertBudget() {
+    if (budgetConfirmed) budgetConfig = cloneBudget(budgetConfirmed);
+    fieldError = { daily: "", monthly: "" };
+  }
+
+  async function saveBudget() {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = undefined;
+    }
+    if (!budgetConfig) return;
+    // Skip the save if either enabled budget has an invalid amount; the
+    // field-level error is already shown and the field is left as typed.
+    if (!validate("daily") || !validate("monthly")) return;
+
+    budgetError = "";
+    // Persist the full config, preserving the deferred cost-notifications
+    // fields (notify/approach_pct) at their defaults.
+    const payload: BudgetConfig = {
+      daily: { ...budgetConfig.daily, notify: NOTIFY_DEFAULT },
+      monthly: { ...budgetConfig.monthly, notify: NOTIFY_DEFAULT },
+      show_in_tray: budgetConfig.show_in_tray,
+      approach_pct: APPROACH_PCT_DEFAULT,
+    };
+    try {
+      const result = await setBudgetConfig(payload);
+      budgetConfirmed = result;
+      // Adopt the (possibly clamped) server result.
+      budgetConfig = cloneBudget(result);
+    } catch (err) {
+      budgetError = String(err);
+      revertBudget();
+    }
+  }
+
+  function scheduleSave() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = undefined;
+      void saveBudget();
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  // Debounced path: typing into the amount input.
+  function onAmountInput(period: Period) {
+    if (validate(period)) scheduleSave();
+  }
+
+  // Immediate path: leaving the amount field commits right away.
+  function onAmountBlur() {
+    void saveBudget();
+  }
+
+  function toggleBudgetEnabled(period: Period) {
+    if (!budgetConfig) return;
+    budgetConfig[period].enabled = !budgetConfig[period].enabled;
+    validate(period);
+    void saveBudget();
+  }
+
+  function toggleTray() {
+    if (!budgetConfig) return;
+    budgetConfig.show_in_tray = !budgetConfig.show_in_tray;
+    void saveBudget();
+  }
+
   $effect(() => {
     void refresh();
+    void loadBudgets();
   });
 </script>
 
 <main class="container">
   <h1>Settings</h1>
+
+  {#if budgetError}
+    <p class="error-box">{budgetError}</p>
+  {/if}
+  {#if budgetConfig}
+    {#each [{ period: "daily" as const, title: "Daily budget", help: "Tracks today's spend against this amount." }, { period: "monthly" as const, title: "Monthly budget", help: "Tracks spend across the current calendar month." }] as card (card.period)}
+      <section class="setting">
+        <div class="setting-text">
+          <h2>{card.title}</h2>
+          <p class="muted">{card.help}</p>
+          <label class="amount-label">
+            <span>Amount (USD)</span>
+            <input
+              type="number"
+              min={MIN_AMOUNT}
+              step="0.01"
+              inputmode="decimal"
+              disabled={!budgetConfig[card.period].enabled}
+              bind:value={budgetConfig[card.period].amount_usd}
+              oninput={() => onAmountInput(card.period)}
+              onblur={onAmountBlur}
+              aria-invalid={fieldError[card.period] ? "true" : undefined}
+            />
+          </label>
+          {#if fieldError[card.period]}
+            <p class="error-box">{fieldError[card.period]}</p>
+          {/if}
+        </div>
+        <div class="setting-control">
+          <button
+            class:primary={!budgetConfig[card.period].enabled}
+            onclick={() => toggleBudgetEnabled(card.period)}
+            aria-pressed={budgetConfig[card.period].enabled}
+          >
+            {budgetConfig[card.period].enabled ? "Turn off" : "Turn on"}
+          </button>
+          <span class="state {budgetConfig[card.period].enabled ? 'good' : 'muted'}">
+            {budgetConfig[card.period].enabled ? "On" : "Off"}
+          </span>
+        </div>
+      </section>
+    {/each}
+
+    <section class="setting">
+      <div class="setting-text">
+        <h2>Show budgets in tray</h2>
+        <p class="muted">
+          Adds a budget band indicator next to today's cost in the menu-bar readout.
+        </p>
+      </div>
+      <div class="setting-control">
+        <button
+          class:primary={!budgetConfig.show_in_tray}
+          onclick={toggleTray}
+          aria-pressed={budgetConfig.show_in_tray}
+        >
+          {budgetConfig.show_in_tray ? "Turn off" : "Turn on"}
+        </button>
+        <span class="state {budgetConfig.show_in_tray ? 'good' : 'muted'}">
+          {budgetConfig.show_in_tray ? "On" : "Off"}
+        </span>
+      </div>
+    </section>
+  {/if}
 
   <section class="setting">
     <div class="setting-text">
@@ -318,6 +502,34 @@
     font-size: 0.9em;
   }
 
+  .amount-label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-top: 0.6rem;
+    font-size: 0.9em;
+    max-width: 12rem;
+  }
+
+  .amount-label input {
+    border-radius: 8px;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    padding: 0.45em 0.6em;
+    font-size: 0.95em;
+    font-family: inherit;
+    color: #0f0f0f;
+    background-color: #ffffff;
+  }
+
+  .amount-label input:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  .amount-label input[aria-invalid="true"] {
+    border-color: #b42318;
+  }
+
   ul {
     margin: 0.25rem 0 0.5rem;
     padding-left: 1.25rem;
@@ -447,6 +659,12 @@
     .warn-box {
       background: #4a3a14;
       color: #ffd98a;
+    }
+
+    .amount-label input {
+      color: #ffffff;
+      background-color: #0f0f0f98;
+      border-color: rgba(255, 255, 255, 0.2);
     }
 
     button,
