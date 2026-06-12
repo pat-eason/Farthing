@@ -565,26 +565,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "claude-usage-tracker"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "similar",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-opener",
- "tauri-plugin-positioner",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1089,6 +1069,26 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "farthing"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "similar",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-opener",
+ "tauri-plugin-positioner",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "fastrand"

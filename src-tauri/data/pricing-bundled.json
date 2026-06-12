@@ -1,5 +1,5 @@
 {
-  "_claude_usage_tracker": {
+  "_farthing": {
     "schema": 1,
     "source": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
     "snapshot_commit": "3b40ac987fb4fe08061b67dda91b286dc41bee28",

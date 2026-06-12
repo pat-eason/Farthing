@@ -34,7 +34,7 @@
 
 <div class="shell">
   <nav class="sidebar" aria-label="Views">
-    <p class="app-name">Claude Usage Tracker</p>
+    <p class="app-name">Farthing</p>
     <ul>
       {#each views as view (view.route)}
         <li>

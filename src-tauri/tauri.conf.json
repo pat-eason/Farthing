@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "claude-usage-tracker",
+  "productName": "Farthing",
   "version": "0.1.0",
-  "identifier": "com.peason.claude-usage-tracker",
+  "identifier": "com.peason.farthing",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Claude Usage Tracker",
+        "title": "Farthing",
         "width": 1100,
         "height": 720,
         "minWidth": 800,
@@ -24,7 +24,7 @@
       {
         "label": "popover",
         "url": "/popover",
-        "title": "Claude Usage Tracker",
+        "title": "Farthing",
         "width": 320,
         "height": 512,
         "visible": false,

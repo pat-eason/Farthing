@@ -1,5 +1,5 @@
 {
-  "name": "claude-usage-tracker",
+  "name": "farthing",
   "version": "0.1.0",
   "description": "Zero-config macOS menu bar app for Claude Code token/cost usage",
   "license": "MIT",

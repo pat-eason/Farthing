@@ -14,6 +14,11 @@ use rusqlite::Connection;
 /// File name of the database inside the app data directory.
 pub const DB_FILE_NAME: &str = "usage.db";
 
+/// Directory name (under `~/Library/Application Support/`) used by the
+/// pre-Farthing bundle identifier. Source of the one-time rename migration
+/// (see [`migrate_legacy_data_dir`]).
+pub const LEGACY_DATA_DIR_NAME: &str = "com.peason.claude-usage-tracker";
+
 /// Key in `meta` that stores the current schema version.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
@@ -220,6 +225,41 @@ impl Db {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
+}
+
+/// One-time data migration for the Farthing rename (2026-06-12): the bundle
+/// identifier change moved `app_data_dir`, leaving existing installs' data
+/// behind in the old directory. Moves `usage.db` plus its `-wal`/`-shm`
+/// siblings from `old_dir` into `new_dir` when — and only when — `new_dir`
+/// has no `usage.db` of its own.
+///
+/// Non-destructive by construction:
+/// - If `new_dir` already holds a `usage.db`, nothing happens (the new DB
+///   wins; the old directory is left untouched).
+/// - Files are *moved* (`rename`), never copied, so no stale second copy is
+///   left behind to drift.
+/// - The WAL/SHM siblings move before the main file: if the process dies
+///   midway, the next start still sees no `usage.db` in `new_dir`, re-runs
+///   the migration, and reunites the database with its already-moved WAL.
+///
+/// Returns `Ok(true)` when a database was moved, `Ok(false)` for a no-op.
+pub fn migrate_legacy_data_dir(old_dir: &Path, new_dir: &Path) -> std::io::Result<bool> {
+    if new_dir.join(DB_FILE_NAME).exists() {
+        return Ok(false);
+    }
+    let old_db = old_dir.join(DB_FILE_NAME);
+    if !old_db.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(new_dir)?;
+    for suffix in ["-wal", "-shm"] {
+        let sibling = old_dir.join(format!("{DB_FILE_NAME}{suffix}"));
+        if sibling.exists() {
+            std::fs::rename(&sibling, new_dir.join(format!("{DB_FILE_NAME}{suffix}")))?;
+        }
+    }
+    std::fs::rename(&old_db, new_dir.join(DB_FILE_NAME))?;
+    Ok(true)
 }
 
 fn configure_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -604,6 +644,113 @@ mod tests {
             )
             .unwrap();
         assert_eq!(leaked, 0, "partial migration leaked objects");
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn legacy_migration_moves_db_and_wal_shm_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let old_dir = root.path().join("com.peason.claude-usage-tracker");
+        let new_dir = root.path().join("com.peason.farthing");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        write_file(&old_dir.join("usage.db"), "db");
+        write_file(&old_dir.join("usage.db-wal"), "wal");
+        write_file(&old_dir.join("usage.db-shm"), "shm");
+
+        let moved = migrate_legacy_data_dir(&old_dir, &new_dir).unwrap();
+        assert!(moved);
+        for name in ["usage.db", "usage.db-wal", "usage.db-shm"] {
+            assert!(new_dir.join(name).exists(), "missing {name} in new dir");
+            assert!(!old_dir.join(name).exists(), "{name} left in old dir");
+        }
+        assert_eq!(
+            std::fs::read_to_string(new_dir.join("usage.db")).unwrap(),
+            "db"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_moves_db_without_wal_shm() {
+        let root = tempfile::tempdir().unwrap();
+        let old_dir = root.path().join("old");
+        let new_dir = root.path().join("new");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        write_file(&old_dir.join("usage.db"), "db");
+
+        assert!(migrate_legacy_data_dir(&old_dir, &new_dir).unwrap());
+        assert!(new_dir.join("usage.db").exists());
+        assert!(!new_dir.join("usage.db-wal").exists());
+        assert!(!new_dir.join("usage.db-shm").exists());
+    }
+
+    #[test]
+    fn legacy_migration_prefers_existing_new_db_and_leaves_old_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let old_dir = root.path().join("old");
+        let new_dir = root.path().join("new");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        write_file(&old_dir.join("usage.db"), "old");
+        write_file(&old_dir.join("usage.db-wal"), "old-wal");
+        write_file(&new_dir.join("usage.db"), "new");
+
+        let moved = migrate_legacy_data_dir(&old_dir, &new_dir).unwrap();
+        assert!(!moved);
+        assert_eq!(
+            std::fs::read_to_string(new_dir.join("usage.db")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old_dir.join("usage.db")).unwrap(),
+            "old"
+        );
+        assert!(old_dir.join("usage.db-wal").exists());
+    }
+
+    #[test]
+    fn legacy_migration_is_a_noop_without_an_old_db() {
+        let root = tempfile::tempdir().unwrap();
+        let old_dir = root.path().join("missing-old");
+        let new_dir = root.path().join("new");
+
+        assert!(!migrate_legacy_data_dir(&old_dir, &new_dir).unwrap());
+        // No-op must not even create the new directory.
+        assert!(!new_dir.exists());
+    }
+
+    #[test]
+    fn legacy_migration_then_open_serves_the_migrated_data() {
+        let root = tempfile::tempdir().unwrap();
+        let old_dir = root.path().join("old");
+        let new_dir = root.path().join("new");
+
+        // Build a real database in the old location and close it.
+        {
+            let db = Db::open_in_dir(&old_dir).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO requests (request_id, session_id, timestamp_ms)
+                     VALUES ('req_legacy', 's', 1)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        assert!(migrate_legacy_data_dir(&old_dir, &new_dir).unwrap());
+        let db = Db::open_in_dir(&new_dir).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM requests WHERE request_id = 'req_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(!old_dir.join(DB_FILE_NAME).exists());
     }
 
     #[test]

@@ -65,7 +65,7 @@ pnpm tauri build --bundles app,dmg
 Then assess:
 
 ```sh
-APP="src-tauri/target/release/bundle/macos/claude-usage-tracker.app"
+APP="src-tauri/target/release/bundle/macos/Farthing.app"
 codesign --verify --deep --strict --verbose=2 "$APP"
 xcrun stapler validate "$APP"
 spctl --assess --type exec --verbose=2 "$APP"   # must report "accepted, source=Notarized Developer ID"
@@ -76,4 +76,4 @@ spctl --assess --type exec --verbose=2 "$APP"   # must report "accepted, source=
 ## Status / blockers
 
 - [ ] **Blocked on human**: no Apple Developer credentials exist yet. Add the six secrets above, push a tag, and confirm the `Verify notarization` step passes and the release publishes non-draft.
-- The pending rename (working name **BarTab**, see `docs/notes/naming.md`) changes `productName`/`identifier`; the workflow finds the `.app`/`.dmg` by glob, so no `release.yml` edits are needed when it lands.
+- The rename to **Farthing** (see `docs/notes/naming.md`) landed 2026-06-12 (`productName: Farthing`, `identifier: com.peason.farthing`); the workflow finds the `.app`/`.dmg` by glob, so no `release.yml` edits were needed.

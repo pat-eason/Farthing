@@ -223,9 +223,7 @@
   {/if}
 
   <footer class="open-app-row">
-    <button type="button" class="open-app" onclick={() => void openApp()}>
-      Open Claude Usage Tracker
-    </button>
+    <button type="button" class="open-app" onclick={() => void openApp()}> Open Farthing </button>
   </footer>
 </main>
 
