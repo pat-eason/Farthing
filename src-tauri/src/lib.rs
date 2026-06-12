@@ -17,6 +17,7 @@ pub mod session;
 pub mod settings_merge;
 pub mod transcript;
 pub mod tray;
+pub mod tray_title;
 pub mod uninstall;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -77,6 +78,9 @@ pub fn run() {
                 .with_pause_flag(capture_state.pause_flag())
                 .with_notifier(Arc::new(move |stored| {
                     let _ = ingest_app.emit(ingest::INGESTED_EVENT, stored);
+                    // Tray title tracks today's cost; updated Rust-side so
+                    // it never round-trips through the webview.
+                    tray_title::refresh(&ingest_app);
                 }));
             app.manage(ingest_state.clone());
 
@@ -97,6 +101,7 @@ pub fn run() {
             let projects_root = backfill::projects_root(app.handle())?;
             let backfill_db = Arc::clone(&database);
             let backfill_pricing = pricing_state.clone();
+            let backfill_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
                 backfill::run_pass(
                     &backfill_db,
@@ -104,6 +109,9 @@ pub fn run() {
                     &backfill_state,
                     &projects_root,
                 );
+                // The pass may have recovered rows from today; reflect them
+                // in the tray title.
+                tray_title::refresh(&backfill_app);
             });
 
             // OTLP receiver on 127.0.0.1:43177. A port conflict is recorded
@@ -115,8 +123,22 @@ pub fn run() {
 
             // Menu bar presence (task 4.1): tray icon + menu, popover shell,
             // ActivationPolicy::Accessory (no Dock icon until the desktop
-            // window opens).
+            // window opens). Seeds the tray title (today's cost) too.
             tray::setup(app)?;
+
+            // Coarse 60s tick keeping the tray title fresh: catches the
+            // local-midnight rollover (cost resets to $0.00) without any
+            // midnight-alarm bookkeeping. The query is an index-only range
+            // scan; cheap enough to run for the life of the app.
+            let tick_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await; // first tick is immediate; already seeded
+                loop {
+                    interval.tick().await;
+                    tray_title::refresh(&tick_app);
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
