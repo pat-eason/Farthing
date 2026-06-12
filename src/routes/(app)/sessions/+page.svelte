@@ -7,10 +7,11 @@
   // always reconciles with the row that was clicked. Sessions with no cwd
   // mapping render as "(unknown project)": data, not errors (PRD FR-3).
   import {
-    getSessionDetail,
     getSessionRollups,
+    getSessionDetail,
     getUsageSummary,
     toFacets,
+    type Facets,
     type ModelMix,
     type SessionDetail,
     type SessionRollup,
@@ -20,12 +21,22 @@
   import { facets } from "$lib/facets.svelte";
   import {
     formatCost,
+    formatDate,
     formatDateTime,
     formatDuration,
     formatTime,
     formatTokens,
     projectName,
   } from "$lib/format";
+  import { page } from "$app/state";
+  import { isExporting, runExport, type PreparedExport } from "$lib/export.svelte";
+  import {
+    buildReportHtml,
+    buildSummaryCsv,
+    type AggregatedCsv,
+    type ReportFilter,
+    type ReportTotals,
+  } from "$lib/report/buildReport";
 
   /** Page size; "Load more" appends the next SQL page. */
   const PAGE = 100;
@@ -185,17 +196,202 @@
 
   const pageCost = $derived((rows ?? []).reduce((sum, row) => sum + row.cost_usd, 0));
   const isEmpty = $derived(rows !== undefined && rows.length === 0);
+
+  // ---- export (R1/R2/R4/R16) ----
+  //
+  // Sessions is a TABLE report (no chart). Two fidelity rules:
+  //  - Aggregated CSV = the FULL session-rollup set across ALL pages in the
+  //    current sort (R16), not the visible/loaded page. The table only holds
+  //    the pages the user scrolled, so the export re-queries the full set by
+  //    paging at MAX_SESSION_LIMIT until a short page.
+  //  - Raw CSV restricts to the session row set (`excludeSessionless=true`)
+  //    so the raw rows match the session-rollup window (R9/R16); Rust orders
+  //    that view's raw CSV by `session_id, timestamp_ms`.
+  //
+  // `session_rollups` clamps any limit to MAX_SESSION_LIMIT (2000) server-side
+  // (queries.rs); page through it the same way.
+  const ALL_PAGE = 2000;
+
+  /** Fetch every session rollup for the facets in the given sort, paging until
+   * a short page. Pure over its inputs (the consistent snapshotted facets). */
+  async function fetchAllRollups(
+    snapFacets: Facets,
+    snapSort: SessionSort,
+    snapDescending: boolean
+  ): Promise<SessionRollup[]> {
+    const all: SessionRollup[] = [];
+    for (let offset = 0; ; offset += ALL_PAGE) {
+      const batch = await getSessionRollups(snapFacets, {
+        sort: snapSort,
+        descending: snapDescending,
+        limit: ALL_PAGE,
+        offset,
+      });
+      all.push(...batch);
+      if (batch.length < ALL_PAGE) break;
+    }
+    return all;
+  }
+
+  const SORT_LABEL: Record<SessionSort, string> = {
+    start: "Start",
+    duration: "Duration",
+    tokens: "Tokens",
+    cost: "Cost",
+  };
+
+  /** Identity-header filter chips (R6): source, project, model, plus the
+   * active sort (the table report's "grouping" analogue). */
+  function reportFilters(
+    snapFacets: Facets,
+    snapSort: SessionSort,
+    snapDescending: boolean
+  ): ReportFilter[] {
+    const filters: ReportFilter[] = [];
+    if (snapFacets.query_source && snapFacets.query_source !== "all") {
+      filters.push({ label: "Source", value: snapFacets.query_source });
+    }
+    const project = snapFacets.project;
+    if (project === "unknown") {
+      filters.push({ label: "Project", value: "(unknown)" });
+    } else if (project && typeof project === "object") {
+      filters.push({ label: "Project", value: projectName(project.cwd) });
+    }
+    if (snapFacets.model) {
+      filters.push({ label: "Model", value: snapFacets.model });
+    }
+    filters.push({
+      label: "Sorted by",
+      value: `${SORT_LABEL[snapSort]} ${snapDescending ? "↓" : "↑"}`,
+    });
+    return filters;
+  }
+
+  /** Aggregated CSV/table datapoints (R7/R16): one row per session rollup, in
+   * the current sort, across all pages. */
+  function aggregatedFromRollups(all: SessionRollup[]): AggregatedCsv {
+    return {
+      columns: [
+        "Session",
+        "Project",
+        "Start",
+        "Duration",
+        "Models",
+        "Requests",
+        "Errors",
+        "Tokens",
+        "Cost (USD)",
+      ],
+      rows: all.map((row) => [
+        row.session_id,
+        projectName(row.cwd),
+        formatDateTime(row.first_ms),
+        formatDuration(row.last_ms - row.first_ms),
+        row.models.join(" "),
+        String(row.requests),
+        String(row.errors),
+        String(totalTokens(row)),
+        String(row.cost_usd),
+      ]),
+    };
+  }
+
+  /** Reconciliation totals for the report (R9): from the consistent read. */
+  function reportTotals(s: UsageSummary): ReportTotals {
+    return {
+      costUsd: s.cost_usd,
+      requests: s.requests,
+      unpricedRequests: s.unpriced_requests,
+      errors: s.errors,
+      inputTokens: s.input_tokens,
+      outputTokens: s.output_tokens,
+      cacheReadTokens: s.cache_read_tokens,
+      cacheCreationTokens: s.cache_creation_tokens,
+    };
+  }
+
+  function windowLabel(s: UsageSummary): string {
+    if (s.start_ms === null || s.end_ms === null) return "All time";
+    return `${formatDate(s.start_ms)} – ${formatDate(s.end_ms - 1)}`;
+  }
+
+  function onExport(): void {
+    // Synchronous snapshot (R2/R4): capture facets, the active sort, and the
+    // originating route before any await, so re-sorting after the click can't
+    // change the produced bundle.
+    const snapFacets = toFacets(facets);
+    const snapSort = sort;
+    const snapDescending = descending;
+    const originRoute = page.url.pathname;
+
+    void runExport({
+      view: "sessions",
+      facets: snapFacets,
+      originRoute,
+      prepare: async (): Promise<PreparedExport> => {
+        // Consistent point-in-time read (R9): summary for counts/totals, and
+        // the FULL rollup set across all pages for the aggregated CSV (R16) —
+        // NOT the view's loaded `$state`, which only holds visible pages.
+        const [snapSummary, allRollups] = await Promise.all([
+          getUsageSummary(snapFacets),
+          fetchAllRollups(snapFacets, snapSort, snapDescending),
+        ]);
+
+        if (snapSummary.requests === 0 && snapSummary.errors === 0) {
+          return {
+            requests: 0,
+            errors: 0,
+            reportHtml: "",
+            summaryCsv: "",
+            // Sessions raw CSV = session row set (R16): excludes session-less rows.
+            excludeSessionless: true,
+          };
+        }
+
+        const aggregated = aggregatedFromRollups(allRollups);
+        const reportHtml = buildReportHtml({
+          title: "Sessions",
+          rangeLabel: windowLabel(snapSummary),
+          filters: reportFilters(snapFacets, snapSort, snapDescending),
+          totals: reportTotals(snapSummary),
+          // Table report: no chart.
+          aggregated,
+          generatedAtMs: Date.now(),
+        });
+
+        return {
+          requests: snapSummary.requests,
+          errors: snapSummary.errors,
+          reportHtml,
+          summaryCsv: buildSummaryCsv(aggregated),
+          // R16: raw CSV uses the session row set + `session_id, timestamp_ms`
+          // order, which the Rust export applies when this flag is true.
+          excludeSessionless: true,
+        };
+      },
+    });
+  }
 </script>
 
 <div class="sessions-view">
   <header class="view-header">
     <h1>Sessions</h1>
-    {#if summary}
-      <span class="muted header-stats">
-        {summary.sessions} session{summary.sessions === 1 ? "" : "s"} ·
-        {formatCost(summary.cost_usd)} API-equivalent
-      </span>
-    {/if}
+    <div class="header-actions">
+      {#if summary}
+        <span class="muted header-stats">
+          {summary.sessions} session{summary.sessions === 1 ? "" : "s"} ·
+          {formatCost(summary.cost_usd)} API-equivalent
+        </span>
+      {/if}
+      <button
+        type="button"
+        class="export-button"
+        onclick={onExport}
+        disabled={isExporting() || loading}
+      >
+        Export
+      </button>
+    </div>
   </header>
 
   {#if summary && summary.unpriced_requests > 0}
@@ -511,6 +707,35 @@
     font-size: 0.82rem;
   }
 
+  .header-actions {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.7rem;
+  }
+
+  .export-button {
+    appearance: none;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    border-radius: 6px;
+    margin: 0;
+    padding: 0.25rem 0.85rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: #1c1c1e;
+    background: #fff;
+    cursor: pointer;
+    align-self: center;
+  }
+
+  .export-button:hover:not(:disabled) {
+    background: #f2f2f4;
+  }
+
+  .export-button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   .stale {
     opacity: 0.6;
     transition: opacity 0.15s ease 0.15s;
@@ -782,6 +1007,16 @@
 
     .error {
       color: #ffa198;
+    }
+
+    .export-button {
+      color: #e7e7ea;
+      background: #2a2a2c;
+      border-color: rgba(255, 255, 255, 0.22);
+    }
+
+    .export-button:hover:not(:disabled) {
+      background: #333335;
     }
 
     .table-card,
