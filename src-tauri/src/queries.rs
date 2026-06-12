@@ -2178,7 +2178,10 @@ mod tests {
         let timestamps: Vec<i64> = rows.iter().map(|r| r.timestamp_ms).collect();
         let mut sorted = timestamps.clone();
         sorted.sort();
-        assert_eq!(timestamps, sorted, "rows are ordered by timestamp ascending");
+        assert_eq!(
+            timestamps, sorted,
+            "rows are ordered by timestamp ascending"
+        );
     }
 
     #[test]
@@ -2203,7 +2206,10 @@ mod tests {
         assert_eq!(relativize_home("/home/bob", Some("/home/bob")), "~");
         assert_eq!(relativize_home("/home/bob/x", Some("/home/bob")), "~/x");
         // A sibling whose name shares a prefix must not be rewritten.
-        assert_eq!(relativize_home("/home/bobby/x", Some("/home/bob")), "/home/bobby/x");
+        assert_eq!(
+            relativize_home("/home/bobby/x", Some("/home/bob")),
+            "/home/bobby/x"
+        );
         // No home resolved: paths pass through unchanged.
         assert_eq!(relativize_home("/proj/x", None), "/proj/x");
     }
@@ -2326,10 +2332,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        let rollup_rows: i64 = rollups
-            .iter()
-            .map(|s| s.totals.requests + s.errors)
-            .sum();
+        let rollup_rows: i64 = rollups.iter().map(|s| s.totals.requests + s.errors).sum();
         assert_eq!(
             excluded.len() as i64,
             rollup_rows,

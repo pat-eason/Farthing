@@ -142,14 +142,8 @@ fn requests_csv_line(row: &RawExportRow) -> String {
     let iso = chrono::DateTime::from_timestamp_millis(row.timestamp_ms)
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default();
-    let cost = row
-        .cost_usd
-        .map(|c| c.to_string())
-        .unwrap_or_default();
-    let duration = row
-        .duration_ms
-        .map(|d| d.to_string())
-        .unwrap_or_default();
+    let cost = row.cost_usd.map(|c| c.to_string()).unwrap_or_default();
+    let duration = row.duration_ms.map(|d| d.to_string()).unwrap_or_default();
     let mut line = String::new();
     line.push_str(&row.timestamp_ms.to_string());
     line.push(',');
@@ -219,7 +213,13 @@ where
         .unwrap_or_else(|| "export.zip".to_string());
     let tmp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
 
-    let rows_written = match build_zip(&tmp, report_html, summary_csv, &mut stream_rows, &mut on_progress) {
+    let rows_written = match build_zip(
+        &tmp,
+        report_html,
+        summary_csv,
+        &mut stream_rows,
+        &mut on_progress,
+    ) {
         Ok(rows) => rows,
         Err(err) => {
             // Best-effort cleanup; the temp is hidden + PID-scoped, so a
@@ -307,7 +307,9 @@ where
 
 /// Resolve the data directory for the read-only export connection and the
 /// user's home dir (for path relativization), shared by the command and tests.
-fn open_export_db<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(db::Db, Option<String>), String> {
+fn open_export_db<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<(db::Db, Option<String>), String> {
     let data_dir = app.state::<DbPath>().0.clone();
     let db = db::Db::open_readonly(&data_dir.join(db::DB_FILE_NAME))
         .map_err(|err| format!("cannot open export database: {err}"))?;
@@ -382,9 +384,15 @@ pub fn export<R: Runtime>(
         .map_err(|err| format!("cannot stream export rows: {err}"))
     };
 
-    let rows_written = write_bundle(&destination, &report_html, &summary_csv, stream_rows, |rows| {
-        emit_progress(rows, &mut last_emit);
-    })?;
+    let rows_written = write_bundle(
+        &destination,
+        &report_html,
+        &summary_csv,
+        stream_rows,
+        |rows| {
+            emit_progress(rows, &mut last_emit);
+        },
+    )?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     // Single terminal event so the banner can flip to "done" without polling.
@@ -410,12 +418,7 @@ pub fn export<R: Runtime>(
 /// the primary success surface), never surfaced as an export failure.
 #[tauri::command]
 pub fn notify_export_done<R: Runtime>(app: tauri::AppHandle<R>, title: String, body: String) {
-    let _ = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show();
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 #[cfg(test)]
@@ -568,8 +571,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let destination = dest(&dir, "empty.zip");
 
-        let written = write_bundle(&destination, "<html></html>", "h\n", stream_ok(vec![]), |_| {})
-            .unwrap();
+        let written = write_bundle(
+            &destination,
+            "<html></html>",
+            "h\n",
+            stream_ok(vec![]),
+            |_| {},
+        )
+        .unwrap();
 
         assert_eq!(written, 0);
         let requests = read_zip_entry(&destination, REQUESTS_CSV_NAME);
@@ -599,7 +608,13 @@ mod tests {
         std::fs::set_permissions(&subdir, perms).unwrap();
         let destination = subdir.join("out.zip");
 
-        let result = write_bundle(&destination, "<html></html>", "h\n", stream_ok(vec![row(1)]), |_| {});
+        let result = write_bundle(
+            &destination,
+            "<html></html>",
+            "h\n",
+            stream_ok(vec![row(1)]),
+            |_| {},
+        );
 
         // Restore perms so TempDir can clean up.
         let mut restore = std::fs::metadata(&subdir).unwrap().permissions();
@@ -618,8 +633,14 @@ mod tests {
     fn missing_parent_dir_rejected_before_write() {
         let dir = TempDir::new().unwrap();
         let destination = dir.path().join("nope").join("out.zip");
-        let err = write_bundle(&destination, "<html></html>", "h\n", stream_ok(vec![row(1)]), |_| {})
-            .unwrap_err();
+        let err = write_bundle(
+            &destination,
+            "<html></html>",
+            "h\n",
+            stream_ok(vec![row(1)]),
+            |_| {},
+        )
+        .unwrap_err();
         assert!(
             err.contains("does not exist"),
             "actionable error names the missing directory: {err}"
@@ -632,14 +653,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let destination = dest(&dir, "report.tar");
         let err = validate_destination(&destination).unwrap_err();
-        assert!(err.contains(".zip"), "error names the required extension: {err}");
+        assert!(
+            err.contains(".zip"),
+            "error names the required extension: {err}"
+        );
     }
 
     #[test]
     fn relative_destination_rejected() {
         let destination = PathBuf::from("report.zip");
         let err = validate_destination(&destination).unwrap_err();
-        assert!(err.contains("absolute"), "error names the constraint: {err}");
+        assert!(
+            err.contains("absolute"),
+            "error names the constraint: {err}"
+        );
     }
 
     #[test]
@@ -664,7 +691,11 @@ mod tests {
             |rows| ticks.push(rows),
         )
         .unwrap();
-        assert_eq!(ticks, vec![1, 2, 3, 4], "one monotonic tick per streamed row");
+        assert_eq!(
+            ticks,
+            vec![1, 2, 3, 4],
+            "one monotonic tick per streamed row"
+        );
     }
 
     #[test]
@@ -679,7 +710,10 @@ mod tests {
             line.contains("\"API Error: 529, \"\"overloaded\"\"\nretry\""),
             "error field is RFC-4180 quoted: {line}"
         );
-        assert!(line.contains("\"~/a,b\""), "cwd with a comma is quoted: {line}");
+        assert!(
+            line.contains("\"~/a,b\""),
+            "cwd with a comma is quoted: {line}"
+        );
     }
 
     #[test]
@@ -691,9 +725,15 @@ mod tests {
         let line = requests_csv_line(&r);
         // event_type column is the 5th field; ensure empty cost/duration emit
         // as bare empty cells (",,"), not "null".
-        assert!(!line.contains("null"), "None never serializes as the text null");
+        assert!(
+            !line.contains("null"),
+            "None never serializes as the text null"
+        );
         // Two consecutive commas appear where empty cells sit.
-        assert!(line.contains(",,"), "empty cells render as adjacent commas: {line}");
+        assert!(
+            line.contains(",,"),
+            "empty cells render as adjacent commas: {line}"
+        );
     }
 
     // ---- integration: real Unit 2 stream -> requests.csv reconciles ----
@@ -768,7 +808,13 @@ mod tests {
             "requests.csv data rows match the Unit 2 count over the same facets"
         );
         // The api_error row carries its event_type and home-relativized path.
-        assert!(requests.contains("api_error"), "error rows are included (R8)");
-        assert!(requests.contains("~/proj"), "cwd is home-relativized in the CSV (R8)");
+        assert!(
+            requests.contains("api_error"),
+            "error rows are included (R8)"
+        );
+        assert!(
+            requests.contains("~/proj"),
+            "cwd is home-relativized in the CSV (R8)"
+        );
     }
 }

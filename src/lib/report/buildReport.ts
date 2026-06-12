@@ -102,9 +102,7 @@ function csvCell(value: string): string {
  * well-terminated.
  */
 export function buildSummaryCsv(aggregated: AggregatedCsv): string {
-  const lines = [aggregated.columns, ...aggregated.rows].map((row) =>
-    row.map(csvCell).join(",")
-  );
+  const lines = [aggregated.columns, ...aggregated.rows].map((row) => row.map(csvCell).join(","));
   return lines.join("\r\n") + "\r\n";
 }
 
@@ -196,8 +194,7 @@ function renderChips(filters: ReportFilter[]): string {
  * unpriced / token counts, with the exact unrounded values embedded as
  * `data-*` so the standalone report reconciles against the raw CSV. */
 function renderTotals(t: ReportTotals): string {
-  const totalTokens =
-    t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheCreationTokens;
+  const totalTokens = t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheCreationTokens;
   const items: string[] = [
     `<span class="report-total-item">API-equivalent</span>`,
     `<span class="report-total-item"><b>${t.requests.toLocaleString()}</b> request${t.requests === 1 ? "" : "s"}</span>`,
