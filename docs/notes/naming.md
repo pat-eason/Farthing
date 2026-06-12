@@ -2,6 +2,11 @@
 
 > Checked 2026-06-11. Final name is a human decision; this doc proposes candidates with
 > collision evidence and picks a working default. **Working default: BarTab.**
+>
+> **Resolved 2026-06-12: final name is Farthing** (display name "Farthing", slug
+> `farthing`, bundle identifier `com.peason.farthing`). BarTab was declined; Farthing
+> (the runner-up below) was confirmed. The rename checklist has been applied (status
+> per item below); the candidate analysis is kept as-is for the historical record.
 
 ## Why the working name has to go
 
@@ -71,29 +76,38 @@ Each candidate was checked against, on 2026-06-11:
   a free OSS dev tool via GitHub .dmg, not the App Store), so risk reads low — but this
   is exactly the call a human should confirm.
 
-## Rename checklist (apply in one commit once the name is confirmed)
+## Rename checklist (applied 2026-06-12, name: Farthing)
 
-The rename deliberately did NOT land with this task: changing `identifier` moves
-`app_data_dir` and would orphan the dogfooding DB mid-development. Land it with 6.2/6.3.
+The rename deliberately did NOT land with task 6.1: changing `identifier` moves
+`app_data_dir` and would orphan the dogfooding DB mid-development. It landed in one
+commit ("Rename to Farthing") once the name was confirmed.
 
-1. `src-tauri/tauri.conf.json`: `productName`, `identifier` → `com.peason.bartab`, both
-   window `title`s.
-2. `package.json` `name`; `src-tauri/Cargo.toml` package `name` + `lib.name`
-   (`claude_usage_tracker_lib`, referenced from `main.rs` and every file in
+1. [x] `src-tauri/tauri.conf.json`: `productName` → `Farthing`, `identifier` →
+   `com.peason.farthing`, both window `title`s.
+2. [x] `package.json` `name` → `farthing`; `src-tauri/Cargo.toml` package `name` →
+   `farthing` + `lib.name` → `farthing_lib` (referenced from `main.rs` and every file in
    `src-tauri/examples/`).
-3. `src-tauri/src/tray.rs`: "Open Claude Usage Tracker" menu item, tooltip.
-4. UI strings: `src/routes/(app)/+layout.svelte` (`app-name`), `src/routes/popover/+page.svelte`
+3. [x] `src-tauri/src/tray.rs`: "Open Farthing" menu item, "Farthing" tooltip.
+4. [x] UI strings: `src/routes/(app)/+layout.svelte` (`app-name`), `src/routes/popover/+page.svelte`
    (footer button).
-5. `src-tauri/src/pricing.rs` + `src-tauri/src/autostart.rs`: any identifier/name literals
-   (user-agent, LaunchAgent label notes).
-6. README/docs headings ("(working name)" markers in README, PRD, development plan).
-7. **Data migration:** identifier change moves
-   `~/Library/Application Support/com.peason.claude-usage-tracker/` → `.../com.peason.bartab/`.
-   Add a one-time first-boot move of `usage.db` (+ `-wal`/`-shm`) from the old dir, or
-   accept losing OTel-only history (backfill only regenerates transcript-derived rows).
-8. Autostart: LaunchAgent is registered per-identifier; uninstall/re-enable around the
-   rename (dev machines only; no public installs exist yet).
-9. GitHub repo rename `claude-usage-tracker` → `bartab` (old URL redirects).
+5. [x] `src-tauri/src/pricing.rs` + `src-tauri/src/autostart.rs`: identifier/name literals
+   (the bundled pricing file's provenance entry is now `_farthing`; LaunchAgent label
+   notes reference `target/debug/farthing`). Env overrides renamed for consistency:
+   `FARTHING_DATA_DIR` / `FARTHING_SETTINGS_PATH` / `FARTHING_PROJECTS_DIR`.
+6. [x] README/docs headings ("(working name)" markers in README, PRD, development plan;
+   release.md notes).
+7. [x] **Data migration:** identifier change moves
+   `~/Library/Application Support/com.peason.claude-usage-tracker/` → `.../com.peason.farthing/`.
+   One-time first-boot move of `usage.db` (+ `-wal`/`-shm`) from the old dir implemented
+   as `db::migrate_legacy_data_dir` (unit-tested; move-not-copy; no-op when the new dir
+   already has a `usage.db`, old dir left untouched).
+8. [ ] Autostart: LaunchAgent is registered per-identifier; uninstall/re-enable around the
+   rename (dev machines only; no public installs exist yet). Manual step, not part of the
+   rename commit.
+9. [ ] GitHub repo rename `claude-usage-tracker` → `farthing` (old URL redirects).
+   Deferred; the local/remote repo directory is still `claude-usage-tracker`, which is why
+   docs that reference the real path (e.g. `docs/notes/otel-schema.md`, CONTRIBUTING's
+   `cd claude-usage-tracker`) intentionally keep the old slug.
 
 ## Icon placeholders
 

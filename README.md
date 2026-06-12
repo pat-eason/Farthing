@@ -1,8 +1,8 @@
-# Claude Usage Tracker (working name)
+# Farthing
+
+> Keeps count of every farthing of your Claude Code spend.
 
 A macOS menu bar app that makes Claude Code token and dollar usage visible with **zero manual configuration**. Install it, click "Set up" once, and every Claude Code session on your machine starts reporting per-request usage: cost, tokens (input/output/cache read/cache creation), model, project, and session, surfaced through a menu bar popover and a full desktop UI.
-
-> The name is a working name; a rename (working default: **BarTab**) is planned before the public v1.0 release. See [docs/notes/naming.md](docs/notes/naming.md).
 
 ## What it does
 
@@ -85,7 +85,7 @@ Not removed: the settings.json backups (kept so you can restore any earlier stat
 ## Privacy posture
 
 - **Loopback only**: the receiver binds `127.0.0.1` exclusively. Nothing listens on a network interface; no data ever leaves your machine.
-- **Local-only data**: all usage data lives in a SQLite database at `~/Library/Application Support/com.peason.claude-usage-tracker/usage.db`. There is no telemetry, no analytics, no remote sync of any kind.
+- **Local-only data**: all usage data lives in a SQLite database at `~/Library/Application Support/com.peason.farthing/usage.db`. There is no telemetry, no analytics, no remote sync of any kind.
 - **No content stored**: only usage numbers and metadata (tokens, cost, model, session id, timestamps, project directory paths). Prompt and response content is never stored. Account-identity attributes present on Claude Code's OTel events (`user.email`, `user.id`, `organization.id`, ...) are deliberately not persisted.
 - **One outbound request, optional in effect**: on startup the app refreshes its model-pricing table from a pinned LiteLLM pricing JSON URL (fail-silent, cached locally, used only to price backfilled rows for which Claude Code did not report a cost). No usage data is sent; it is a plain GET for a public file. If it fails or is blocked, the bundled pricing snapshot is used.
 

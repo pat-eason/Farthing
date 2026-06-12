@@ -15,9 +15,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use claude_usage_tracker_lib::backfill::{diff_report, run_pass, BackfillState, DiffReport};
-use claude_usage_tracker_lib::db::Db;
-use claude_usage_tracker_lib::pricing::{PricingState, PricingTable};
+use farthing_lib::backfill::{diff_report, run_pass, BackfillState, DiffReport};
+use farthing_lib::db::Db;
+use farthing_lib::pricing::{PricingState, PricingTable};
 
 const WINDOW_HOURS: u32 = 24 * 7;
 const FLIP_COUNT: i64 = 200;

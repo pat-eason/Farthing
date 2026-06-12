@@ -63,7 +63,7 @@ const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
 const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
 
 /// Bundled price snapshot (see module docs; provenance recorded in the
-/// file's `_claude_usage_tracker` entry and `docs/notes/pricing.md`).
+/// file's `_farthing` entry and `docs/notes/pricing.md`).
 const BUNDLED_PRICING: &str = include_str!("../data/pricing-bundled.json");
 
 /// Resolved per-token USD costs for one model. All fields are finite and

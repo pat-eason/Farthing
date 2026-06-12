@@ -33,14 +33,14 @@ use axum::routing::any;
 use axum::Router;
 use serde_json::json;
 
-use claude_usage_tracker_lib::backfill::BackfillInfo;
-use claude_usage_tracker_lib::health::{
+use farthing_lib::backfill::BackfillInfo;
+use farthing_lib::health::{
     compute_health, ConfigState, HealthStatus, StoredEvents, TranscriptsInfo,
 };
-use claude_usage_tracker_lib::ingest::IngestStatsSnapshot;
-use claude_usage_tracker_lib::onboarding;
-use claude_usage_tracker_lib::receiver::ReceiverStatus;
-use claude_usage_tracker_lib::settings_merge::{describe_settings_error, detect_conflicts};
+use farthing_lib::ingest::IngestStatsSnapshot;
+use farthing_lib::onboarding;
+use farthing_lib::receiver::ReceiverStatus;
+use farthing_lib::settings_merge::{describe_settings_error, detect_conflicts};
 
 const DEFAULT_PORT: u16 = 43198;
 

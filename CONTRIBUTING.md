@@ -29,17 +29,17 @@ pnpm tauri build --bundles app
 
 Both are read at startup; set them on the `pnpm tauri dev` invocation:
 
-| Variable                             | Effect                                                                                                                                                                                                             |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `CLAUDE_USAGE_TRACKER_DATA_DIR`      | Points the whole data dir (usage.db, pricing cache, backups) somewhere else, e.g. a seeded directory. Without it, dev and installed builds share `~/Library/Application Support/com.peason.claude-usage-tracker/`. |
-| `CLAUDE_USAGE_TRACKER_SETTINGS_PATH` | Points the onboarding/uninstall flows at a scratch settings.json instead of `~/.claude/settings.json`. **Always set this when exercising onboarding or uninstall in dev.**                                         |
+| Variable                 | Effect                                                                                                                                                                                                 |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `FARTHING_DATA_DIR`      | Points the whole data dir (usage.db, pricing cache, backups) somewhere else, e.g. a seeded directory. Without it, dev and installed builds share `~/Library/Application Support/com.peason.farthing/`. |
+| `FARTHING_SETTINGS_PATH` | Points the onboarding/uninstall flows at a scratch settings.json instead of `~/.claude/settings.json`. **Always set this when exercising onboarding or uninstall in dev.**                             |
 
 ```bash
 # Example: fully sandboxed dev run against seeded data
-cargo run --manifest-path src-tauri/Cargo.toml --example seed_metrics_db -- /tmp/cut-dev
-echo '{}' > /tmp/cut-dev/settings.json
-CLAUDE_USAGE_TRACKER_DATA_DIR=/tmp/cut-dev \
-CLAUDE_USAGE_TRACKER_SETTINGS_PATH=/tmp/cut-dev/settings.json \
+cargo run --manifest-path src-tauri/Cargo.toml --example seed_metrics_db -- /tmp/farthing-dev
+echo '{}' > /tmp/farthing-dev/settings.json
+FARTHING_DATA_DIR=/tmp/farthing-dev \
+FARTHING_SETTINGS_PATH=/tmp/farthing-dev/settings.json \
 pnpm tauri dev
 ```
 

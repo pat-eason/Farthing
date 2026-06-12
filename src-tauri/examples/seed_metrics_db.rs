@@ -16,12 +16,12 @@
 //!
 //! ```sh
 //! cargo run --release --example seed_metrics_db -- /tmp/seeded-data 1000000
-//! CLAUDE_USAGE_TRACKER_DATA_DIR=/tmp/seeded-data pnpm tauri dev
+//! FARTHING_DATA_DIR=/tmp/seeded-data pnpm tauri dev
 //! ```
 
-use claude_usage_tracker_lib::db::Db;
-use claude_usage_tracker_lib::metrics;
-use claude_usage_tracker_lib::queries::{
+use farthing_lib::db::Db;
+use farthing_lib::metrics;
+use farthing_lib::queries::{
     self, Facets, ProjectFacet, QuerySourceFacet, RangeFacet, SeriesGroupBy, SessionSort,
 };
 
@@ -30,7 +30,7 @@ const DAYS: i64 = 75;
 const SESSIONS: i64 = 600;
 const BUDGET_MS: u128 = 500;
 const PROJECTS: &[&str] = &[
-    "/Users/dev/Projects/claude-usage-tracker",
+    "/Users/dev/Projects/farthing",
     "/Users/dev/Projects/api-gateway",
     "/Users/dev/Projects/cms-service",
     "/Users/dev/Projects/presentations",

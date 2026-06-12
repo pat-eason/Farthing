@@ -40,8 +40,8 @@ use axum::routing::any;
 use axum::Router;
 use serde::Deserialize;
 
-use claude_usage_tracker_lib::db::Db;
-use claude_usage_tracker_lib::queries::{self, Facets, SeriesGroupBy, SessionSort};
+use farthing_lib::db::Db;
+use farthing_lib::queries::{self, Facets, SeriesGroupBy, SessionSort};
 
 const DEFAULT_PORT: u16 = 43199;
 

@@ -36,14 +36,27 @@ pub fn run() {
         // activation policy flip (tray.rs, task 4.1).
         .on_window_event(tray::handle_window_event)
         .setup(|app| {
-            // macOS: ~/Library/Application Support/com.peason.claude-usage-tracker
+            // macOS: ~/Library/Application Support/com.peason.farthing
             // Dev/test override: point the whole data dir (usage.db, pricing
             // cache) at a seeded directory, e.g. one produced by
             // `cargo run --example seed_metrics_db`, without touching the
             // real install's data.
-            let data_dir = match std::env::var_os("CLAUDE_USAGE_TRACKER_DATA_DIR") {
+            let data_dir = match std::env::var_os("FARTHING_DATA_DIR") {
                 Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-                _ => app.path().app_data_dir()?,
+                _ => {
+                    let dir = app.path().app_data_dir()?;
+                    // One-time rename migration (2026-06-12): the pre-Farthing
+                    // identifier kept its data in a sibling directory. Move
+                    // usage.db (+ WAL/SHM) over before the DB opens; failure
+                    // is non-fatal (a fresh DB is created, old data stays put).
+                    if let Some(parent) = dir.parent() {
+                        let legacy = parent.join(db::LEGACY_DATA_DIR_NAME);
+                        if let Err(err) = db::migrate_legacy_data_dir(&legacy, &dir) {
+                            eprintln!("db: legacy data dir migration failed: {err}");
+                        }
+                    }
+                    dir
+                }
             };
             let database = Arc::new(Mutex::new(db::Db::open_in_dir(&data_dir)?));
             app.manage(db::DbState(Arc::clone(&database)));

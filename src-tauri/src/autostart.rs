@@ -8,7 +8,7 @@
 //! the plist by hand) show up on the next status query.
 //!
 //! Dev-build guard: debug builds refuse to *enable*. A LaunchAgent written
-//! from a dev run would point at `target/debug/claude-usage-tracker`, break
+//! from a dev run would point at `target/debug/farthing`, break
 //! on the next rebuild, and litter `~/Library/LaunchAgents`. Status queries
 //! and disable (cleanup) remain available in dev so the settings UI and
 //! tests can exercise real plugin state without registering anything.

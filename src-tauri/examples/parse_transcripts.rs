@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use claude_usage_tracker_lib::transcript::{collapse_requests, parse_file, ParseStats};
+use farthing_lib::transcript::{collapse_requests, parse_file, ParseStats};
 
 fn main() {
     let root = std::env::args()

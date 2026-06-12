@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use claude_usage_tracker_lib::{db, ingest, receiver};
+use farthing_lib::{db, ingest, receiver};
 
 #[tokio::main]
 async fn main() {

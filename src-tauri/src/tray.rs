@@ -92,13 +92,7 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
 
     let paused = app.state::<CaptureState>().paused();
 
-    let open_app = MenuItem::with_id(
-        app,
-        MENU_OPEN_APP,
-        "Open Claude Usage Tracker",
-        true,
-        None::<&str>,
-    )?;
+    let open_app = MenuItem::with_id(app, MENU_OPEN_APP, "Open Farthing", true, None::<&str>)?;
     let pause =
         CheckMenuItem::with_id(app, MENU_PAUSE, "Pause capture", true, paused, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)?;
@@ -128,7 +122,7 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         // Template image: macOS renders it as a monochrome glyph that adapts
         // to the menu bar appearance (dark/light).
         .icon_as_template(true)
-        .tooltip("Claude Usage Tracker")
+        .tooltip("Farthing")
         .menu(&menu)
         // Left click toggles the popover; the menu stays on right click.
         .show_menu_on_left_click(false)
