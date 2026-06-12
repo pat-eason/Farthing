@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{Emitter, Manager};
 
+pub mod alerts;
 pub mod autostart;
 pub mod backfill;
 pub mod capture;
@@ -71,6 +72,14 @@ pub fn run() {
             // receiver spawns and before tray::setup seeds the menu/badge.
             let capture_state = capture::CaptureState::load(Arc::clone(&database));
             app.manage(capture_state.clone());
+
+            // Cost-alert config + runtime (cost-notifications plan): persisted
+            // as JSON in `meta`, cached in memory. `load` also captures
+            // `process_start_ms` (wall clock) so burst/delta can floor their
+            // spend queries on launch and never fire on recovered pre-launch
+            // spend. The engine (later units) reads/writes this under its own
+            // eval lock; nothing here triggers an evaluation yet.
+            app.manage(alerts::AlertState::load(Arc::clone(&database)));
 
             // Ingest pipeline state: shared DB handle + counters, queryable
             // via `ingest_stats` (health view, task 2.5). The receiver
@@ -166,6 +175,8 @@ pub fn run() {
             notify::notification_permission_state,
             notify::notification_request_permission,
             notify::notification_send_test,
+            alerts::alert_config_get,
+            alerts::alert_config_set,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,
