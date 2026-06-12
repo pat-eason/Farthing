@@ -235,3 +235,66 @@ export function getFacetOptions(): Promise<FacetOptions> {
 export function getHomeDir(): Promise<string | null> {
   return invoke<string | null>("home_dir");
 }
+
+/** Progress event the export command emits (src-tauri/src/export.rs:36). The
+ * banner listens on this to drive the determinate progress bar (R11). */
+export const EXPORT_PROGRESS_EVENT = "export:progress";
+
+/** Payload of [`EXPORT_PROGRESS_EVENT`]; mirrors the Rust `ExportProgress`
+ * serde shape (camelCase). `phase` is `"writing"` for streaming updates and
+ * `"done"` for the single terminal event. */
+export interface ExportProgress {
+  phase: "writing" | "done";
+  rowsWritten: number;
+  /** `requests + errors`; the denominator the bar renders against (the
+   * frontend clamps displayed progress to <=100%). */
+  totalRows: number;
+}
+
+/** Result of the export command; mirrors the Rust `ExportResult` serde shape.
+ * `elapsedMs` lets the frontend own the notification decision (R12). */
+export interface ExportResult {
+  elapsedMs: number;
+  /** Raw rows actually streamed into `requests.csv`. */
+  rowsWritten: number;
+}
+
+/** Arguments for the export command. `facets` is the resolved SQL facet set
+ * (so Rust reads the identical window the report was built from), and the
+ * report HTML + aggregated CSV are the frontend-rendered strings written
+ * verbatim into the bundle (R5). `totalRows` (`requests + errors`) seeds the
+ * determinate progress bar. `excludeSessionless` is the per-view flag (the
+ * sessions view passes `true` so its raw CSV matches the session-rollup set —
+ * R16); every other view passes `false`. */
+export interface ExportArgs {
+  destination: string;
+  facets: Facets;
+  reportHtml: string;
+  summaryCsv: string;
+  totalRows: number;
+  excludeSessionless: boolean;
+}
+
+/** Stream the raw `requests.csv`, assemble the `.zip` at `destination`, and
+ * emit progress on [`EXPORT_PROGRESS_EVENT`] (R5/R8/R11/R13). The report HTML
+ * and aggregated CSV are supplied by the frontend; Rust streams the raw rows
+ * from a read-only connection and writes the bundle atomically. */
+export function runExportCommand(args: ExportArgs): Promise<ExportResult> {
+  const { destination, facets, reportHtml, summaryCsv, totalRows, excludeSessionless } = args;
+  return invoke<ExportResult>("export", {
+    destination,
+    facets,
+    reportHtml,
+    summaryCsv,
+    totalRows,
+    excludeSessionless,
+  });
+}
+
+/** Fire a single completion notification (R12). The *decision* to fire (slow
+ * export OR the user navigated away) is frontend-owned; this only performs the
+ * send. Best-effort: Rust swallows a denied permission, and the caller wraps
+ * this in try/catch so a missing/denied notification never breaks the flow. */
+export function notifyExportDone(title: string, body: string): Promise<void> {
+  return invoke<void>("notify_export_done", { title, body });
+}

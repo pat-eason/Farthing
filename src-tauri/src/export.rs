@@ -28,6 +28,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use tauri::{Emitter, Manager, Runtime};
+use tauri_plugin_notification::NotificationExt;
 
 use crate::db::{self, DbPath};
 use crate::queries::{export_raw_rows_for, Facets, RawExportRow};
@@ -399,6 +400,22 @@ pub fn export<R: Runtime>(
         elapsed_ms,
         rows_written,
     })
+}
+
+/// Fire a single desktop notification for a completed export. The *decision* to
+/// fire (export was slow OR the user navigated away from the originating view)
+/// lives in the frontend — Rust can't observe SvelteKit route changes — so this
+/// command only performs the send when the frontend asks (R12). Best-effort:
+/// a denied permission or any plugin error is swallowed (the in-app banner is
+/// the primary success surface), never surfaced as an export failure.
+#[tauri::command]
+pub fn notify_export_done<R: Runtime>(app: tauri::AppHandle<R>, title: String, body: String) {
+    let _ = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
 }
 
 #[cfg(test)]

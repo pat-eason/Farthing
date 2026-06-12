@@ -27,6 +27,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         // Native save dialog for the report-export destination (export.rs).
         .plugin(tauri_plugin_dialog::init())
+        // Desktop notifications for slow/background exports (export.rs); the
+        // send decision is frontend-owned (route + elapsed), the send itself is
+        // a pure-Rust NotificationExt call gated by notification:default.
+        .plugin(tauri_plugin_notification::init())
         // LaunchAgent mode per PRD; enabled during onboarding, toggleable
         // on the settings view (autostart.rs).
         .plugin(tauri_plugin_autostart::init(
@@ -164,6 +168,7 @@ pub fn run() {
             queries::project_rollups,
             queries::home_dir,
             export::export,
+            export::notify_export_done,
             capture::capture_status,
             capture::capture_set_paused,
             onboarding::onboarding_status,
