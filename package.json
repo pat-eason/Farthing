@@ -4,6 +4,7 @@
   "description": "Zero-config macOS menu bar app for Claude Code token/cost usage",
   "license": "MIT",
   "type": "module",
+  "packageManager": "pnpm@10.19.0",
   "author": {
     "name": "Pat Eason",
     "email": "patrick@pateason.io"
