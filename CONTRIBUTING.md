@@ -69,13 +69,14 @@ Notes on the Rust suite:
 
 `src-tauri/examples/` contains headless harnesses for working on the backend without the app shell:
 
-| Example                               | Purpose                                                                                                                                 |
-| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `e2e_receiver`                        | Runs the production Db + receiver stack on `127.0.0.1:43177`, headless. Point a real `claude` run at it to test live ingest end to end. |
-| `seed_metrics_db`                     | Generates a large seeded `usage.db` (used for the 1M-row query-performance gate).                                                       |
-| `query_bridge`                        | Serves the query commands over plain HTTP so the desktop views can be exercised/verified in a normal browser against a seeded DB.       |
-| `backfill_pass` / `parse_transcripts` | Run a backfill pass / transcript parse standalone.                                                                                      |
-| `diff_report` / `refresh_pricing`     | Run the OTel-vs-backfill diff report / pricing refresh standalone.                                                                      |
+| Example                               | Purpose                                                                                                                                                              |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `e2e_receiver`                        | Runs the production Db + receiver stack on `127.0.0.1:43177`, headless. Point a real `claude` run at it to test live ingest end to end.                              |
+| `seed_metrics_db`                     | Generates a large seeded `usage.db` (used for the 1M-row query-performance gate).                                                                                    |
+| `query_bridge`                        | Serves the query commands over plain HTTP so the desktop views can be exercised/verified in a normal browser against a seeded DB.                                    |
+| `health_bridge`                       | Serves `health_status`/`onboarding_status` over HTTP with switchable failure scenarios, so every health/onboarding error state can be exercised in a normal browser. |
+| `backfill_pass` / `parse_transcripts` | Run a backfill pass / transcript parse standalone.                                                                                                                   |
+| `diff_report` / `refresh_pricing`     | Run the OTel-vs-backfill diff report / pricing refresh standalone.                                                                                                   |
 
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml --example e2e_receiver -- /tmp/e2e-data

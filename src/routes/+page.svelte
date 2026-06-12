@@ -94,6 +94,11 @@
     <pre class="diff">{#each status.diff as line, i (i)}<span class="diff-{line.kind}"
           >{line.kind === "add" ? "+" : line.kind === "remove" ? "-" : " "} {line.text}
 </span>{/each}</pre>
+    <p class="muted">
+      Applying also registers the app to start at login (a macOS LaunchAgent), so the receiver is
+      always running when Claude Code sends events. You can turn that off in settings at any time;
+      nothing else on your system is touched.
+    </p>
     <div class="row">
       <button class="primary" onclick={confirmFromPreview}>
         {status.conflicts.length > 0 ? "Continue" : "Apply changes"}

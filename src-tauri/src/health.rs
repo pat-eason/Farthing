@@ -29,7 +29,9 @@ use crate::backfill::{BackfillInfo, BackfillState};
 use crate::db::Db;
 use crate::ingest::{IngestState, IngestStatsSnapshot};
 use crate::receiver::{ReceiverState, ReceiverStatus};
-use crate::settings_merge::{detect_conflicts, is_installed, read_settings, Conflict};
+use crate::settings_merge::{
+    describe_settings_error, detect_conflicts, is_installed, read_settings, Conflict,
+};
 
 /// How long the app waits, with config installed, before flagging the
 /// "configured but no events" state. Long enough that one slow human turn
@@ -77,7 +79,7 @@ pub fn config_state(settings_path: &Path) -> ConfigState {
         Ok(map) => map,
         Err(err) => {
             return ConfigState::Error {
-                message: err.to_string(),
+                message: describe_settings_error(&err, settings_path),
             }
         }
     };
@@ -99,8 +101,8 @@ pub fn config_state(settings_path: &Path) -> ConfigState {
 /// and a human remediation string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Cause {
-    /// `"port_conflict"`, `"receiver_failed"`, `"receiver_starting"`,
-    /// `"sessions_predate_config"`, or `"paused"`.
+    /// `"capture_paused"`, `"port_conflict"`, `"receiver_failed"`,
+    /// `"receiver_starting"`, `"sessions_predate_config"`, or `"idle"`.
     pub kind: &'static str,
     pub detail: String,
 }
@@ -117,12 +119,14 @@ pub struct NoEventsDiagnosis {
 
 /// Run the no-events detector. Fires only when the config is installed
 /// (events *should* flow) and nothing has arrived within the threshold.
-/// A broken receiver is the definitive cause when present; with a healthy
-/// receiver the causes are the ambiguous pair the user must check
-/// (pre-config sessions still running, or Claude Code simply not in use).
+/// Paused capture or a broken receiver is the definitive cause when
+/// present; with a healthy receiver the causes are the ambiguous pair the
+/// user must check (pre-config sessions still running, or Claude Code
+/// simply not in use).
 pub fn diagnose_no_events(
     config: &ConfigState,
     receiver: &ReceiverStatus,
+    capture_paused: bool,
     last_event_ms: Option<i64>,
     now_ms: i64,
 ) -> Option<NoEventsDiagnosis> {
@@ -132,6 +136,19 @@ pub fn diagnose_no_events(
     let minutes_since_last = last_event_ms.map(|t| (now_ms - t) / 60_000);
     if minutes_since_last.is_some_and(|m| m < NO_EVENTS_THRESHOLD_MINUTES) {
         return None;
+    }
+    if capture_paused {
+        return Some(NoEventsDiagnosis {
+            threshold_minutes: NO_EVENTS_THRESHOLD_MINUTES,
+            minutes_since_last,
+            causes: vec![Cause {
+                kind: "capture_paused",
+                detail: "Capture is paused, so incoming events are acknowledged but \
+                         discarded. Resume capture to store events again; the paused \
+                         window can be recovered later with a backfill pass."
+                    .to_string(),
+            }],
+        });
     }
     let causes = match receiver {
         ReceiverStatus::PortInUse { port } => vec![Cause {
@@ -159,7 +176,7 @@ pub fn diagnose_no_events(
                     .to_string(),
             },
             Cause {
-                kind: "paused",
+                kind: "idle",
                 detail: "Claude Code may simply not be in use right now. No usage means no \
                          events; this is normal."
                     .to_string(),
@@ -173,6 +190,16 @@ pub fn diagnose_no_events(
     })
 }
 
+/// The transcripts root the backfill engine reads, and whether it exists
+/// (a fresh machine has none until the first Claude Code session; the
+/// health view explains that instead of showing a bare "0 files").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TranscriptsInfo {
+    /// Display path of the transcripts root (`~/.claude/projects`).
+    pub path: String,
+    pub exists: bool,
+}
+
 /// Everything the health view renders, in one query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HealthStatus {
@@ -180,7 +207,11 @@ pub struct HealthStatus {
     pub config: ConfigState,
     /// Display path of the settings file the config state was read from.
     pub settings_path: String,
-    /// Since-launch ingest counters (task 1.4), including `ingest_failures`.
+    /// Capture pause state (task 4.4): while `true`, arriving events are
+    /// acknowledged and discarded, which the health view must say out loud.
+    pub capture_paused: bool,
+    /// Since-launch ingest counters (task 1.4), including `ingest_failures`
+    /// and the most recent failure detail.
     pub ingest: IngestStatsSnapshot,
     /// Unix ms of the most recent event received; `None` when none ever.
     /// Freshest of the in-memory ingest clock and the stored rows, so it
@@ -188,6 +219,13 @@ pub struct HealthStatus {
     pub last_event_ms: Option<i64>,
     /// All-time `requests` rows received live (`source = 'otel'`).
     pub events_stored: u64,
+    /// Set when the stored-event totals could not be read from the
+    /// database (locked by another process, disk trouble). The rest of the
+    /// snapshot stays usable; `events_stored`/`last_event_ms` fall back to
+    /// the in-memory counters only.
+    pub db_error: Option<String>,
+    /// Transcripts root used by backfill, and whether it exists.
+    pub transcripts: TranscriptsInfo,
     /// Transcript backfill: running flag + the last completed pass.
     pub backfill: BackfillInfo,
     /// Present when the "configured but no events" detector fired.
@@ -206,15 +244,31 @@ pub struct StoredEvents {
 /// app handle). `stored.last_event_ms` is event time from stored rows;
 /// `ingest.last_event_ms` is the wall clock of the last live ingest (0 =
 /// never this launch). The freshest of the two is "last event received".
+#[allow(clippy::too_many_arguments)]
 pub fn compute_health(
     receiver: ReceiverStatus,
     config: ConfigState,
     settings_path: String,
+    capture_paused: bool,
     ingest: IngestStatsSnapshot,
-    stored: StoredEvents,
+    stored: Result<StoredEvents, String>,
+    transcripts: TranscriptsInfo,
     backfill: BackfillInfo,
     now_ms: i64,
 ) -> HealthStatus {
+    // A failed stored-events read (locked database, disk trouble) degrades
+    // to the in-memory since-launch counters instead of taking the whole
+    // health view down with it (task 6.4).
+    let (stored, db_error) = match stored {
+        Ok(stored) => (stored, None),
+        Err(message) => (
+            StoredEvents {
+                count: ingest.events_ingested,
+                last_event_ms: None,
+            },
+            Some(message),
+        ),
+    };
     let last_event_ms = [
         (ingest.last_event_ms > 0).then_some(ingest.last_event_ms),
         stored.last_event_ms,
@@ -222,14 +276,17 @@ pub fn compute_health(
     .into_iter()
     .flatten()
     .max();
-    let no_events = diagnose_no_events(&config, &receiver, last_event_ms, now_ms);
+    let no_events = diagnose_no_events(&config, &receiver, capture_paused, last_event_ms, now_ms);
     HealthStatus {
         receiver,
         config,
         settings_path,
+        capture_paused,
         ingest,
         last_event_ms,
         events_stored: stored.count,
+        db_error,
+        transcripts,
         backfill,
         no_events,
     }
@@ -262,7 +319,24 @@ pub fn current_health<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<HealthSta
     let ingest = ingest_state.stats.snapshot();
     let stored = {
         let db = ingest_state.db.lock().expect("db mutex poisoned");
-        db_event_stats(&db).map_err(|err| format!("cannot query event stats: {err}"))?
+        db_event_stats(&db).map_err(|err| {
+            format!(
+                "The usage database could not be read ({err}). Totals shown are \
+                 since-launch only. If another copy of this app is running, quit it; \
+                 otherwise check free disk space and relaunch."
+            )
+        })
+    };
+    let capture_paused = app
+        .try_state::<crate::capture::CaptureState>()
+        .map(|state| state.paused())
+        .unwrap_or(false);
+    let transcripts = {
+        let root = crate::backfill::projects_root(app)?;
+        TranscriptsInfo {
+            exists: root.is_dir(),
+            path: root.display().to_string(),
+        }
     };
     let backfill = app
         .state::<BackfillState>()
@@ -280,8 +354,10 @@ pub fn current_health<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<HealthSta
         receiver,
         config,
         settings_path.display().to_string(),
+        capture_paused,
         ingest,
         stored,
+        transcripts,
         backfill,
         now_ms,
     ))
@@ -319,6 +395,14 @@ mod tests {
             ingest_failures: 0,
             events_skipped: 0,
             last_event_ms,
+            last_failure: None,
+        }
+    }
+
+    fn transcripts() -> TranscriptsInfo {
+        TranscriptsInfo {
+            path: "/tmp/projects".into(),
+            exists: true,
         }
     }
 
@@ -420,7 +504,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                diagnose_no_events(&config, &listening(), None, NOW_MS),
+                diagnose_no_events(&config, &listening(), false, None, NOW_MS),
                 None,
                 "must not fire for {config:?}"
             );
@@ -431,7 +515,24 @@ mod tests {
     fn detector_silent_with_recent_event() {
         let recent = NOW_MS - (NO_EVENTS_THRESHOLD_MINUTES - 1) * MINUTE_MS;
         assert_eq!(
-            diagnose_no_events(&ConfigState::Installed, &listening(), Some(recent), NOW_MS),
+            diagnose_no_events(
+                &ConfigState::Installed,
+                &listening(),
+                false,
+                Some(recent),
+                NOW_MS
+            ),
+            None
+        );
+        // A recent event silences the detector even while paused.
+        assert_eq!(
+            diagnose_no_events(
+                &ConfigState::Installed,
+                &listening(),
+                true,
+                Some(recent),
+                NOW_MS
+            ),
             None
         );
     }
@@ -439,19 +540,43 @@ mod tests {
     #[test]
     fn detector_fires_with_stale_event_and_healthy_receiver() {
         let stale = NOW_MS - 45 * MINUTE_MS;
-        let diagnosis =
-            diagnose_no_events(&ConfigState::Installed, &listening(), Some(stale), NOW_MS)
-                .expect("must fire");
+        let diagnosis = diagnose_no_events(
+            &ConfigState::Installed,
+            &listening(),
+            false,
+            Some(stale),
+            NOW_MS,
+        )
+        .expect("must fire");
         assert_eq!(diagnosis.minutes_since_last, Some(45));
         assert_eq!(diagnosis.threshold_minutes, NO_EVENTS_THRESHOLD_MINUTES);
         let kinds: Vec<&str> = diagnosis.causes.iter().map(|c| c.kind).collect();
-        assert_eq!(kinds, ["sessions_predate_config", "paused"]);
+        assert_eq!(kinds, ["sessions_predate_config", "idle"]);
+    }
+
+    /// Paused capture is the definitive cause: it trumps everything,
+    /// including a broken receiver, because resuming is the fix either way.
+    #[test]
+    fn paused_capture_is_the_definitive_cause() {
+        for receiver in [listening(), ReceiverStatus::PortInUse { port: 43177 }] {
+            let diagnosis =
+                diagnose_no_events(&ConfigState::Installed, &receiver, true, None, NOW_MS)
+                    .expect("must fire");
+            assert_eq!(diagnosis.causes.len(), 1);
+            assert_eq!(diagnosis.causes[0].kind, "capture_paused");
+            assert!(
+                diagnosis.causes[0].detail.contains("Resume"),
+                "remediation must say how to fix it: {}",
+                diagnosis.causes[0].detail
+            );
+        }
     }
 
     #[test]
     fn detector_fires_when_no_event_ever() {
-        let diagnosis = diagnose_no_events(&ConfigState::Installed, &listening(), None, NOW_MS)
-            .expect("must fire");
+        let diagnosis =
+            diagnose_no_events(&ConfigState::Installed, &listening(), false, None, NOW_MS)
+                .expect("must fire");
         assert_eq!(diagnosis.minutes_since_last, None);
         assert!(!diagnosis.causes.is_empty());
     }
@@ -462,13 +587,13 @@ mod tests {
             installed: true,
             conflicts: vec![],
         };
-        assert!(diagnose_no_events(&config, &listening(), None, NOW_MS).is_some());
+        assert!(diagnose_no_events(&config, &listening(), false, None, NOW_MS).is_some());
     }
 
     #[test]
     fn port_conflict_is_the_definitive_cause() {
         let receiver = ReceiverStatus::PortInUse { port: 43177 };
-        let diagnosis = diagnose_no_events(&ConfigState::Installed, &receiver, None, NOW_MS)
+        let diagnosis = diagnose_no_events(&ConfigState::Installed, &receiver, false, None, NOW_MS)
             .expect("must fire");
         assert_eq!(diagnosis.causes.len(), 1);
         assert_eq!(diagnosis.causes[0].kind, "port_conflict");
@@ -480,7 +605,7 @@ mod tests {
         let receiver = ReceiverStatus::Failed {
             message: "boom".into(),
         };
-        let diagnosis = diagnose_no_events(&ConfigState::Installed, &receiver, None, NOW_MS)
+        let diagnosis = diagnose_no_events(&ConfigState::Installed, &receiver, false, None, NOW_MS)
             .expect("must fire");
         assert_eq!(diagnosis.causes.len(), 1);
         assert_eq!(diagnosis.causes[0].kind, "receiver_failed");
@@ -495,27 +620,32 @@ mod tests {
             listening(),
             ConfigState::Installed,
             "p".into(),
+            false,
             snapshot(NOW_MS - MINUTE_MS),
-            StoredEvents {
+            Ok(StoredEvents {
                 count: 10,
                 last_event_ms: Some(NOW_MS - 5 * MINUTE_MS),
-            },
+            }),
+            transcripts(),
             BackfillInfo::default(),
             NOW_MS,
         );
         assert_eq!(fresher_memory.last_event_ms, Some(NOW_MS - MINUTE_MS));
         assert_eq!(fresher_memory.no_events, None);
+        assert_eq!(fresher_memory.db_error, None);
 
         // Restart case: nothing ingested this launch, rows in the DB.
         let db_only = compute_health(
             listening(),
             ConfigState::Installed,
             "p".into(),
+            false,
             snapshot(0),
-            StoredEvents {
+            Ok(StoredEvents {
                 count: 10,
                 last_event_ms: Some(NOW_MS - 5 * MINUTE_MS),
-            },
+            }),
+            transcripts(),
             BackfillInfo::default(),
             NOW_MS,
         );
@@ -525,14 +655,40 @@ mod tests {
             listening(),
             ConfigState::Installed,
             "p".into(),
+            false,
             snapshot(0),
-            StoredEvents::default(),
+            Ok(StoredEvents::default()),
+            transcripts(),
             BackfillInfo::default(),
             NOW_MS,
         );
         assert_eq!(never.last_event_ms, None);
         assert!(never.no_events.is_some(), "configured + never = detector");
         assert_eq!(never.backfill, BackfillInfo::default());
+    }
+
+    /// A failed stored-events read (locked DB, disk trouble) degrades to
+    /// the since-launch counters and carries the message, instead of
+    /// erroring the whole health view (task 6.4).
+    #[test]
+    fn db_read_failure_degrades_with_message() {
+        let mut ingest = snapshot(NOW_MS - MINUTE_MS);
+        ingest.events_ingested = 7;
+        let health = compute_health(
+            listening(),
+            ConfigState::Installed,
+            "p".into(),
+            false,
+            ingest,
+            Err("The usage database could not be read (locked)".into()),
+            transcripts(),
+            BackfillInfo::default(),
+            NOW_MS,
+        );
+        assert_eq!(health.events_stored, 7, "falls back to in-memory counter");
+        assert_eq!(health.last_event_ms, Some(NOW_MS - MINUTE_MS));
+        let message = health.db_error.expect("db error surfaced");
+        assert!(message.contains("could not be read"), "got: {message}");
     }
 
     // ---- command wiring over a real (mock-runtime) app ----
@@ -592,15 +748,21 @@ mod tests {
             ReceiverStatus::PortInUse { port: 43177 },
             ConfigState::Installed,
             "/tmp/settings.json".into(),
+            false,
             IngestStatsSnapshot {
                 events_ingested: 2,
                 ingest_failures: 1,
                 events_skipped: 3,
                 last_event_ms: NOW_MS - 20 * MINUTE_MS,
+                last_failure: Some("disk full".into()),
             },
-            StoredEvents {
+            Ok(StoredEvents {
                 count: 5,
                 last_event_ms: None,
+            }),
+            TranscriptsInfo {
+                path: "/tmp/projects".into(),
+                exists: false,
             },
             BackfillInfo::default(),
             NOW_MS,
@@ -612,14 +774,18 @@ mod tests {
                 "receiver": {"state": "port_in_use", "port": 43177},
                 "config": {"state": "installed"},
                 "settings_path": "/tmp/settings.json",
+                "capture_paused": false,
                 "ingest": {
                     "events_ingested": 2,
                     "ingest_failures": 1,
                     "events_skipped": 3,
                     "last_event_ms": NOW_MS - 20 * MINUTE_MS,
+                    "last_failure": "disk full",
                 },
                 "last_event_ms": NOW_MS - 20 * MINUTE_MS,
                 "events_stored": 5,
+                "db_error": null,
+                "transcripts": {"path": "/tmp/projects", "exists": false},
                 "backfill": {"running": false, "last": null},
                 "no_events": {
                     "threshold_minutes": NO_EVENTS_THRESHOLD_MINUTES,

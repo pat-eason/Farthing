@@ -60,6 +60,10 @@ pub struct IngestStats {
     events_skipped: AtomicU64,
     /// Wall-clock ms of the most recent successful ingest (0 = never).
     last_event_ms: AtomicI64,
+    /// Human-readable detail of the most recent ingest failure, so the
+    /// health view can say *why* (disk full, locked database, schema
+    /// change) instead of just counting (task 6.4).
+    last_failure: Mutex<Option<String>>,
 }
 
 /// Point-in-time copy of [`IngestStats`] for the frontend.
@@ -70,6 +74,8 @@ pub struct IngestStatsSnapshot {
     pub events_skipped: u64,
     /// 0 when no event has ever been ingested.
     pub last_event_ms: i64,
+    /// Detail of the most recent ingest failure; `None` when none ever.
+    pub last_failure: Option<String>,
 }
 
 impl IngestStats {
@@ -79,6 +85,11 @@ impl IngestStats {
             ingest_failures: self.ingest_failures.load(Ordering::Relaxed),
             events_skipped: self.events_skipped.load(Ordering::Relaxed),
             last_event_ms: self.last_event_ms.load(Ordering::Relaxed),
+            last_failure: self
+                .last_failure
+                .lock()
+                .expect("last_failure mutex poisoned")
+                .clone(),
         }
     }
 
@@ -91,8 +102,12 @@ impl IngestStats {
         self.last_event_ms.store(now_ms, Ordering::Relaxed);
     }
 
-    fn record_failure(&self) {
+    fn record_failure(&self, detail: String) {
         self.ingest_failures.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_failure
+            .lock()
+            .expect("last_failure mutex poisoned") = Some(detail);
     }
 
     fn record_skip(&self) {
@@ -218,13 +233,19 @@ fn ingest_record(state: &IngestState, record: &Value) -> bool {
                 true
             }
             Err(err) => {
-                state.stats.record_failure();
-                eprintln!("ingest: failed to store {event_type} row: {err}");
+                // The detail matters: this is how a full disk or a locked
+                // database surfaces in the health view (task 6.4).
+                let detail = format!("could not store an {event_type} event: {err}");
+                eprintln!("ingest: {detail}");
+                state.stats.record_failure(detail);
                 false
             }
         },
         None => {
-            state.stats.record_failure();
+            state.stats.record_failure(format!(
+                "an {event_type} event arrived without the required fields \
+                 (session.id / timestamp); possibly a Claude Code schema change"
+            ));
             false
         }
     }
@@ -615,6 +636,38 @@ mod tests {
         let stats = state.stats.snapshot();
         assert_eq!(stats.ingest_failures, 2);
         assert_eq!(stats.events_ingested, 0);
+        // The health view shows why: the parse-failure detail is recorded.
+        let detail = stats.last_failure.expect("failure detail recorded");
+        assert!(detail.contains("required fields"), "got: {detail}");
+    }
+
+    /// Storage failures (the disk-full / locked-database class, task 6.4)
+    /// keep the receiver alive and surface their detail in the snapshot.
+    #[test]
+    fn storage_failure_records_actionable_detail() {
+        let (state, _dir) = test_state();
+        {
+            let db = state.db.lock().unwrap();
+            db.conn().execute_batch("DROP TABLE requests").unwrap();
+        }
+        ingest_str(
+            &state,
+            r#"{"resourceLogs": [{"scopeLogs": [{"logRecords": [{
+                "timeUnixNano": "1781200718939000000",
+                "attributes": [
+                    {"key": "event.name", "value": {"stringValue": "api_request"}},
+                    {"key": "session.id", "value": {"stringValue": "sess-1"}}
+                ]
+            }]}]}]}"#,
+        );
+        let stats = state.stats.snapshot();
+        assert_eq!(stats.ingest_failures, 1);
+        assert_eq!(stats.events_ingested, 0);
+        let detail = stats.last_failure.expect("failure detail recorded");
+        assert!(
+            detail.contains("could not store an api_request event"),
+            "got: {detail}"
+        );
     }
 
     #[test]
@@ -656,7 +709,7 @@ mod tests {
     #[test]
     fn stats_snapshot_serializes_for_frontend() {
         let stats = IngestStats::default();
-        stats.record_failure();
+        stats.record_failure("disk full".to_string());
         let json = serde_json::to_value(stats.snapshot()).unwrap();
         assert_eq!(
             json,
@@ -665,6 +718,7 @@ mod tests {
                 "ingest_failures": 1,
                 "events_skipped": 0,
                 "last_event_ms": 0,
+                "last_failure": "disk full",
             })
         );
     }

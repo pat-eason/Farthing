@@ -23,15 +23,18 @@ export interface IngestStats {
   events_skipped: number;
   /** Wall-clock ms of the last live ingest; 0 = never this launch. */
   last_event_ms: number;
+  /** Detail of the most recent ingest failure; null when none ever. */
+  last_failure: string | null;
 }
 
 export interface Cause {
   kind:
+    | "capture_paused"
     | "port_conflict"
     | "receiver_failed"
     | "receiver_starting"
     | "sessions_predate_config"
-    | "paused";
+    | "idle";
   detail: string;
 }
 
@@ -44,15 +47,31 @@ export interface NoEventsDiagnosis {
   causes: Cause[];
 }
 
+/** Transcripts root used by backfill, and whether it exists yet. */
+export interface TranscriptsInfo {
+  path: string;
+  exists: boolean;
+}
+
 export interface HealthStatus {
   receiver: ReceiverStatus;
   config: ConfigState;
   settings_path: string;
+  /** While true, arriving events are acknowledged but discarded (task 4.4). */
+  capture_paused: boolean;
   ingest: IngestStats;
   /** Unix ms of the most recent event received; null when none ever. */
   last_event_ms: number | null;
   /** All-time live-received event rows. */
   events_stored: number;
+  /**
+   * Set when stored-event totals could not be read from the database
+   * (locked by another process, disk trouble); totals degrade to
+   * since-launch counters.
+   */
+  db_error: string | null;
+  /** Transcripts root used by backfill, and whether it exists. */
+  transcripts: TranscriptsInfo;
   /** Transcript backfill: running flag + the last completed pass. */
   backfill: BackfillInfo;
   /** Present when the "configured but no events" detector fired. */

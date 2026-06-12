@@ -30,7 +30,9 @@ use tauri::Manager;
 
 use crate::db;
 use crate::onboarding::{backup_dir, diff_lines, render, settings_path, DiffLine};
-use crate::settings_merge::{apply_unmerge, is_installed, read_settings, unmerge_file};
+use crate::settings_merge::{
+    apply_unmerge, describe_settings_error, is_installed, read_settings, unmerge_file,
+};
 
 /// Everything the confirmation dialog needs to state exactly what will and
 /// won't be removed. Read-only.
@@ -85,7 +87,8 @@ pub fn compute_status(
     backups_dir: &Path,
     autostart_enabled: bool,
 ) -> Result<UninstallStatus, String> {
-    let current = read_settings(settings_path).map_err(|err| err.to_string())?;
+    let current =
+        read_settings(settings_path).map_err(|err| describe_settings_error(&err, settings_path))?;
     let unmerged = apply_unmerge(&current);
 
     let before = render(&current);
@@ -176,8 +179,9 @@ pub fn uninstall_apply(
     app: tauri::AppHandle,
     delete_database: bool,
 ) -> Result<UninstallOutcome, String> {
-    let outcome =
-        unmerge_file(&settings_path(&app)?, &backup_dir(&app)?).map_err(|err| err.to_string())?;
+    let settings = settings_path(&app)?;
+    let outcome = unmerge_file(&settings, &backup_dir(&app)?)
+        .map_err(|err| describe_settings_error(&err, &settings))?;
 
     // LaunchAgent removal: idempotent no-op when not registered. On failure
     // re-read the real state so the done screen never claims a removal that

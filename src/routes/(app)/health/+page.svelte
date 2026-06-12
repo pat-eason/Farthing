@@ -8,6 +8,7 @@
   // clicking anything.
   import { resolve } from "$app/paths";
   import { getDiffReport, runBackfill, type DiffReport } from "$lib/backfill";
+  import { setCapturePaused } from "$lib/capture";
   import { getHealthStatus, type HealthStatus } from "$lib/health";
 
   const REFRESH_INTERVAL_MS = 5_000;
@@ -35,6 +36,15 @@
     } catch (err) {
       errorMessage = String(err);
     }
+  }
+
+  async function resumeCapture() {
+    try {
+      await setCapturePaused(false);
+    } catch (err) {
+      errorMessage = String(err);
+    }
+    void refresh();
   }
 
   async function backfillNow() {
@@ -100,6 +110,19 @@
   {:else if !health}
     <p class="muted">Checking…</p>
   {:else}
+    {#if health.capture_paused}
+      <section class="warn-box">
+        <h2>Capture is paused</h2>
+        <p>
+          Incoming events are acknowledged but not stored. Sessions that run while paused can be
+          recovered later with a backfill pass.
+        </p>
+        <div class="row">
+          <button onclick={() => void resumeCapture()}>Resume capture</button>
+        </div>
+      </section>
+    {/if}
+
     {#if health.no_events}
       <section class="warn-box">
         <h2>
@@ -138,6 +161,9 @@
 
     <section class="card">
       <h2>Events</h2>
+      {#if health.db_error}
+        <p class="bad">{health.db_error}</p>
+      {/if}
       <p>
         Last event received:
         {#if health.last_event_ms === null}
@@ -148,13 +174,14 @@
         {/if}
       </p>
       <ul class="stats">
-        <li>{health.events_stored} events stored in total</li>
+        <li>
+          {health.events_stored} events stored{health.db_error ? " since launch" : " in total"}
+        </li>
         <li>{health.ingest.events_ingested} ingested since launch</li>
         <li class={health.ingest.ingest_failures > 0 ? "bad" : ""}>
           {health.ingest.ingest_failures} ingest failures since launch
-          {#if health.ingest.ingest_failures > 0}
-            (events arrived but could not be stored, often a Claude Code schema change; please
-            report this)
+          {#if health.ingest.ingest_failures > 0 && health.ingest.last_failure}
+            (most recent: {health.ingest.last_failure})
           {/if}
         </li>
         <li class="muted">
@@ -194,6 +221,12 @@
 
     <section class="card">
       <h2>Backfill</h2>
+      {#if !health.transcripts.exists}
+        <p class="muted">
+          No transcripts folder at <code>{health.transcripts.path}</code> yet. Claude Code creates it
+          on first use; until then backfill has nothing to read, which is normal on a fresh machine.
+        </p>
+      {/if}
       {#if health.backfill.running || backfillRunning}
         <p class="warn">A backfill pass is running…</p>
       {:else if health.backfill.last}
