@@ -1,0 +1,83 @@
+name: Version
+
+# Changesets-driven versioning. On every push to main:
+#   - if pending changesets exist, open/update a "Version Packages" PR that
+#     bumps the version everywhere and updates CHANGELOG.md (via `pnpm version`,
+#     which runs `changeset version` then fans the bump out to tauri.conf.json,
+#     Cargo.toml, and Cargo.lock).
+#   - when that PR merges, the bump lands on main with no changesets left; this
+#     workflow detects the version change and calls the reusable Release
+#     workflow, which tags `v<version>` and builds/publishes the macOS .dmg.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: version-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  decide:
+    name: Open Version PR / decide release
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.gate.outputs.should_release }}
+      version: ${{ steps.gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need prior commit (to detect a version bump) and tags (to avoid
+          # re-releasing a version that already shipped).
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Opens/updates the "Version Packages" PR when changesets are present.
+      # With no publish command and no pending changesets (the post-merge
+      # case) it does nothing, leaving the release decision to the gate below.
+      - name: Create or update Version PR
+        uses: changesets/action@v1
+        with:
+          version: pnpm run version
+          commit: "chore: version packages"
+          title: "chore: version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Release only when this push actually bumped the version (i.e. the
+      # Version PR just merged) and that version has not already been tagged.
+      # Plain pushes and changeset-adding pushes leave the version untouched.
+      - name: Decide whether to release
+        id: gate
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          OLD="$(git show HEAD~1:package.json 2>/dev/null | node -pe "try { JSON.parse(require('fs').readFileSync(0, 'utf8')).version } catch { '' }" || true)"
+          if [ "$VER" != "$OLD" ] && ! git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Version changed $OLD -> $VER and v$VER is untagged: releasing."
+          else
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "No release: version=$VER previous=$OLD (tag exists: $(git rev-parse -q --verify "refs/tags/v$VER" >/dev/null && echo yes || echo no))."
+          fi
+
+  release:
+    name: Release
+    needs: decide
+    if: needs.decide.outputs.should_release == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: v${{ needs.decide.outputs.version }}
+    secrets: inherit
