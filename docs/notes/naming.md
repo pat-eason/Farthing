@@ -111,18 +111,29 @@ commit ("Rename to Farthing") once the name was confirmed.
 
 ## Icons
 
-Real art ships now: the master is `art/farthing-icon.png` (full-color coin-with-bird
-mark; the three-bar placeholder era is over). `scripts/generate-icons.py` (PIL;
-deterministic) derives every shipped asset from it:
+Real art ships now, from two masters with one generator script each (both PIL,
+deterministic):
+
+**App icon + sidebar** — master is `art/farthing-icon.png` (full-color coin-with-bird
+mark; the three-bar placeholder era is over), derived by `scripts/generate-icons.py`:
 
 - `art/app-icon.png` — 1024×1024 square master (coin centered on the macOS icon grid);
   `pnpm tauri icon art/app-icon.png` regenerates everything in `src-tauri/icons/`.
-- `src-tauri/icons/tray-icon.png` — 80×64 black+alpha **template image**: a bird-only
-  silhouette (the full coin reads as a featureless disc at menu bar sizes); loaded via
-  `include_bytes!` in `tray.rs` with `icon_as_template(true)` so macOS recolors it for
-  dark/light menu bars. macOS renders tray images 18pt tall, so 64px height = @2x retina.
 - `src/lib/assets/farthing-icon.png` — 128px full-color downscale for the desktop
   sidebar wordmark (Vite-imported in `src/routes/(app)/+layout.svelte`).
 
-After changing the master art: run the script, re-run `pnpm tauri icon art/app-icon.png`,
-and re-tune the silhouette-extraction constants at the top of the script if needed.
+**Menu bar tray glyph** — master is `art/tray-source-bird.png` (stylized bird + arrow +
+dot render), derived by `scripts/generate-tray-candidates.py`:
+
+- `art/tray-candidates/` — the candidate set (template-full, template-bird, color, plus
+  a simulated light/dark menu bar `preview.png`), kept for provenance.
+- `src-tauri/icons/tray-icon.png` — the chosen candidate (**template-bird**): 82×64
+  black+alpha **template image**, a bird-only silhouette (the full mark is too busy at
+  menu bar sizes, and the old coin master read as a featureless disc); loaded via
+  `include_bytes!` in `tray.rs` with `icon_as_template(true)` so macOS recolors it for
+  dark/light menu bars. macOS renders tray images 18pt tall, so 64px height = @2x
+  retina. The decode test in `tray.rs` pins the 82×64 size.
+
+After changing either master: run its script (re-tune the extraction constants at the
+top if the art changed shape), and for the app icon also re-run
+`pnpm tauri icon art/app-icon.png`.
