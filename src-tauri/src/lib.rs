@@ -4,6 +4,7 @@ use tauri::{Emitter, Manager};
 
 pub mod autostart;
 pub mod backfill;
+pub mod budgets;
 pub mod capture;
 pub mod db;
 pub mod health;
@@ -67,6 +68,11 @@ pub fn run() {
             // receiver spawns and before tray::setup seeds the menu/badge.
             let capture_state = capture::CaptureState::load(Arc::clone(&database));
             app.manage(capture_state.clone());
+
+            // Budget config (standalone build): daily/monthly thresholds +
+            // tray-visibility toggle, persisted as a JSON row in `meta`.
+            // Loaded from the same DB handle, defaulting on any read error.
+            app.manage(budgets::BudgetState::load(Arc::clone(&database)));
 
             // Ingest pipeline state: shared DB handle + counters, queryable
             // via `ingest_stats` (health view, task 2.5). The receiver
@@ -137,6 +143,9 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     tray_title::refresh(&tick_app);
+                    // Nudge the popover to re-query so its day window rolls
+                    // over at local midnight even with no live ingest.
+                    let _ = tick_app.emit("metrics:tick", ());
                 }
             });
             Ok(())
@@ -165,7 +174,10 @@ pub fn run() {
             autostart::autostart_set,
             uninstall::uninstall_status,
             uninstall::uninstall_apply,
-            tray::open_main_window
+            tray::open_main_window,
+            budgets::budget_config_get,
+            budgets::budget_config_set,
+            budgets::budget_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

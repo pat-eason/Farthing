@@ -98,6 +98,59 @@ pub fn local_day_window(now: chrono::DateTime<chrono::Local>) -> (i64, i64) {
     (local_midnight_ms(today), local_midnight_ms(tomorrow))
 }
 
+/// Unix ms of local midnight on the FIRST day of `date`'s month. Resolved via
+/// [`local_midnight_ms`], so it inherits the same DST-correct handling.
+pub fn local_month_start_ms(date: chrono::NaiveDate) -> i64 {
+    use chrono::Datelike;
+    let first = chrono::NaiveDate::from_ymd_opt(date.year(), date.month(), 1)
+        .expect("day 1 of any month is valid");
+    local_midnight_ms(first)
+}
+
+/// The current local month as a `[this month start, next month start)`
+/// unix-ms window. The end rolls the year over when `now` is in December
+/// (Dec -> Jan of the following year).
+pub fn local_month_window(now: chrono::DateTime<chrono::Local>) -> (i64, i64) {
+    use chrono::Datelike;
+    let today = now.date_naive();
+    let start = local_month_start_ms(today);
+    let (next_year, next_month) = if today.month() == 12 {
+        (today.year() + 1, 1)
+    } else {
+        (today.year(), today.month() + 1)
+    };
+    let next_first = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
+        .expect("day 1 of any month is valid");
+    (start, local_midnight_ms(next_first))
+}
+
+/// Priced spend over a `[start_ms, end_ms)` window plus the count of unpriced
+/// `api_request` rows in the same window. `floor_ms`, when `Some`, additionally
+/// drops rows older than the floor (forward-compat for cost-notifications;
+/// callers pass `None` today). Visual budget totals use `None` so backfilled
+/// past-dated rows are included.
+///
+/// - spend = `SUM(cost_usd)` over rows with non-NULL cost in the window
+/// - unpriced = `COUNT` of `api_request` rows with NULL cost in the window
+pub fn priced_spend_for_window(
+    db: &Db,
+    start_ms: i64,
+    end_ms: i64,
+    floor_ms: Option<i64>,
+) -> rusqlite::Result<(f64, i64)> {
+    // A single floor parameter (NULL => no floor) keeps this one query_row.
+    db.conn().query_row(
+        "SELECT
+            COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN cost_usd END), 0.0),
+            COALESCE(SUM(event_type = 'api_request' AND cost_usd IS NULL), 0)
+         FROM requests
+         WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2
+           AND (?3 IS NULL OR timestamp_ms >= ?3)",
+        rusqlite::params![start_ms, end_ms, floor_ms],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+}
+
 /// Aggregate the metrics for one `[day_start_ms, day_end_ms)` window.
 /// Pure DB read; the window is a parameter so tests pin it exactly.
 pub fn metrics_for_window(
@@ -986,5 +1039,119 @@ mod tests {
         assert_eq!(metrics.input_tokens, 42);
         assert_eq!(metrics.cost_usd, 0.25);
         assert!(metrics.day_start_ms <= now_ms && now_ms < metrics.day_end_ms);
+    }
+
+    // ---- monthly window + priced spend (budgets, unit 2) ----
+
+    #[test]
+    fn local_month_window_feb_start_and_span() {
+        use chrono::TimeZone;
+        // Mid-February: window opens Feb 1 00:00 local, closes Mar 1 00:00.
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 2, 14, 9, 30, 0)
+            .single()
+            .expect("valid local time");
+        let (start, end) = local_month_window(now);
+        let start_local = chrono::Local.timestamp_millis_opt(start).unwrap();
+        let end_local = chrono::Local.timestamp_millis_opt(end).unwrap();
+        assert_eq!(
+            start_local.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-02-01 00:00:00"
+        );
+        assert_eq!(
+            end_local.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-01 00:00:00"
+        );
+    }
+
+    #[test]
+    fn local_month_window_december_rolls_to_january() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 12, 20, 12, 0, 0)
+            .single()
+            .expect("valid local time");
+        let (start, end) = local_month_window(now);
+        let start_local = chrono::Local.timestamp_millis_opt(start).unwrap();
+        let end_local = chrono::Local.timestamp_millis_opt(end).unwrap();
+        assert_eq!(
+            start_local.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-12-01 00:00:00"
+        );
+        assert_eq!(
+            end_local.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2027-01-01 00:00:00"
+        );
+    }
+
+    #[test]
+    fn priced_spend_excludes_null_cost_and_counts_unpriced() {
+        let (_dir, db) = test_db();
+        insert_request(
+            &db,
+            Some("s"),
+            START + 1,
+            Some(3.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        // NULL-cost api_request: excluded from spend, counted as unpriced.
+        insert_request(&db, Some("s"), START + 2, None, (1, 0, 0, 0), "api_request");
+        // NULL-cost api_error: neither spend nor unpriced.
+        insert_request(&db, Some("s"), START + 3, None, (0, 0, 0, 0), "api_error");
+
+        let (spend, unpriced) = priced_spend_for_window(&db, START, END, None).unwrap();
+        assert_eq!(spend, 3.0);
+        assert_eq!(unpriced, 1);
+    }
+
+    #[test]
+    fn priced_spend_includes_backfilled_past_rows_without_floor() {
+        let (_dir, db) = test_db();
+        // A backfilled row early in the window (true total, no event-time floor).
+        insert_request(
+            &db,
+            Some("old"),
+            START + 10,
+            Some(5.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        insert_request(
+            &db,
+            Some("new"),
+            END - 10,
+            Some(2.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        let (spend, _) = priced_spend_for_window(&db, START, END, None).unwrap();
+        assert_eq!(spend, 7.0, "no floor => backfilled past rows included");
+    }
+
+    #[test]
+    fn priced_spend_floor_excludes_rows_before_floor() {
+        let (_dir, db) = test_db();
+        insert_request(
+            &db,
+            Some("before"),
+            START + 100,
+            Some(5.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        insert_request(
+            &db,
+            Some("after"),
+            START + 5000,
+            Some(2.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        let floor = START + 1000;
+        let (with_floor, _) = priced_spend_for_window(&db, START, END, Some(floor)).unwrap();
+        assert_eq!(with_floor, 2.0, "row before floor excluded");
+        let (without_floor, _) = priced_spend_for_window(&db, START, END, None).unwrap();
+        assert_eq!(without_floor, 7.0, "row before floor included when None");
     }
 }
