@@ -120,6 +120,29 @@ impl From<std::io::Error> for SettingsError {
     }
 }
 
+/// Render a [`SettingsError`] for the UI with the file path and, where the
+/// error kind admits one, a concrete remediation hint. Shared by the
+/// onboarding, uninstall, and health surfaces (task 6.4) so every
+/// settings.json failure names the file and says what to do about it.
+pub fn describe_settings_error(err: &SettingsError, path: &Path) -> String {
+    let base = format!("{err} (file: {})", path.display());
+    match err {
+        SettingsError::Io(io) if io.kind() == ErrorKind::PermissionDenied => format!(
+            "{base}. This app does not have permission to access the file; check its \
+             permissions (e.g. `chmod u+rw` it) and that the containing folder is accessible."
+        ),
+        SettingsError::Io(io) if io.kind() == ErrorKind::StorageFull => format!(
+            "{base}. The disk is full; free up space and try again. The previous file \
+             contents are intact (writes are atomic and happen after a backup)."
+        ),
+        SettingsError::Malformed(_) => format!(
+            "{base}. Fix the JSON syntax (or restore one of the timestamped backups) and \
+             try again; the file has not been modified."
+        ),
+        _ => base,
+    }
+}
+
 /// Result of a [`merge_file`] / [`unmerge_file`] call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplyOutcome {
@@ -850,6 +873,72 @@ mod tests {
         assert!(matches!(err, SettingsError::UnexpectedShape("env")));
         assert_eq!(std::fs::read_to_string(&s.settings).unwrap(), raw);
         assert!(backup_files(&s.backups).is_empty());
+    }
+
+    // ---- error rendering for the UI (task 6.4) ----
+
+    /// Every settings.json failure shown to the user names the file, and
+    /// the common kinds carry a concrete remediation hint.
+    #[test]
+    fn describe_settings_error_names_file_and_remediation() {
+        let path = Path::new("/tmp/settings.json");
+
+        let malformed = serde_json::from_str::<Value>("{oops").expect_err("malformed");
+        let message = describe_settings_error(&SettingsError::Malformed(malformed), path);
+        assert!(message.contains("/tmp/settings.json"), "got: {message}");
+        assert!(message.contains("Fix the JSON syntax"), "got: {message}");
+        assert!(message.contains("has not been modified"), "got: {message}");
+
+        let denied = std::io::Error::new(ErrorKind::PermissionDenied, "denied");
+        let message = describe_settings_error(&SettingsError::Io(denied), path);
+        assert!(message.contains("/tmp/settings.json"), "got: {message}");
+        assert!(message.contains("permission"), "got: {message}");
+
+        let full = std::io::Error::new(ErrorKind::StorageFull, "no space");
+        let message = describe_settings_error(&SettingsError::Io(full), path);
+        assert!(message.contains("disk is full"), "got: {message}");
+        assert!(message.contains("intact"), "got: {message}");
+
+        // Kinds without a specific hint still name the file.
+        let shape = SettingsError::UnexpectedShape("env");
+        let message = describe_settings_error(&shape, path);
+        assert!(message.contains("/tmp/settings.json"), "got: {message}");
+    }
+
+    /// The real unreadable-file path end to end: a settings.json this user
+    /// cannot read surfaces as an Io(PermissionDenied) the UI describes
+    /// with the chmod hint, and nothing is ever written.
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_settings_file_degrades_with_permission_hint() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = setup(Some("{}"));
+        std::fs::set_permissions(&s.settings, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        // Root can read anything; skip where the test runs privileged.
+        if std::fs::read_to_string(&s.settings).is_ok() {
+            return;
+        }
+
+        let err = read_settings(&s.settings).expect_err("must fail");
+        assert!(
+            matches!(&err, SettingsError::Io(io) if io.kind() == ErrorKind::PermissionDenied),
+            "got {err:?}"
+        );
+        let message = describe_settings_error(&err, &s.settings);
+        assert!(message.contains("chmod u+rw"), "got: {message}");
+        assert!(
+            message.contains(&s.settings.display().to_string()),
+            "got: {message}"
+        );
+
+        let err = merge_file(&s.settings, &s.backups).expect_err("merge must abort");
+        assert!(matches!(err, SettingsError::Io(_)), "got {err:?}");
+        assert!(backup_files(&s.backups).is_empty(), "no backup on abort");
+
+        std::fs::set_permissions(&s.settings, std::fs::Permissions::from_mode(0o644))
+            .expect("restore perms for cleanup");
+        assert_eq!(std::fs::read_to_string(&s.settings).unwrap(), "{}");
     }
 
     // ---- backups & restore ----
