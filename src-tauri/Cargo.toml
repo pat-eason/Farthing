@@ -22,6 +22,16 @@ tauri-build = { version = "2", features = [] }
 # tray-icon: menu bar status item (tray.rs, task 4.1).
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
+# Native save dialog for the report-export destination (export.rs); scoped to
+# the save dialog in capabilities (dialog:allow-save), not the broader default.
+tauri-plugin-dialog = "2"
+# Desktop notification for long/backgrounded exports, driven Rust-side via
+# NotificationExt (no JS package needed). Pinned to 2.3 (sound landed 2.3.1);
+# the 2.6 core-dep floor is already met by tauri 2.11 / @tauri-apps/api ^2.
+tauri-plugin-notification = "2.3"
+# Report-export bundle assembly (export.rs): writes report.html + the two CSVs
+# into a single .zip. Minimal feature set — deflate is the only codec needed.
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # Positions the popover window under the tray icon (multi-monitor and
 # scale-factor aware); fed by forwarding tray events in tray.rs.
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }

@@ -24,6 +24,8 @@ pub mod uninstall;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Native save dialog for the report-export destination (export.rs).
+        .plugin(tauri_plugin_dialog::init())
         // LaunchAgent mode per PRD; enabled during onboarding, toggleable
         // on the settings view (autostart.rs).
         .plugin(tauri_plugin_autostart::init(
@@ -61,6 +63,9 @@ pub fn run() {
             };
             let database = Arc::new(Mutex::new(db::Db::open_in_dir(&data_dir)?));
             app.manage(db::DbState(Arc::clone(&database)));
+            // Data dir for the read-only export connection (export.rs); see
+            // db::DbPath. Reads a WAL snapshot without the shared DbState lock.
+            app.manage(db::DbPath(data_dir.clone()));
 
             // Capture pause/resume (task 4.4): persisted in `meta`, so a
             // paused app stays paused across restarts. Loaded before the

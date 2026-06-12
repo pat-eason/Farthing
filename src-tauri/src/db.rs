@@ -191,6 +191,14 @@ pub struct Db {
 /// pipeline (axum task) share the same handle.
 pub struct DbState(pub Arc<Mutex<Db>>);
 
+/// Tauri-managed data directory that holds `usage.db`. The report export
+/// (export.rs) joins [`DB_FILE_NAME`] to this and opens a second, read-only
+/// connection (`SQLITE_OPEN_READ_ONLY`) so a long All-time scan reads a WAL
+/// snapshot without holding the shared [`DbState`] mutex or stalling live
+/// ingest. Kept separate from [`Db`] so the read-only path never touches
+/// `configure_connection`/`apply_migrations` (both writes).
+pub struct DbPath(pub PathBuf);
+
 impl Db {
     /// Open (creating if necessary) `usage.db` inside `dir`, creating the
     /// directory itself if missing, then configure pragmas and migrate.
@@ -751,6 +759,75 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert!(!old_dir.join(DB_FILE_NAME).exists());
+    }
+
+    /// The read-only export path (export.rs) opens a second connection with
+    /// `SQLITE_OPEN_READ_ONLY` against the managed [`DbPath`]. WAL must let
+    /// that reader see committed rows even while the shared [`DbState`] mutex
+    /// is held by the ingest/write path — that concurrent-reader property is
+    /// the whole reason the export uses a fresh connection instead of the
+    /// shared one.
+    #[test]
+    fn read_only_export_connection_reads_while_dbstate_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_dir(dir.path()).unwrap();
+        insert_session(&db, "s1", Some("/proj/alpha"));
+        db.conn()
+            .execute(
+                "INSERT INTO requests (session_id, timestamp_ms, model, cost_usd)
+                 VALUES ('s1', 1700000000000, 'sonnet', 1.5)",
+                [],
+            )
+            .unwrap();
+
+        // Hold the shared handle exactly as the live ingest path does, then
+        // open the export's read-only connection and read concurrently.
+        let state = DbState(Arc::new(Mutex::new(db)));
+        let path = DbPath(dir.path().to_path_buf());
+        let _guard = state.0.lock().unwrap();
+
+        let export = Connection::open_with_flags(
+            path.0.join(DB_FILE_NAME),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let count: i64 = export
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "read-only reader must see committed rows");
+    }
+
+    /// The export connection must never write to `usage.db` — the invariant
+    /// is enforced by the open flag, not merely asserted in prose. An INSERT
+    /// on a `SQLITE_OPEN_READ_ONLY` connection errors.
+    #[test]
+    fn read_only_export_connection_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let _db = Db::open_in_dir(dir.path()).unwrap();
+
+        let export = Connection::open_with_flags(
+            dir.path().join(DB_FILE_NAME),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let write = export.execute(
+            "INSERT INTO requests (session_id, timestamp_ms) VALUES ('s', 1)",
+            [],
+        );
+        assert!(
+            write.is_err(),
+            "INSERT on a read-only export connection must error"
+        );
+    }
+
+    fn insert_session(db: &Db, session_id: &str, cwd: Option<&str>) {
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, cwd, first_seen_ms)
+                 VALUES (?1, ?2, 1700000000000)",
+                rusqlite::params![session_id, cwd],
+            )
+            .unwrap();
     }
 
     #[test]
