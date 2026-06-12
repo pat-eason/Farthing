@@ -110,12 +110,11 @@ fn show_with(notifier: &impl Notifier, title: &str, body: &str) -> ShowOutcome {
 /// the shape of each alert without depending on actual spend.
 fn test_copy(rule_type: &str) -> Result<(&'static str, &'static str), String> {
     match rule_type {
-        RULE_TYPE_BURST => Ok((
-            "Usage spike",
-            "$12.40 in the last 10 minutes (sample)",
-        )),
+        RULE_TYPE_BURST => Ok(("Usage spike", "$12.40 in the last 10 minutes (sample)")),
         RULE_TYPE_DELTA => Ok(("Usage milestone", "$50 of usage so far (sample)")),
-        other => Err(format!("cannot send test notification: unknown rule type '{other}'")),
+        other => Err(format!(
+            "cannot send test notification: unknown rule type '{other}'"
+        )),
     }
 }
 
@@ -145,7 +144,10 @@ pub fn notification_request_permission<R: Runtime>(app: AppHandle<R>) -> String 
 /// given rule type (`"burst"` or `"delta"`). Uses fixed sample values, never
 /// live DB data, so the user sees the shape of an alert on demand.
 #[tauri::command]
-pub fn notification_send_test<R: Runtime>(app: AppHandle<R>, rule_type: String) -> Result<(), String> {
+pub fn notification_send_test<R: Runtime>(
+    app: AppHandle<R>,
+    rule_type: String,
+) -> Result<(), String> {
     let (title, body) = test_copy(&rule_type)?;
     show(&app, title, body);
     Ok(())
