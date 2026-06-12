@@ -56,6 +56,71 @@ pub fn format_title(cost_usd: f64, paused: bool) -> String {
     }
 }
 
+/// Monochrome warning prefix: U+26A0 plus the text variation selector
+/// (U+FE0E) so macOS renders the flat glyph, not the colored emoji.
+const WARN_PREFIX: &str = "⚠\u{FE0E} ";
+
+/// Pipe separating the cost from the budget readout (` | `).
+const BUDGET_SEPARATOR: &str = " | ";
+
+/// Stoplight dot for a band. Colored emoji circles render in color in the
+/// menu bar (a plain-string approximation of a status dot — no native
+/// attributed-string tinting needed): green / yellow / orange / red.
+fn band_dot(band: crate::budgets::Band) -> &'static str {
+    use crate::budgets::Band;
+    match band {
+        Band::Green => "🟢",
+        Band::Yellow => "🟡",
+        Band::Amber => "🟠",
+        Band::Red => "🔴",
+    }
+}
+
+/// Render the tray title with the optional budget readout folded in.
+///
+/// Starts from [`format_title`] (cost + pause badge). When `status` is
+/// present and `show_in_tray` is set with at least one budget line, appends
+/// ` | ` then each budget as `{dot} D {pct}%` / `{dot} M {pct}%` (daily
+/// before monthly, only the present ones), where `{dot}` is the band's
+/// stoplight glyph. Independently, when the worst band is Amber or Red,
+/// prepends the monochrome warning glyph — even with `show_in_tray` off.
+/// With no status, or nothing extra to show, returns the plain title.
+pub fn format_budget_title(
+    cost_usd: f64,
+    paused: bool,
+    status: Option<&crate::budgets::BudgetStatus>,
+) -> String {
+    use crate::budgets::Band;
+
+    let base = format_title(cost_usd, paused);
+    let Some(status) = status else {
+        return base;
+    };
+
+    let warn = matches!(status.worst_band, Band::Amber | Band::Red);
+
+    let mut budgets: Vec<String> = Vec::new();
+    if status.show_in_tray {
+        if let Some(daily) = status.daily.as_ref() {
+            budgets.push(format!("{} D {}%", band_dot(daily.band), daily.percent));
+        }
+        if let Some(monthly) = status.monthly.as_ref() {
+            budgets.push(format!("{} M {}%", band_dot(monthly.band), monthly.percent));
+        }
+    }
+
+    let mut title = String::new();
+    if warn {
+        title.push_str(WARN_PREFIX);
+    }
+    title.push_str(&base);
+    if !budgets.is_empty() {
+        title.push_str(BUDGET_SEPARATOR);
+        title.push_str(&budgets.join("  "));
+    }
+    title
+}
+
 /// Recompute today's cost and set the tray title. Safe from any thread:
 /// the query runs on the caller, the `set_title` is dispatched to the main
 /// thread (tray mutations elsewhere are silently dropped, live-verified in
@@ -69,10 +134,16 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
         .try_state::<CaptureState>()
         .map(|state| state.paused())
         .unwrap_or(false);
-    let (day_start_ms, day_end_ms) = crate::metrics::local_day_window(chrono::Local::now());
-    let cost_usd = {
+    // Optional: a budget readout the formatter folds into the title. Missing
+    // managed state (tests, startup ordering) => behave exactly as today.
+    let budget_config = app
+        .try_state::<crate::budgets::BudgetState>()
+        .map(|state| state.config());
+    let now = chrono::Local::now();
+    let (day_start_ms, day_end_ms) = crate::metrics::local_day_window(now);
+    let (cost_usd, status) = {
         let db = db_state.0.lock().expect("db mutex poisoned");
-        match cost_for_window(&db, day_start_ms, day_end_ms) {
+        let cost_usd = match cost_for_window(&db, day_start_ms, day_end_ms) {
             Ok(cost) => cost,
             Err(err) => {
                 // Keep the previous (correct-at-the-time) title rather than
@@ -80,17 +151,121 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
                 eprintln!("tray title: cannot query today's cost: {err}");
                 return;
             }
-        }
+        };
+        let status = budget_config.as_ref().and_then(|config| {
+            match crate::budgets::evaluate(&db, config, now) {
+                Ok(status) => Some(status),
+                Err(err) => {
+                    // Budget readout is best-effort: drop it and still render
+                    // the cost rather than failing the whole title refresh.
+                    eprintln!("tray title: cannot evaluate budgets: {err}");
+                    None
+                }
+            }
+        });
+        (cost_usd, status)
     };
-    let title = format_title(cost_usd, paused);
-    let ui_app = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
-            // Always a non-empty string, so the macOS set_title(None)
-            // no-clear quirk (see task 4.4) can never bite here.
-            let _ = tray.set_title(Some(title.as_str()));
+    // macOS: when budgets show in the tray, draw the stacked readout as a
+    // status-button image (set_title can't stack); otherwise restore the bird
+    // icon and show the plain cost. Other platforms always use the title.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(model) = budget_render_model(cost_usd, paused, status.as_ref()) {
+            // Render off the title path: draw a PNG and install it via
+            // set_icon (which keeps tray-icon's click overlay sized to the
+            // button, so left-click still toggles the popover).
+            let fallback = format_budget_title(cost_usd, paused, status.as_ref());
+            let ui_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) else {
+                    return;
+                };
+                let png = objc2::MainThreadMarker::new()
+                    .and_then(|mtm| crate::tray_render::render_png(&model, mtm));
+                if let Some(img) =
+                    png.and_then(|bytes| tauri::image::Image::from_bytes(&bytes).ok())
+                {
+                    let _ = tray.set_icon_as_template(false);
+                    let _ = tray.set_icon(Some(img));
+                    // Cost lives in the drawn image; clear the text title.
+                    let _ = tray.set_title(Some(""));
+                    CUSTOM_IMAGE_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    // Rendering failed: degrade to the single-line title.
+                    let _ = tray.set_title(Some(fallback.as_str()));
+                }
+            });
+            return;
         }
-    });
+        // Plain mode: restore the bird template icon if a drawn image replaced
+        // it, then show the plain cost as the title.
+        let plain = format_title(cost_usd, paused);
+        let ui_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
+                if CUSTOM_IMAGE_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = tray.set_icon_as_template(true);
+                    let _ = tray.set_icon(Some(crate::tray::template_icon()));
+                }
+                let _ = tray.set_title(Some(plain.as_str()));
+            }
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let title = format_budget_title(cost_usd, paused, status.as_ref());
+        let ui_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
+                // Always a non-empty string, so the macOS set_title(None)
+                // no-clear quirk (see task 4.4) can never bite here.
+                let _ = tray.set_title(Some(title.as_str()));
+            }
+        });
+    }
+}
+
+/// True while the macOS status button shows a drawn budget image instead of
+/// the bird icon; lets [`refresh`] restore the icon on return to plain mode.
+#[cfg(target_os = "macos")]
+static CUSTOM_IMAGE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Build the stacked-readout model when budgets should show in the tray.
+/// `None` => plain mode (no budgets set, or the tray toggle is off).
+#[cfg(target_os = "macos")]
+fn budget_render_model(
+    cost_usd: f64,
+    paused: bool,
+    status: Option<&crate::budgets::BudgetStatus>,
+) -> Option<crate::tray_render::Model> {
+    let status = status?;
+    if !status.show_in_tray {
+        return None;
+    }
+    let mut rows = Vec::new();
+    if let Some(daily) = status.daily.as_ref() {
+        rows.push(crate::tray_render::Row {
+            marker: "D",
+            percent: daily.percent,
+            band: daily.band,
+        });
+    }
+    if let Some(monthly) = status.monthly.as_ref() {
+        rows.push(crate::tray_render::Row {
+            marker: "M",
+            percent: monthly.percent,
+            band: monthly.band,
+        });
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(crate::tray_render::Model {
+        cost: format_title(cost_usd, paused),
+        rows,
+    })
 }
 
 #[cfg(test)]
@@ -127,6 +302,118 @@ mod tests {
         // cost_usd should never be negative, but the title must not render
         // "$-0.01" if a bad row ever sneaks in.
         assert_eq!(format_title(-0.5, false), "$0.00");
+    }
+
+    // ---- budget title formatting ----
+
+    use crate::budgets::{Band, BudgetLine, BudgetStatus};
+
+    /// A budget line at a given rounded percent / band; spend/amount values
+    /// don't affect the title, so they're placeholders.
+    fn line(percent: i64, band: Band) -> BudgetLine {
+        BudgetLine {
+            amount_usd: 100.0,
+            spent_priced_usd: percent as f64,
+            unpriced_requests: 0,
+            percent,
+            band,
+            exceeded: false,
+        }
+    }
+
+    fn status(
+        daily: Option<BudgetLine>,
+        monthly: Option<BudgetLine>,
+        show_in_tray: bool,
+        worst_band: Band,
+    ) -> BudgetStatus {
+        BudgetStatus {
+            daily,
+            monthly,
+            show_in_tray,
+            worst_band,
+        }
+    }
+
+    #[test]
+    fn no_status_returns_plain_title() {
+        assert_eq!(format_budget_title(12.34, false, None), "$12.34");
+    }
+
+    #[test]
+    fn both_under_amber_shown_appends_percents_no_warn() {
+        let s = status(
+            Some(line(40, Band::Green)),
+            Some(line(20, Band::Green)),
+            true,
+            Band::Green,
+        );
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "$12.34 | 🟢 D 40%  🟢 M 20%"
+        );
+    }
+
+    #[test]
+    fn daily_amber_prepends_warn() {
+        let s = status(
+            Some(line(80, Band::Amber)),
+            Some(line(20, Band::Green)),
+            true,
+            Band::Amber,
+        );
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "⚠\u{FE0E} $12.34 | 🟠 D 80%  🟢 M 20%"
+        );
+    }
+
+    #[test]
+    fn warn_without_show_in_tray_drops_percents() {
+        // Red worst band warns even with the tray readout off, but no percents.
+        let s = status(Some(line(120, Band::Red)), None, false, Band::Red);
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "⚠\u{FE0E} $12.34"
+        );
+    }
+
+    #[test]
+    fn no_budget_lines_returns_plain_title() {
+        let s = status(None, None, true, Band::Green);
+        assert_eq!(format_budget_title(12.34, false, Some(&s)), "$12.34");
+    }
+
+    #[test]
+    fn paused_with_amber_budget_keeps_badge_and_percents() {
+        let s = status(
+            Some(line(95, Band::Amber)),
+            Some(line(20, Band::Green)),
+            true,
+            Band::Amber,
+        );
+        assert_eq!(
+            format_budget_title(12.34, true, Some(&s)),
+            "⚠\u{FE0E} Paused · $12.34 | 🟠 D 95%  🟢 M 20%"
+        );
+    }
+
+    #[test]
+    fn only_monthly_set_appends_just_monthly() {
+        let s = status(None, Some(line(25, Band::Green)), true, Band::Green);
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "$12.34 | 🟢 M 25%"
+        );
+    }
+
+    #[test]
+    fn only_monthly_amber_tray_off_warns_without_percents() {
+        let s = status(None, Some(line(80, Band::Amber)), false, Band::Amber);
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "⚠\u{FE0E} $12.34"
+        );
     }
 
     // ---- today-cost query ----

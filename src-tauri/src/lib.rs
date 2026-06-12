@@ -5,6 +5,7 @@ use tauri::{Emitter, Manager};
 pub mod alerts;
 pub mod autostart;
 pub mod backfill;
+pub mod budgets;
 pub mod capture;
 pub mod db;
 pub mod export;
@@ -20,6 +21,8 @@ pub mod session;
 pub mod settings_merge;
 pub mod transcript;
 pub mod tray;
+#[cfg(target_os = "macos")]
+pub mod tray_render;
 pub mod tray_title;
 pub mod uninstall;
 
@@ -79,6 +82,11 @@ pub fn run() {
             // receiver spawns and before tray::setup seeds the menu/badge.
             let capture_state = capture::CaptureState::load(Arc::clone(&database));
             app.manage(capture_state.clone());
+
+            // Budget config (standalone build): daily/monthly thresholds +
+            // tray-visibility toggle, persisted as a JSON row in `meta`.
+            // Loaded from the same DB handle, defaulting on any read error.
+            app.manage(budgets::BudgetState::load(Arc::clone(&database)));
 
             // Cost-alert config + runtime (cost-notifications plan): persisted
             // as JSON in `meta`, cached in memory. `load` also captures
@@ -181,6 +189,9 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     tray_title::refresh(&tick_app);
+                    // Nudge the popover to re-query so its day window rolls
+                    // over at local midnight even with no live ingest.
+                    let _ = tick_app.emit("metrics:tick", ());
                     // Coarse re-evaluation each minute, undebounced: catches the
                     // delta month-rollover (state-derived from Local::now(), no
                     // midnight alarm) and re-checks notification permission so a
@@ -227,7 +238,10 @@ pub fn run() {
             autostart::autostart_set,
             uninstall::uninstall_status,
             uninstall::uninstall_apply,
-            tray::open_main_window
+            tray::open_main_window,
+            budgets::budget_config_get,
+            budgets::budget_config_set,
+            budgets::budget_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
