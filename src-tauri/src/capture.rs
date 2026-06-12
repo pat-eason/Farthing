@@ -115,6 +115,8 @@ pub fn apply_paused<R: Runtime>(
     // on the async runtime (live-verified: a set_title there is dropped).
     let ui_app = app.clone();
     let _ = app.run_on_main_thread(move || crate::tray::sync_paused_ui(&ui_app, paused));
+    // Title: paused badge appears/disappears next to today's cost.
+    crate::tray_title::refresh(app);
     let _ = app.emit(PAUSED_CHANGED_EVENT, status);
     Ok(status)
 }

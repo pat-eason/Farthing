@@ -12,9 +12,9 @@
 //!   so the Dock icon disappears while the app stays resident.
 //!
 //! The "Pause capture" check item drives `capture::apply_paused` (task
-//! 4.4): the receiver discards (200 + drop) while paused, the tray shows a
-//! "Paused" title badge next to the icon, and the persisted state restores
-//! the menu check + badge on the next launch.
+//! 4.4): the receiver discards (200 + drop) while paused, the tray title
+//! shows a "Paused" badge next to today's cost (`crate::tray_title`), and
+//! the persisted state restores the menu check + badge on the next launch.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,11 +29,9 @@ use crate::capture::{self, CaptureState};
 pub const MAIN_WINDOW: &str = "main";
 pub const POPOVER_WINDOW: &str = "popover";
 
-/// Tray icon id, used to look the icon up for the paused title badge.
+/// Tray icon id, used to look the icon up for the title (today's cost +
+/// paused badge, `crate::tray_title`).
 pub const TRAY_ID: &str = "main-tray";
-
-/// Menu-bar badge shown next to the tray icon while capture is paused.
-const PAUSED_BADGE: &str = "Paused";
 
 const MENU_OPEN_APP: &str = "open-app";
 const MENU_PAUSE: &str = "pause";
@@ -117,7 +115,7 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
     // pause changes from outside the menu (popover resume button).
     app.manage(PauseMenuHandle(pause.clone()));
 
-    let tray = TrayIconBuilder::with_id(TRAY_ID)
+    TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         // Template image: macOS renders it as a monochrome glyph that adapts
         // to the menu bar appearance (dark/light).
@@ -142,10 +140,9 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         })
         .build(app.handle())?;
 
-    // Restore the paused badge for a launch into a persisted pause.
-    if paused {
-        let _ = tray.set_title(Some(PAUSED_BADGE));
-    }
+    // Seed the title (today's cost; a launch into a persisted pause gets
+    // its badge back too). The DB is managed before tray setup runs.
+    crate::tray_title::refresh(app.handle());
 
     Ok(())
 }
@@ -168,17 +165,14 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: &MenuEvent, pause: &
     }
 }
 
-/// Bring the tray UI in line with `paused`: menu check state + the menu-bar
-/// "Paused" title badge. Tolerates a missing tray/menu (tests, startup
+/// Bring the tray menu in line with `paused` (check item). The menu-bar
+/// title (today's cost + paused badge) is owned by
+/// [`crate::tray_title::refresh`], which `capture::apply_paused` invokes
+/// alongside this. Tolerates a missing menu handle (tests, startup
 /// ordering) — state is owned by `CaptureState`, this is presentation only.
 pub fn sync_paused_ui<R: Runtime>(app: &AppHandle<R>, paused: bool) {
     if let Some(handle) = app.try_state::<PauseMenuHandle<R>>() {
         let _ = handle.0.set_checked(paused);
-    }
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        // Clear with Some("") — set_title(None) leaves the previous title in
-        // place on macOS (live-verified).
-        let _ = tray.set_title(Some(if paused { PAUSED_BADGE } else { "" }));
     }
 }
 
