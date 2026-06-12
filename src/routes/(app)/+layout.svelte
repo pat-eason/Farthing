@@ -16,6 +16,7 @@
   let { children } = $props();
 
   const views = [
+    { route: "/(app)/spend", label: "Budgets" },
     { route: "/(app)/cost", label: "Cost over time" },
     { route: "/(app)/sessions", label: "Sessions" },
     { route: "/(app)/tokens", label: "Tokens & cache" },
