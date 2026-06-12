@@ -6,6 +6,7 @@ pub mod autostart;
 pub mod backfill;
 pub mod capture;
 pub mod db;
+pub mod export;
 pub mod health;
 pub mod ingest;
 pub mod metrics;
@@ -162,6 +163,7 @@ pub fn run() {
             queries::session_detail,
             queries::project_rollups,
             queries::home_dir,
+            export::export,
             capture::capture_status,
             capture::capture_set_paused,
             onboarding::onboarding_status,

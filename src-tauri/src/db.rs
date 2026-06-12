@@ -216,6 +216,19 @@ impl Db {
         Ok(Self { conn })
     }
 
+    /// Open `usage.db` at `path` read-only for the report export (export.rs).
+    ///
+    /// Deliberately skips [`configure_connection`] and [`apply_migrations`]
+    /// (both write to the file): the connection is opened with
+    /// `SQLITE_OPEN_READ_ONLY` so a long All-time scan reads a consistent WAL
+    /// snapshot without holding the shared [`DbState`] mutex or stalling live
+    /// ingest. The open flag — not prose — enforces the never-writes invariant
+    /// (an `INSERT` errors; see the read-only-connection tests).
+    pub fn open_readonly(path: &Path) -> Result<Self, DbError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn })
+    }
+
     /// Current schema version as recorded in `meta`.
     pub fn schema_version(&self) -> Result<u64, DbError> {
         schema_version(&self.conn)
