@@ -1,6 +1,6 @@
 {
   "name": "farthing",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Zero-config macOS menu bar app for Claude Code token/cost usage",
   "license": "MIT",
   "type": "module",
