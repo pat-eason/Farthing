@@ -8,7 +8,11 @@
   // state (facets.svelte.ts) persist across navigation and close/reopen.
   import { resolve } from "$app/paths";
   import { page } from "$app/state";
+  import { listen } from "@tauri-apps/api/event";
   import FacetBar from "$lib/FacetBar.svelte";
+  import ExportBanner from "$lib/ExportBanner.svelte";
+  import { applyProgress } from "$lib/export.svelte";
+  import { EXPORT_PROGRESS_EVENT, type ExportProgress } from "$lib/queries";
   // 128px downscale of art/farthing-icon.png (scripts/generate-icons.py);
   // hashed + bundled by Vite, displayed at 22px so retina stays crisp.
   import farthingIcon from "$lib/assets/farthing-icon.png";
@@ -34,6 +38,16 @@
   // The facet bar only frames the analysis views; health/settings are
   // operational pages the facets don't apply to.
   const showFacets = $derived(views.some((view) => isActive(view.route)));
+
+  // App-level export progress listener (R11). The banner is shared by all four
+  // views, so the listener lives in the shell — it survives view navigation
+  // during a long export. Mirrors the popover's listen + $effect cleanup.
+  $effect(() => {
+    const unlisten = listen<ExportProgress>(EXPORT_PROGRESS_EVENT, (event) => {
+      applyProgress(event.payload);
+    });
+    return () => void unlisten.then((stop) => stop());
+  });
 </script>
 
 <div class="shell">
@@ -63,6 +77,7 @@
   </nav>
 
   <div class="content">
+    <ExportBanner />
     {#if showFacets}
       <header class="facet-header">
         <FacetBar />
