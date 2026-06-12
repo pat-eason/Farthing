@@ -58,20 +58,22 @@ jobs:
 
       # Release only when this push actually bumped the version (i.e. the
       # Version PR just merged) and that version has not already been tagged.
-      # Read the COMMITTED package.json from git, not the working tree: the
-      # changesets/action step above runs `pnpm run version`, which mutates the
-      # working-tree package.json to the next version even on changeset-adding
-      # pushes. Comparing committed HEAD vs HEAD~1 blobs is immune to that.
+      # Pin to the pushed commit and its first parent by absolute SHA: the
+      # changesets/action step above checks out its own changeset-release
+      # branch and leaves git HEAD there, so HEAD / HEAD~1 no longer refer to
+      # the pushed main commit. github.sha is immutable and immune to that.
       - name: Decide whether to release
         id: gate
+        env:
+          SHA: ${{ github.sha }}
         run: |
           blobver() {
             git show "$1:package.json" 2>/dev/null \
               | node -pe "try { JSON.parse(require('fs').readFileSync(0, 'utf8')).version } catch { '' }" \
               || true
           }
-          VER="$(blobver HEAD)"
-          OLD="$(blobver HEAD~1)"
+          VER="$(blobver "$SHA")"
+          OLD="$(blobver "$SHA^")"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           if [ -n "$VER" ] && [ "$VER" != "$OLD" ] && ! git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
             echo "should_release=true" >> "$GITHUB_OUTPUT"
