@@ -124,33 +124,6 @@ pub fn local_month_window(now: chrono::DateTime<chrono::Local>) -> (i64, i64) {
     (start, local_midnight_ms(next_first))
 }
 
-/// Priced spend over a `[start_ms, end_ms)` window plus the count of unpriced
-/// `api_request` rows in the same window. `floor_ms`, when `Some`, additionally
-/// drops rows older than the floor (forward-compat for cost-notifications;
-/// callers pass `None` today). Visual budget totals use `None` so backfilled
-/// past-dated rows are included.
-///
-/// - spend = `SUM(cost_usd)` over rows with non-NULL cost in the window
-/// - unpriced = `COUNT` of `api_request` rows with NULL cost in the window
-pub fn priced_spend_for_window(
-    db: &Db,
-    start_ms: i64,
-    end_ms: i64,
-    floor_ms: Option<i64>,
-) -> rusqlite::Result<(f64, i64)> {
-    // A single floor parameter (NULL => no floor) keeps this one query_row.
-    db.conn().query_row(
-        "SELECT
-            COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN cost_usd END), 0.0),
-            COALESCE(SUM(event_type = 'api_request' AND cost_usd IS NULL), 0)
-         FROM requests
-         WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2
-           AND (?3 IS NULL OR timestamp_ms >= ?3)",
-        rusqlite::params![start_ms, end_ms, floor_ms],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-}
-
 /// Aggregate the metrics for one `[day_start_ms, day_end_ms)` window.
 /// Pure DB read; the window is a parameter so tests pin it exactly.
 pub fn metrics_for_window(
@@ -216,6 +189,49 @@ pub fn metrics_for_window(
         .collect::<Result<_, _>>()?;
 
     Ok(metrics)
+}
+
+/// Priced-only spend over a `[start, end)` window for the alert engine.
+///
+/// Returns `(priced_sum, unpriced_count)`:
+/// - `priced_sum` totals `cost_usd` over rows that actually carry a price, so
+///   `NULL`-cost rows never silently count as `$0` (the COALESCE-to-zero trap
+///   `docs/notes/pricing.md` warns about): the alert thresholds must reflect
+///   real priced spend, not an under-count padded with free zeros.
+/// - `unpriced_count` is the `api_request` rows *excluded* from that sum
+///   because their `cost_usd` is `NULL` (unknown model pricing) inside the
+///   window, so a caller can tell "$0 of spend" from "spend it can't see".
+///
+/// `min_timestamp_ms` is an optional event-time floor: when `Some(floor)`, only
+/// rows timestamped at/after `floor` are counted. Burst passes
+/// `max(now - window, process_start_ms)` so spend recovered from before this
+/// process launched (backfill, or an otel re-delivery that flips a backfill row
+/// and resets its `timestamp_ms` to the real event time) can never trip a
+/// rate alert; `None` applies no floor.
+///
+/// One indexed range scan, mirroring [`metrics_for_window`]: the conditional
+/// sums ride a single pass of `idx_requests_facet_rollup` (timestamp_ms-leading,
+/// pinned so the planner can't drift onto a non-time index).
+pub fn priced_spend_for_window(
+    db: &Db,
+    start_ms: i64,
+    end_ms: i64,
+    min_timestamp_ms: Option<i64>,
+) -> Result<(f64, i64), rusqlite::Error> {
+    let conn = db.conn();
+    // A floor of `None` collapses to a tautology (`timestamp_ms >= MIN`) so the
+    // SQL shape is fixed regardless and the planner sees one parameterized
+    // statement. The window's own `>= ?1` already keeps the scan bounded.
+    let floor = min_timestamp_ms.unwrap_or(i64::MIN);
+    conn.query_row(
+        "SELECT
+            COALESCE(SUM(cost_usd), 0.0),
+            COALESCE(SUM(event_type = 'api_request' AND cost_usd IS NULL), 0)
+         FROM requests INDEXED BY idx_requests_facet_rollup
+         WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2 AND timestamp_ms >= ?3",
+        (start_ms, end_ms, floor),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
 }
 
 /// Frontend query: today's metrics for the popover.
@@ -702,6 +718,248 @@ mod tests {
             start_local.format("%H:%M:%S%.3f").to_string(),
             "00:00:00.000"
         );
+    }
+
+    // ---- local month window ----
+
+    #[test]
+    fn local_month_window_brackets_now_and_starts_on_the_first_at_midnight() {
+        let now = chrono::Local::now();
+        let (start, end) = local_month_window(now);
+        let now_ms = now.timestamp_millis();
+        assert!(
+            start <= now_ms && now_ms < end,
+            "now must fall inside its own month"
+        );
+        // A month is 28-31 days, each 24h except DST transitions (23h/25h).
+        let len = end - start;
+        assert!(
+            (27 * DAY_MS..=32 * DAY_MS).contains(&len),
+            "month length out of range: {len}ms"
+        );
+        use chrono::{Datelike, TimeZone};
+        let start_local = chrono::Local.timestamp_millis_opt(start).unwrap();
+        assert_eq!(start_local.day(), 1, "start is the first of the month");
+        assert_eq!(
+            start_local.format("%H:%M:%S%.3f").to_string(),
+            "00:00:00.000"
+        );
+        // End is the first of the *next* month at local midnight.
+        let end_local = chrono::Local.timestamp_millis_opt(end).unwrap();
+        assert_eq!(end_local.day(), 1, "end is the first of next month");
+        assert_eq!(end_local.format("%H:%M:%S%.3f").to_string(), "00:00:00.000");
+    }
+
+    /// Build the `[start, end)` month window for a fixed local date, exercising
+    /// the same boundary math `local_month_window` uses without depending on the
+    /// machine's current month.
+    fn month_window_for(year: i32, month: u32, day: u32) -> (i64, i64) {
+        use chrono::TimeZone;
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+        let noon = date.and_hms_opt(12, 0, 0).unwrap();
+        let now = chrono::Local.from_local_datetime(&noon).single().unwrap();
+        local_month_window(now)
+    }
+
+    /// Assert a unix-ms instant renders as the first of `month`/`year` at local
+    /// midnight.
+    fn assert_is_first_at_midnight(ms: i64, year: i32, month: u32) {
+        use chrono::{Datelike, TimeZone};
+        let local = chrono::Local.timestamp_millis_opt(ms).unwrap();
+        assert_eq!(local.year(), year);
+        assert_eq!(local.month(), month);
+        assert_eq!(local.day(), 1);
+        assert_eq!(local.format("%H:%M:%S%.3f").to_string(), "00:00:00.000");
+    }
+
+    #[test]
+    fn local_month_window_mid_month_spans_first_to_first_of_next() {
+        let (start, end) = month_window_for(2026, 6, 15);
+        assert_is_first_at_midnight(start, 2026, 6);
+        assert_is_first_at_midnight(end, 2026, 7);
+    }
+
+    #[test]
+    fn local_month_window_handles_december_to_january_rollover() {
+        let (start, end) = month_window_for(2026, 12, 20);
+        assert_is_first_at_midnight(start, 2026, 12);
+        // Year rolls over: next month is January of the following year.
+        assert_is_first_at_midnight(end, 2027, 1);
+    }
+
+    #[test]
+    fn local_month_window_february_leap_and_non_leap() {
+        use chrono::TimeZone;
+        // 2024 is a leap year: February has 29 days. The window must close on
+        // March 1 regardless, and span exactly 29 local days.
+        let (leap_start, leap_end) = month_window_for(2024, 2, 10);
+        assert_is_first_at_midnight(leap_start, 2024, 2);
+        assert_is_first_at_midnight(leap_end, 2024, 3);
+        // A non-DST February stays exact 24h days; assert the day count, not raw
+        // ms, to stay correct in any timezone.
+        let leap_days = (chrono::Local.timestamp_millis_opt(leap_end).unwrap()
+            - chrono::Local.timestamp_millis_opt(leap_start).unwrap())
+        .num_days();
+        assert_eq!(leap_days, 29, "Feb 2024 is a leap month");
+
+        // 2025 is not a leap year: February has 28 days.
+        let (start, end) = month_window_for(2025, 2, 10);
+        assert_is_first_at_midnight(start, 2025, 2);
+        assert_is_first_at_midnight(end, 2025, 3);
+        let days = (chrono::Local.timestamp_millis_opt(end).unwrap()
+            - chrono::Local.timestamp_millis_opt(start).unwrap())
+        .num_days();
+        assert_eq!(days, 28, "Feb 2025 is not a leap month");
+    }
+
+    #[test]
+    fn local_month_window_start_is_local_midnight_across_a_dst_month() {
+        // US DST springs forward in March; the month boundary must still land on
+        // local midnight (the helper routes both ends through local_midnight_ms,
+        // which probes past a skipped/ambiguous midnight). The day count tolerates
+        // the 23h transition day.
+        let (start, end) = month_window_for(2026, 3, 12);
+        assert_is_first_at_midnight(start, 2026, 3);
+        assert_is_first_at_midnight(end, 2026, 4);
+    }
+
+    // ---- priced-only windowed spend ----
+
+    #[test]
+    fn priced_spend_sums_only_priced_rows_and_counts_unpriced() {
+        let (_dir, db) = test_db();
+        // Two priced api_request rows: $1.50 + $0.50 = $2.00.
+        insert_request(
+            &db,
+            Some("s"),
+            START + 1,
+            Some(1.5),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        insert_request(
+            &db,
+            Some("s"),
+            START + 2,
+            Some(0.5),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        // Two unpriced api_request rows: excluded from the sum, counted instead.
+        insert_request(&db, Some("s"), START + 3, None, (1, 0, 0, 0), "api_request");
+        insert_request(&db, Some("s"), START + 4, None, (1, 0, 0, 0), "api_request");
+        // An error row carries NULL cost but is not an api_request: neither summed
+        // nor counted as unpriced.
+        insert_request(&db, Some("s"), START + 5, None, (0, 0, 0, 0), "api_error");
+
+        let (sum, unpriced) = priced_spend_for_window(&db, START, END, None).unwrap();
+        assert_eq!(sum, 2.0);
+        assert_eq!(unpriced, 2, "only NULL-cost api_request rows in window");
+    }
+
+    #[test]
+    fn priced_spend_respects_window_bounds() {
+        let (_dir, db) = test_db();
+        // Just before the window: excluded.
+        insert_request(
+            &db,
+            Some("s"),
+            START - 1,
+            Some(9.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        // At the inclusive start: included.
+        insert_request(
+            &db,
+            Some("s"),
+            START,
+            Some(1.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        // Inside: included.
+        insert_request(
+            &db,
+            Some("s"),
+            START + 1,
+            Some(2.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        // At the exclusive end: excluded.
+        insert_request(&db, Some("s"), END, Some(4.0), (1, 0, 0, 0), "api_request");
+
+        let (sum, unpriced) = priced_spend_for_window(&db, START, END, None).unwrap();
+        assert_eq!(sum, 3.0);
+        assert_eq!(unpriced, 0);
+    }
+
+    #[test]
+    fn priced_spend_empty_window_is_zero_and_zero() {
+        let (_dir, db) = test_db();
+        assert_eq!(
+            priced_spend_for_window(&db, START, END, None).unwrap(),
+            (0.0, 0)
+        );
+    }
+
+    #[test]
+    fn priced_spend_event_time_floor_excludes_rows_before_the_floor() {
+        let (_dir, db) = test_db();
+        let floor = START + 1000;
+        // Before the floor (the storm guard: pre-launch / recovered spend).
+        insert_request(
+            &db,
+            Some("s"),
+            START + 500,
+            Some(5.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        // Before the floor and unpriced: must not count toward unpriced either.
+        insert_request(
+            &db,
+            Some("s"),
+            START + 600,
+            None,
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        // At the floor (inclusive) and after: counted.
+        insert_request(
+            &db,
+            Some("s"),
+            floor,
+            Some(1.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        insert_request(
+            &db,
+            Some("s"),
+            floor + 50,
+            Some(2.0),
+            (1, 0, 0, 0),
+            "api_request",
+        );
+        insert_request(
+            &db,
+            Some("s"),
+            floor + 60,
+            None,
+            (1, 0, 0, 0),
+            "api_request",
+        );
+
+        let (sum, unpriced) = priced_spend_for_window(&db, START, END, Some(floor)).unwrap();
+        assert_eq!(sum, 3.0, "only spend at/after the floor counts");
+        assert_eq!(unpriced, 1, "only unpriced rows at/after the floor count");
+
+        // No floor sees everything in the window.
+        let (sum_all, unpriced_all) = priced_spend_for_window(&db, START, END, None).unwrap();
+        assert_eq!(sum_all, 8.0);
+        assert_eq!(unpriced_all, 2);
     }
 
     // ---- performance (popover <100ms budget, NFR) ----

@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{Emitter, Manager};
 
+pub mod alerts;
 pub mod autostart;
 pub mod backfill;
 pub mod budgets;
@@ -10,6 +11,7 @@ pub mod db;
 pub mod health;
 pub mod ingest;
 pub mod metrics;
+pub mod notify;
 pub mod onboarding;
 pub mod pricing;
 pub mod queries;
@@ -33,6 +35,9 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // Native desktop notifications for cost alerts (notify.rs). Driven
+        // from Rust via NotificationExt; display-only (no click handlers).
+        .plugin(tauri_plugin_notification::init())
         // Anchors the popover window to the tray icon (tray.rs feeds it the
         // tray events it positions against).
         .plugin(tauri_plugin_positioner::init())
@@ -76,6 +81,14 @@ pub fn run() {
             // Loaded from the same DB handle, defaulting on any read error.
             app.manage(budgets::BudgetState::load(Arc::clone(&database)));
 
+            // Cost-alert config + runtime (cost-notifications plan): persisted
+            // as JSON in `meta`, cached in memory. `load` also captures
+            // `process_start_ms` (wall clock) so burst/delta can floor their
+            // spend queries on launch and never fire on recovered pre-launch
+            // spend. The engine (later units) reads/writes this under its own
+            // eval lock; nothing here triggers an evaluation yet.
+            app.manage(alerts::AlertState::load(Arc::clone(&database)));
+
             // Ingest pipeline state: shared DB handle + counters, queryable
             // via `ingest_stats` (health view, task 2.5). The receiver
             // consults the shared pause flag per request, and pushes a
@@ -89,6 +102,25 @@ pub fn run() {
                     // Tray title tracks today's cost; updated Rust-side so
                     // it never round-trips through the webview.
                     tray_title::refresh(&ingest_app);
+                    // Burst/delta evaluation off the live ingest path, debounced
+                    // to >=5s: a runaway agent loop emits many exports/sec, and
+                    // an unthrottled eval would serialize a windowed spend query
+                    // behind every write (and contend with a backfill-held DB
+                    // lock). The debounce gate is checked first, before the eval
+                    // lock, so a coalesced-out ingest never queues. The eval
+                    // itself runs on a blocking task (it locks the DB for two
+                    // windowed reads + a runtime persist) so it can't stall the
+                    // receiver thread that drives this callback. The spawned task
+                    // owns its own AppHandle clone (Send+Sync+Clone).
+                    if let Some(alert_state) = ingest_app.try_state::<alerts::AlertState>() {
+                        let now_ms = chrono::Local::now().timestamp_millis();
+                        if alert_state.should_run_ingest_eval(now_ms) {
+                            // spawn_eval applies the in-flight guard (one task at
+                            // a time across all triggers) before submitting to the
+                            // thread pool.
+                            alerts::spawn_eval(&ingest_app);
+                        }
+                    }
                 }));
             app.manage(ingest_state.clone());
 
@@ -120,6 +152,11 @@ pub fn run() {
                 // The pass may have recovered rows from today; reflect them
                 // in the tray title.
                 tray_title::refresh(&backfill_app);
+                // …and may have recovered a chunk of this month's pre-launch
+                // spend: re-baseline the delta ladder to the current MTD step
+                // silently so the next live eval only fires on post-launch
+                // growth, never a retroactive flood of passed milestones.
+                alerts::rebaseline_delta_now(&backfill_app);
             });
 
             // OTLP receiver on 127.0.0.1:43177. A port conflict is recorded
@@ -148,6 +185,16 @@ pub fn run() {
                     // Nudge the popover to re-query so its day window rolls
                     // over at local midnight even with no live ingest.
                     let _ = tick_app.emit("metrics:tick", ());
+                    // Coarse re-evaluation each minute, undebounced: catches the
+                    // delta month-rollover (state-derived from Local::now(), no
+                    // midnight alarm) and re-checks notification permission so a
+                    // revoke surfaces as `permission_lost` even on an idle app
+                    // (no ingest to trigger it). The query is the same cheap
+                    // index-only scan; runs on a blocking task so it never holds
+                    // up the tick.
+                    // spawn_eval applies the in-flight guard so a slow
+                    // backfill-held eval cannot queue unbounded tick tasks.
+                    alerts::spawn_eval(&tick_app);
                 }
             });
             Ok(())
@@ -170,6 +217,12 @@ pub fn run() {
             queries::home_dir,
             capture::capture_status,
             capture::capture_set_paused,
+            notify::notification_permission_state,
+            notify::notification_request_permission,
+            notify::notification_send_test,
+            alerts::alert_config_get,
+            alerts::alert_config_set,
+            alerts::alert_runtime_get,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,

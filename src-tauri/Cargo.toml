@@ -31,6 +31,11 @@ tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 # Login-item registration. macOS launcher mode is LaunchAgent (per PRD):
 # enable() writes ~/Library/LaunchAgents/<app>.plist, disable() removes it.
 tauri-plugin-autostart = "2"
+# Native desktop notifications (notify.rs): permission-gated cost alerts.
+# Driven from Rust via NotificationExt; display-only (no click/action
+# handlers — those are mobile-only in Tauri 2). Desktop sound landed in
+# 2.3.1, so pin "2.3".
+tauri-plugin-notification = "2.3"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: the settings.json merge engine (settings_merge.rs) rewrites
 # the user's ~/.claude/settings.json and must keep their key order stable so
