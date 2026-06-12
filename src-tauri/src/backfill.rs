@@ -204,9 +204,14 @@ pub async fn backfill_run<R: tauri::Runtime>(
     let pricing = pricing.inner().clone();
     let state = state.inner().clone();
     let root = projects_root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || run_manual(&db, &pricing, &state, &root))
-        .await
-        .map_err(|err| format!("backfill task failed: {err}"))?
+    let summary =
+        tauri::async_runtime::spawn_blocking(move || run_manual(&db, &pricing, &state, &root))
+            .await
+            .map_err(|err| format!("backfill task failed: {err}"))??;
+    // The pass may have recovered rows from today; reflect them in the
+    // tray title.
+    crate::tray_title::refresh(&app);
+    Ok(summary)
 }
 
 /// The pass itself, without state bookkeeping. A missing root (fresh
