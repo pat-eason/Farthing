@@ -120,14 +120,15 @@ pub async fn serve_on(addr: SocketAddr, status: SharedStatus, ingest: IngestStat
         .unwrap_or(addr.port());
     set_status(&status, ReceiverStatus::Listening { port });
 
-    if let Err(err) = axum::serve(listener, router(ingest)).await {
-        set_status(
-            &status,
-            ReceiverStatus::Failed {
-                message: format!("server stopped: {err}"),
-            },
-        );
-    }
+    // The serve loop never finishes in normal operation (there is no
+    // graceful-shutdown path); if it returns at all the receiver is dead
+    // mid-run and the status must say so, never keep claiming Listening
+    // (the health view turns this into "relaunch the app", task 6.4).
+    let message = match axum::serve(listener, router(ingest)).await {
+        Err(err) => format!("server stopped: {err}"),
+        Ok(()) => "server stopped unexpectedly".to_string(),
+    };
+    set_status(&status, ReceiverStatus::Failed { message });
 }
 
 fn set_status(status: &SharedStatus, next: ReceiverStatus) {

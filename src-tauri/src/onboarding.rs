@@ -23,7 +23,8 @@ use similar::{ChangeTag, TextDiff};
 use tauri::Manager;
 
 use crate::settings_merge::{
-    apply_merge, detect_conflicts, is_installed, merge_file, read_settings, ApplyOutcome, Conflict,
+    apply_merge, describe_settings_error, detect_conflicts, is_installed, merge_file,
+    read_settings, ApplyOutcome, Conflict,
 };
 
 /// Dev/test override for the settings file location. Never set in
@@ -84,8 +85,10 @@ pub struct OnboardingStatus {
 /// Errors (malformed JSON, unexpected shapes, IO) come back as display
 /// strings for the UI; the merge engine guarantees those cases never write.
 pub fn compute_status(settings_path: &Path) -> Result<OnboardingStatus, String> {
-    let current = read_settings(settings_path).map_err(|err| err.to_string())?;
-    let merged = apply_merge(&current).map_err(|err| err.to_string())?;
+    let current =
+        read_settings(settings_path).map_err(|err| describe_settings_error(&err, settings_path))?;
+    let merged =
+        apply_merge(&current).map_err(|err| describe_settings_error(&err, settings_path))?;
 
     let before = render(&current);
     let after = render(&merged);
@@ -111,7 +114,8 @@ pub fn apply(
     backup_dir: &Path,
     acknowledge_conflicts: bool,
 ) -> Result<ApplyOutcome, String> {
-    let current = read_settings(settings_path).map_err(|err| err.to_string())?;
+    let current =
+        read_settings(settings_path).map_err(|err| describe_settings_error(&err, settings_path))?;
     let conflicts = detect_conflicts(&current);
     if !conflicts.is_empty() && !acknowledge_conflicts {
         return Err(format!(
@@ -119,7 +123,8 @@ pub fn apply(
             conflicts.len()
         ));
     }
-    merge_file(settings_path, backup_dir).map_err(|err| err.to_string())
+    merge_file(settings_path, backup_dir)
+        .map_err(|err| describe_settings_error(&err, settings_path))
 }
 
 /// Pretty-print a settings map exactly as the merge engine writes it
