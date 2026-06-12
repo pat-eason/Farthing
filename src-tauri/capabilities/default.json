@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capability for the main and popover windows",
   "windows": ["main", "popover"],
-  "permissions": ["core:default", "opener:default", "notification:default"]
+  "permissions": ["core:default", "opener:default", "dialog:allow-save", "notification:default"]
 }

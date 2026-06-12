@@ -7,6 +7,7 @@ pub mod autostart;
 pub mod backfill;
 pub mod capture;
 pub mod db;
+pub mod export;
 pub mod health;
 pub mod ingest;
 pub mod metrics;
@@ -26,14 +27,17 @@ pub mod uninstall;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Native save dialog for the report-export destination (export.rs).
+        .plugin(tauri_plugin_dialog::init())
         // LaunchAgent mode per PRD; enabled during onboarding, toggleable
         // on the settings view (autostart.rs).
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        // Native desktop notifications for cost alerts (notify.rs). Driven
-        // from Rust via NotificationExt; display-only (no click handlers).
+        // Native desktop notifications, driven from Rust via NotificationExt
+        // (display-only, gated by notification:default): cost alerts (notify.rs)
+        // and slow/background export completion (export.rs).
         .plugin(tauri_plugin_notification::init())
         // Anchors the popover window to the tray icon (tray.rs feeds it the
         // tray events it positions against).
@@ -66,6 +70,9 @@ pub fn run() {
             };
             let database = Arc::new(Mutex::new(db::Db::open_in_dir(&data_dir)?));
             app.manage(db::DbState(Arc::clone(&database)));
+            // Data dir for the read-only export connection (export.rs); see
+            // db::DbPath. Reads a WAL snapshot without the shared DbState lock.
+            app.manage(db::DbPath(data_dir.clone()));
 
             // Capture pause/resume (task 4.4): persisted in `meta`, so a
             // paused app stays paused across restarts. Loaded before the
@@ -204,6 +211,8 @@ pub fn run() {
             queries::session_detail,
             queries::project_rollups,
             queries::home_dir,
+            export::export,
+            export::notify_export_done,
             capture::capture_status,
             capture::capture_set_paused,
             notify::notification_permission_state,

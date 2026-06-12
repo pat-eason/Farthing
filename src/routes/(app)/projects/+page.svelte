@@ -11,11 +11,21 @@
     getProjectRollups,
     getUsageSummary,
     toFacets,
+    type Facets,
     type ProjectRollup,
     type UsageSummary,
   } from "$lib/queries";
   import { facets, UNKNOWN_PROJECT_OPTION } from "$lib/facets.svelte";
-  import { cleanPath, formatCost, formatTokens, projectName } from "$lib/format";
+  import { cleanPath, formatCost, formatDate, formatTokens, projectName } from "$lib/format";
+  import { page } from "$app/state";
+  import { isExporting, runExport, type PreparedExport } from "$lib/export.svelte";
+  import {
+    buildReportHtml,
+    buildSummaryCsv,
+    type AggregatedCsv,
+    type ReportFilter,
+    type ReportTotals,
+  } from "$lib/report/buildReport";
 
   let rows: ProjectRollup[] | undefined = $state();
   let summary: UsageSummary | undefined = $state();
@@ -103,18 +113,158 @@
     if (pageCost <= 0) return null;
     return row.cost_usd / pageCost;
   }
+
+  // ---- export (R1/R2/R4/R17) ----
+  //
+  // Projects is a TABLE report (no chart). The on-screen cost-share bar is a
+  // pure visual of `cost_usd / Σ cost`; the shared report table escapes every
+  // cell (the stored-XSS contract in buildReport.ts), so the share is carried
+  // as a "Share of cost" percentage column — the same datapoint the on-screen
+  // bar encodes — rather than injecting raw bar markup into a table cell. The
+  // project rollups are already the full set (cost-descending, no paging), so
+  // the aggregated CSV = the rollups verbatim (R17).
+
+  /** Share-of-cost over a fixed total (the consistent read's Σ cost), so the
+   * exported share reconciles against the report's totals band rather than the
+   * possibly-stale page total. Returns "" when the total is zero. */
+  function shareString(row: ProjectRollup, totalCost: number): string {
+    if (totalCost <= 0) return "";
+    return `${((row.cost_usd / totalCost) * 100).toFixed(1)}%`;
+  }
+
+  /** Identity-header filter chips (R6): source, model where they differ from
+   * the defaults. The project facet is intentionally omitted — the projects
+   * view exports the per-project breakdown, so a single-project filter would
+   * be self-contradictory; the active project still scopes the rows. */
+  function reportFilters(snapFacets: Facets): ReportFilter[] {
+    const filters: ReportFilter[] = [];
+    if (snapFacets.query_source && snapFacets.query_source !== "all") {
+      filters.push({ label: "Source", value: snapFacets.query_source });
+    }
+    const project = snapFacets.project;
+    if (project === "unknown") {
+      filters.push({ label: "Project", value: "(unknown)" });
+    } else if (project && typeof project === "object") {
+      filters.push({ label: "Project", value: projectName(project.cwd) });
+    }
+    if (snapFacets.model) {
+      filters.push({ label: "Model", value: snapFacets.model });
+    }
+    return filters;
+  }
+
+  /** Aggregated CSV/table datapoints (R7/R17): one row per project rollup,
+   * cost-descending (the query order), with the cost-share column. */
+  function aggregatedFromRollups(
+    all: ProjectRollup[],
+    homeDir: string | null,
+    totalCost: number
+  ): AggregatedCsv {
+    return {
+      columns: ["Project", "Path", "Sessions", "Requests", "Tokens", "Cost (USD)", "Share of cost"],
+      rows: all.map((row) => [
+        projectName(row.cwd),
+        row.cwd === null ? "" : cleanPath(row.cwd, homeDir),
+        String(row.sessions),
+        String(row.requests),
+        String(totalTokens(row)),
+        String(row.cost_usd),
+        shareString(row, totalCost),
+      ]),
+    };
+  }
+
+  /** Reconciliation totals for the report (R9): from the consistent read. */
+  function reportTotals(s: UsageSummary): ReportTotals {
+    return {
+      costUsd: s.cost_usd,
+      requests: s.requests,
+      unpricedRequests: s.unpriced_requests,
+      errors: s.errors,
+      inputTokens: s.input_tokens,
+      outputTokens: s.output_tokens,
+      cacheReadTokens: s.cache_read_tokens,
+      cacheCreationTokens: s.cache_creation_tokens,
+    };
+  }
+
+  function windowLabel(s: UsageSummary): string {
+    if (s.start_ms === null || s.end_ms === null) return "All time";
+    return `${formatDate(s.start_ms)} – ${formatDate(s.end_ms - 1)}`;
+  }
+
+  function onExport(): void {
+    // Synchronous snapshot (R2/R4): capture facets + the originating route
+    // before any await. Projects has no per-view toggle to snapshot; rows are
+    // always cost-descending.
+    const snapFacets = toFacets(facets);
+    const snapHome = home;
+    const originRoute = page.url.pathname;
+
+    void runExport({
+      view: "projects",
+      facets: snapFacets,
+      originRoute,
+      prepare: async (): Promise<PreparedExport> => {
+        // Consistent point-in-time read (R9): summary for counts/totals + the
+        // full project rollups, not the view's loaded `$state`.
+        const [snapSummary, snapRows] = await Promise.all([
+          getUsageSummary(snapFacets),
+          getProjectRollups(snapFacets),
+        ]);
+
+        if (snapSummary.requests === 0 && snapSummary.errors === 0) {
+          return {
+            requests: 0,
+            errors: 0,
+            reportHtml: "",
+            summaryCsv: "",
+            excludeSessionless: false,
+          };
+        }
+
+        const aggregated = aggregatedFromRollups(snapRows, snapHome, snapSummary.cost_usd);
+        const reportHtml = buildReportHtml({
+          title: "Projects",
+          rangeLabel: windowLabel(snapSummary),
+          filters: reportFilters(snapFacets),
+          totals: reportTotals(snapSummary),
+          aggregated,
+          generatedAtMs: Date.now(),
+        });
+
+        return {
+          requests: snapSummary.requests,
+          errors: snapSummary.errors,
+          reportHtml,
+          summaryCsv: buildSummaryCsv(aggregated),
+          excludeSessionless: false,
+        };
+      },
+    });
+  }
 </script>
 
 <div class="projects-view">
   <header class="view-header">
     <h1>Projects</h1>
-    {#if summary && rows}
-      <span class="muted header-stats">
-        {rows.length} project{rows.length === 1 ? "" : "s"} ·
-        {summary.sessions} session{summary.sessions === 1 ? "" : "s"} ·
-        {formatCost(summary.cost_usd)} API-equivalent
-      </span>
-    {/if}
+    <div class="header-actions">
+      {#if summary && rows}
+        <span class="muted header-stats">
+          {rows.length} project{rows.length === 1 ? "" : "s"} ·
+          {summary.sessions} session{summary.sessions === 1 ? "" : "s"} ·
+          {formatCost(summary.cost_usd)} API-equivalent
+        </span>
+      {/if}
+      <button
+        type="button"
+        class="export-button"
+        onclick={onExport}
+        disabled={isExporting() || loading}
+      >
+        Export
+      </button>
+    </div>
   </header>
 
   {#if summary && summary.unpriced_requests > 0}
@@ -257,6 +407,35 @@
 
   .header-stats {
     font-size: 0.82rem;
+  }
+
+  .header-actions {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.7rem;
+  }
+
+  .export-button {
+    appearance: none;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    border-radius: 6px;
+    margin: 0;
+    padding: 0.25rem 0.85rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: #1c1c1e;
+    background: #fff;
+    cursor: pointer;
+    align-self: center;
+  }
+
+  .export-button:hover:not(:disabled) {
+    background: #f2f2f4;
+  }
+
+  .export-button:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   .stale {
@@ -423,6 +602,16 @@
 
     .error {
       color: #ffa198;
+    }
+
+    .export-button {
+      color: #e7e7ea;
+      background: #2a2a2c;
+      border-color: rgba(255, 255, 255, 0.22);
+    }
+
+    .export-button:hover:not(:disabled) {
+      background: #333335;
     }
 
     .table-card {
