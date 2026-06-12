@@ -12,7 +12,7 @@
 //! run against temp dirs; the `#[tauri::command]` wrappers resolve the real
 //! `~/.claude/settings.json` and the app-data backups dir. For development
 //! the settings path can be overridden with the
-//! `CLAUDE_USAGE_TRACKER_SETTINGS_PATH` env var so the flow can be exercised
+//! `FARTHING_SETTINGS_PATH` env var so the flow can be exercised
 //! against a scratch file instead of the real one.
 
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ use crate::settings_merge::{
 
 /// Dev/test override for the settings file location. Never set in
 /// production; the real path is `~/.claude/settings.json`.
-pub const SETTINGS_PATH_ENV: &str = "CLAUDE_USAGE_TRACKER_SETTINGS_PATH";
+pub const SETTINGS_PATH_ENV: &str = "FARTHING_SETTINGS_PATH";
 
 /// One line of the before/after diff shown on the preview screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

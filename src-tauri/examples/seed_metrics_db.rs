@@ -16,12 +16,12 @@
 //!
 //! ```sh
 //! cargo run --release --example seed_metrics_db -- /tmp/seeded-data 1000000
-//! CLAUDE_USAGE_TRACKER_DATA_DIR=/tmp/seeded-data pnpm tauri dev
+//! FARTHING_DATA_DIR=/tmp/seeded-data pnpm tauri dev
 //! ```
 
-use claude_usage_tracker_lib::db::Db;
-use claude_usage_tracker_lib::metrics;
-use claude_usage_tracker_lib::queries::{
+use farthing_lib::db::Db;
+use farthing_lib::metrics;
+use farthing_lib::queries::{
     self, Facets, ProjectFacet, QuerySourceFacet, RangeFacet, SeriesGroupBy, SessionSort,
 };
 

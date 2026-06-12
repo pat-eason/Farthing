@@ -1,4 +1,4 @@
-# PRD: Claude Usage Tracker (working name)
+# PRD: Farthing
 
 > **Author:** Pat Eason
 > **Created:** 2026-06-11
@@ -149,7 +149,7 @@ Key insight from design: Claude Code hooks do **not** carry token/cost data (ver
 | User already runs an OTel collector / has telemetry env set | Medium | Conflict detection in onboarding; fixed non-standard port (43177); explicit user choice, never silent overwrite |
 | Pricing table staleness (backfill cost wrong for new models) | Low | Bundled table + fail-silent remote refresh (pinned LiteLLM URL); "unknown model" rows flagged with tokens-only display; OTel rows unaffected (cost_usd comes from Claude Code) |
 | `cost_usd` semantics for subscription users | Low | Label as "API-equivalent spend" throughout the UI |
-| Project name | Low | "farthing" is a working name; pick a real name before public release (avoid collision with ccusage/CCSeva) |
+| Project name | Low | Resolved 2026-06-12: renamed **Farthing** (collision-checked in `docs/notes/naming.md`; avoids the ccusage/CCSeva collision class) |
 | Tokens-in attribution: per-request `input_tokens` includes full conversation prefix; cache fields dominate | Low | Surface cache_read separately and define "tokens in" precisely in UI copy/docs |
 
 ## Timeline / Milestones

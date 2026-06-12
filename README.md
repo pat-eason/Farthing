@@ -1,8 +1,8 @@
-# Claude Usage Tracker (working name)
+# Farthing
+
+> Keeps count of every farthing of your Claude Code spend.
 
 A macOS menu bar app that makes Claude Code token and dollar usage visible with **zero manual configuration**. Install it, click "Set up" once, and every Claude Code session on your machine starts reporting per-request usage: cost, tokens (input/output/cache read/cache creation), model, project, and session, surfaced through a menu bar popover and a full desktop UI.
-
-> The name is a working name; a rename (working default: **BarTab**) is planned before the public v1.0 release. See [docs/notes/naming.md](docs/notes/naming.md).
 
 ## What it does
 

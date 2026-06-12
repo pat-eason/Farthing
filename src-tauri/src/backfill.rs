@@ -74,7 +74,7 @@ use crate::transcript::{self, AssistantUsage, ParseStats};
 
 /// Env override for the transcripts root (dev/testing); production resolves
 /// `~/.claude/projects` via [`projects_root`].
-pub const PROJECTS_DIR_ENV: &str = "CLAUDE_USAGE_TRACKER_PROJECTS_DIR";
+pub const PROJECTS_DIR_ENV: &str = "FARTHING_PROJECTS_DIR";
 
 /// Outcome of one backfill pass, surfaced by `backfill_status` and the 3.5
 /// diff report.

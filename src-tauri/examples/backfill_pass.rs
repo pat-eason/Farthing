@@ -11,9 +11,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use claude_usage_tracker_lib::backfill::{run_pass, BackfillState, BackfillSummary};
-use claude_usage_tracker_lib::db::Db;
-use claude_usage_tracker_lib::pricing::{PricingState, PricingTable};
+use farthing_lib::backfill::{run_pass, BackfillState, BackfillSummary};
+use farthing_lib::db::Db;
+use farthing_lib::pricing::{PricingState, PricingTable};
 
 fn main() {
     let mut args = std::env::args().skip(1);

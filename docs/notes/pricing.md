@@ -14,9 +14,9 @@ Pinned URL: `https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices
 
 ## Bundled snapshot provenance
 
-Generated from LiteLLM `model_prices_and_context_window.json` at commit `3b40ac987fb4fe08061b67dda91b286dc41bee28` (2026-06-10), filtered to `litellm_provider == "anthropic"` + key starts with `claude`, cost fields only. 22 models; covers every model observed in the local transcript corpus (`claude-opus-4-8`, `claude-opus-4-7`, `claude-haiku-4-5-20251001`, `claude-fable-5`, `claude-sonnet-4-6`) plus the claude-3/4/4.5 generations. Versioning lives in the file's `_claude_usage_tracker` entry (`schema`, `snapshot_commit`, `snapshot_date`).
+Generated from LiteLLM `model_prices_and_context_window.json` at commit `3b40ac987fb4fe08061b67dda91b286dc41bee28` (2026-06-10), filtered to `litellm_provider == "anthropic"` + key starts with `claude`, cost fields only. 22 models; covers every model observed in the local transcript corpus (`claude-opus-4-8`, `claude-opus-4-7`, `claude-haiku-4-5-20251001`, `claude-fable-5`, `claude-sonnet-4-6`) plus the claude-3/4/4.5 generations. Versioning lives in the file's `_farthing` entry (`schema`, `snapshot_commit`, `snapshot_date`).
 
-To regenerate: fetch the URL above, apply the same filter keeping `litellm_provider`, `input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost`, `cache_creation_input_token_cost`, `cache_creation_input_token_cost_above_1hr`, and update the `_claude_usage_tracker` provenance entry. The file is prettier-ignored (byte-exact generator output).
+To regenerate: fetch the URL above, apply the same filter keeping `litellm_provider`, `input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost`, `cache_creation_input_token_cost`, `cache_creation_input_token_cost_above_1hr`, and update the `_farthing` provenance entry. The file is prettier-ignored (byte-exact generator output).
 
 ## Cost formula
 

@@ -6,7 +6,7 @@
 //! cargo run --example refresh_pricing
 //! ```
 
-use claude_usage_tracker_lib::pricing;
+use farthing_lib::pricing;
 
 fn main() {
     let rt = tokio::runtime::Builder::new_current_thread()
