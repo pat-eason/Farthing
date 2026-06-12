@@ -60,15 +60,31 @@ pub fn format_title(cost_usd: f64, paused: bool) -> String {
 /// (U+FE0E) so macOS renders the flat glyph, not the colored emoji.
 const WARN_PREFIX: &str = "⚠\u{FE0E} ";
 
+/// Pipe separating the cost from the budget readout (` | `).
+const BUDGET_SEPARATOR: &str = " | ";
+
+/// Stoplight dot for a band. Colored emoji circles render in color in the
+/// menu bar (a plain-string approximation of a status dot — no native
+/// attributed-string tinting needed): green / yellow / orange / red.
+fn band_dot(band: crate::budgets::Band) -> &'static str {
+    use crate::budgets::Band;
+    match band {
+        Band::Green => "🟢",
+        Band::Yellow => "🟡",
+        Band::Amber => "🟠",
+        Band::Red => "🔴",
+    }
+}
+
 /// Render the tray title with the optional budget readout folded in.
 ///
 /// Starts from [`format_title`] (cost + pause badge). When `status` is
 /// present and `show_in_tray` is set with at least one budget line, appends
-/// the budget percents separated from the cost by two spaces, each as
-/// `D {pct}%` / `M {pct}%` (daily before monthly, only the present ones).
-/// Independently, when the worst band is Amber or Red, prepends the
-/// monochrome warning glyph — even with `show_in_tray` off. With no status,
-/// or nothing extra to show, returns the plain title unchanged.
+/// ` | ` then each budget as `{dot} D {pct}%` / `{dot} M {pct}%` (daily
+/// before monthly, only the present ones), where `{dot}` is the band's
+/// stoplight glyph. Independently, when the worst band is Amber or Red,
+/// prepends the monochrome warning glyph — even with `show_in_tray` off.
+/// With no status, or nothing extra to show, returns the plain title.
 pub fn format_budget_title(
     cost_usd: f64,
     paused: bool,
@@ -83,13 +99,13 @@ pub fn format_budget_title(
 
     let warn = matches!(status.worst_band, Band::Amber | Band::Red);
 
-    let mut percents: Vec<String> = Vec::new();
+    let mut budgets: Vec<String> = Vec::new();
     if status.show_in_tray {
         if let Some(daily) = status.daily.as_ref() {
-            percents.push(format!("D {}%", daily.percent));
+            budgets.push(format!("{} D {}%", band_dot(daily.band), daily.percent));
         }
         if let Some(monthly) = status.monthly.as_ref() {
-            percents.push(format!("M {}%", monthly.percent));
+            budgets.push(format!("{} M {}%", band_dot(monthly.band), monthly.percent));
         }
     }
 
@@ -98,9 +114,9 @@ pub fn format_budget_title(
         title.push_str(WARN_PREFIX);
     }
     title.push_str(&base);
-    if !percents.is_empty() {
-        title.push_str("  ");
-        title.push_str(&percents.join(" "));
+    if !budgets.is_empty() {
+        title.push_str(BUDGET_SEPARATOR);
+        title.push_str(&budgets.join("  "));
     }
     title
 }
@@ -242,7 +258,7 @@ mod tests {
         );
         assert_eq!(
             format_budget_title(12.34, false, Some(&s)),
-            "$12.34  D 40% M 20%"
+            "$12.34 | 🟢 D 40%  🟢 M 20%"
         );
     }
 
@@ -256,7 +272,7 @@ mod tests {
         );
         assert_eq!(
             format_budget_title(12.34, false, Some(&s)),
-            "⚠\u{FE0E} $12.34  D 80% M 20%"
+            "⚠\u{FE0E} $12.34 | 🟠 D 80%  🟢 M 20%"
         );
     }
 
@@ -283,14 +299,17 @@ mod tests {
         );
         assert_eq!(
             format_budget_title(12.34, true, Some(&s)),
-            "⚠\u{FE0E} Paused · $12.34  D 95% M 20%"
+            "⚠\u{FE0E} Paused · $12.34 | 🟠 D 95%  🟢 M 20%"
         );
     }
 
     #[test]
     fn only_monthly_set_appends_just_monthly() {
         let s = status(None, Some(line(25, Band::Green)), true, Band::Green);
-        assert_eq!(format_budget_title(12.34, false, Some(&s)), "$12.34  M 25%");
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "$12.34 | 🟢 M 25%"
+        );
     }
 
     #[test]
