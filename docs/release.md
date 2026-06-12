@@ -2,9 +2,21 @@
 
 How a tagged release of this app gets built, signed, notarized, and published, and exactly what credentials a maintainer must configure to make that happen.
 
+## Versioning (Changesets)
+
+Versions are not bumped by hand. The flow is [Changesets](https://github.com/changesets/changesets)-driven, so the version stays in sync across all four files that must agree (`package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`) and the changelog writes itself.
+
+1. **Record the change.** With any user-facing PR, run `pnpm changeset`, pick the bump, write a one-line note, and commit the generated `.changeset/*.md` file.
+2. **Version PR.** On merge to `main`, `.github/workflows/version.yml` runs the [Changesets action](https://github.com/changesets/action). If changesets are pending, it opens (or updates) a **"Version Packages"** PR that runs `pnpm run version` -- `changeset version` bumps `package.json` and rewrites `CHANGELOG.md`, then `scripts/sync-version.mjs` fans the new version out to `tauri.conf.json`, `Cargo.toml`, and `Cargo.lock`.
+3. **Release.** When that PR merges, the bump lands on `main` with no changesets left. `version.yml` detects the version change (and that `v<version>` is not already tagged) and calls the reusable `release.yml` via `workflow_call`, which creates and pushes the `v<version>` tag and runs the pipeline below. No PAT is needed: the tag is created inside the release job rather than relied upon to trigger it.
+
+> **One-time repo setting:** Settings → Actions → General → Workflow permissions → enable **"Allow GitHub Actions to create and approve pull requests"** so the Version PR can be opened. Without it, `version.yml` fails when it tries to open the PR.
+
+To cut a release by hand instead (e.g. a hotfix), push a tag whose version matches `tauri.conf.json`: `git tag v0.2.0 && git push origin v0.2.0`. `release.yml` still gates on the version match.
+
 ## Pipeline overview
 
-`.github/workflows/release.yml` runs on any `v*` tag push (and on manual `workflow_dispatch` for dry runs without a tag):
+`.github/workflows/release.yml` runs on a `v*` tag push, on a `workflow_call` from `version.yml` (which passes the tag and creates it), or on manual `workflow_dispatch` (a build-only dry run with no tag and no release):
 
 1. Verifies the tag matches `version` in `src-tauri/tauri.conf.json` (tag `v0.1.0` requires version `0.1.0`).
 2. Builds a universal (arm64 + x86_64) macOS app via `pnpm tauri build --target universal-apple-darwin --bundles app,dmg`.
@@ -47,10 +59,15 @@ Alternative: Tauri also supports App Store Connect API keys (`APPLE_API_ISSUER`,
 
 ## Cutting a release
 
-1. Bump the version in all three places (they must agree): `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` (then `cargo build` once to refresh `Cargo.lock`).
-2. Commit, push, and wait for CI green.
-3. `git tag v0.1.0 && git push origin v0.1.0`.
-4. The Release workflow publishes the notarized `.dmg` (or a draft if credentials are missing).
+The normal path is automated (see [Versioning](#versioning-changesets)): land changesets, merge the Version PR, and the release cuts itself. The version bump touches all four files plus `CHANGELOG.md`; no manual edits.
+
+For a manual/hotfix release, bump the version (`pnpm changeset` + merge the Version PR, or edit `package.json` and run `node scripts/sync-version.mjs` so all four files agree), then push the matching tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The Release workflow publishes the notarized `.dmg` (or a draft if credentials are missing).
 
 ## Verifying a signed build locally
 
@@ -75,5 +92,6 @@ spctl --assess --type exec --verbose=2 "$APP"   # must report "accepted, source=
 
 ## Status / blockers
 
-- [ ] **Blocked on human**: no Apple Developer credentials exist yet. Add the six secrets above, push a tag, and confirm the `Verify notarization` step passes and the release publishes non-draft.
+- [ ] **Blocked on human**: no Apple Developer credentials exist yet. Add the six secrets above, push a tag, and confirm the `Verify notarization` step passes and the release publishes non-draft. Until then the automated flow still works end to end: it produces an unsigned `.dmg` and a **draft** release.
+- [ ] **One-time repo setting**: enable "Allow GitHub Actions to create and approve pull requests" (Settings → Actions → General) so `version.yml` can open the Version PR.
 - The rename to **Farthing** (see `docs/notes/naming.md`) landed 2026-06-12 (`productName: Farthing`, `identifier: com.peason.farthing`); the workflow finds the `.app`/`.dmg` by glob, so no `release.yml` edits were needed.
