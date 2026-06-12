@@ -36,9 +36,10 @@
   const INGEST_REFRESH_DEBOUNCE_MS = 200;
   const SPARKLINE_RANGES = [7, 30] as const;
 
-  /** Base popover window height (matches tauri.conf.json); the window grows
-   * past this to fit a tall budget section but never shrinks below it. */
-  const BASE_POPOVER_HEIGHT = 512;
+  /** Fixed popover width (matches tauri.conf.json). */
+  const POPOVER_WIDTH = 320;
+  /** Floor so a transient empty render can't collapse the window. */
+  const MIN_POPOVER_HEIGHT = 120;
 
   let metrics: TodayMetrics | undefined = $state();
   let dailyCosts: DailyCost[] | undefined = $state();
@@ -68,18 +69,25 @@
     } catch (err) {
       errorMessage = String(err);
     }
-    // Grow the popover window to fit its content (width stays 320) so a tall
-    // budget section is never clipped and the footer stays visible. Measured
-    // off the content element: `document`/viewport height is capped at the
-    // current window size, so it can never report that content overflows.
+    await tick();
+    void resizeToContent();
+  }
+
+  // Size the popover window to its content exactly (width stays 320). The
+  // window is non-resizable (tauri.conf.json), but on macOS setSize maps to
+  // NSWindow setContentSize:, which programmatic sizing honors regardless of
+  // the resizable style mask — so no min/max pinning is needed to both fit the
+  // content and keep the user from dragging the edges. Driven by a
+  // ResizeObserver (below) so late layout — the budget section appearing,
+  // fonts settling — always resizes after the fact. `.popover` is height:auto,
+  // so this measures the true content height (not the current window height).
+  async function resizeToContent() {
+    if (!popoverEl) return;
+    const h = Math.max(MIN_POPOVER_HEIGHT, Math.ceil(popoverEl.getBoundingClientRect().height));
     try {
-      await tick();
-      if (popoverEl) {
-        const h = Math.ceil(popoverEl.getBoundingClientRect().height);
-        await getCurrentWindow().setSize(new LogicalSize(320, Math.max(BASE_POPOVER_HEIGHT, h)));
-      }
+      await getCurrentWindow().setSize(new LogicalSize(POPOVER_WIDTH, h));
     } catch {
-      // Resizing is best-effort; ignore failures.
+      /* best-effort: a transient sizing failure self-corrects on the next refresh */
     }
   }
 
@@ -155,9 +163,18 @@
     const unlistenBudgetConfig = listen(BUDGET_CONFIG_CHANGED, () => void refresh());
     const unlistenMetricsTick = listen(METRICS_TICK_EVENT, () => void refresh());
 
+    // Keep the window sized to content across late layout (budget section
+    // appearing, font/metric loads) so the footer is never clipped.
+    let resizeObserver: ResizeObserver | undefined;
+    if (popoverEl) {
+      resizeObserver = new ResizeObserver(() => void resizeToContent());
+      resizeObserver.observe(popoverEl);
+    }
+
     return () => {
       window.removeEventListener("focus", onFocus);
       clearTimeout(ingestTimer);
+      resizeObserver?.disconnect();
       void unlistenIngested.then((unlisten) => unlisten());
       void unlistenPaused.then((unlisten) => unlisten());
       void unlistenBudgetConfig.then((unlisten) => unlisten());
@@ -331,9 +348,9 @@
 
   .popover {
     box-sizing: border-box;
-    /* At least fills the window (no transparent gap); grows taller when the
-       content needs it, and refresh() resizes the window to match. */
-    min-height: 100vh;
+    /* Sizes to its content; the window is then resized to match exactly
+       (resizeToContent), so there's no transparent gap and nothing clips. */
+    height: auto;
     padding: 0.9rem 1rem;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-size: 0.85rem;
