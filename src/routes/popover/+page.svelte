@@ -8,6 +8,8 @@
   // the capture pause state.
   import { tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { LogicalSize } from "@tauri-apps/api/dpi";
   import { getDailyCosts, getTodayMetrics, type DailyCost, type TodayMetrics } from "$lib/metrics";
   import {
     getCaptureStatus,
@@ -16,6 +18,13 @@
     PAUSED_CHANGED_EVENT,
     type CaptureStatus,
   } from "$lib/capture";
+  import {
+    getBudgetStatus,
+    BUDGET_CONFIG_CHANGED,
+    METRICS_TICK_EVENT,
+    type Band,
+    type BudgetStatus,
+  } from "$lib/budgets";
   import { openMainWindow } from "$lib/window";
   import { formatCost, formatTokens, projectName } from "$lib/format";
   // Same 128px downscale the sidebar uses; rendered at 18px here.
@@ -29,6 +38,7 @@
 
   let metrics: TodayMetrics | undefined = $state();
   let dailyCosts: DailyCost[] | undefined = $state();
+  let budgetStatus: BudgetStatus | undefined = $state();
   let sparklineDays: (typeof SPARKLINE_RANGES)[number] = $state(7);
   let paused = $state(false);
   let errorMessage = $state("");
@@ -37,6 +47,13 @@
 
   async function refresh(days: number = sparklineDays) {
     const started = performance.now();
+    // Budget status has its own try/catch so a budget query error never
+    // blanks the popover; on failure the section just hides.
+    try {
+      budgetStatus = await getBudgetStatus();
+    } catch {
+      budgetStatus = undefined;
+    }
     try {
       [metrics, dailyCosts] = await Promise.all([getTodayMetrics(), getDailyCosts(days)]);
       errorMessage = "";
@@ -45,6 +62,19 @@
     } catch (err) {
       errorMessage = String(err);
     }
+    // Grow the popover to fit its content (width stays 320). Ignore errors.
+    try {
+      await tick();
+      const h = Math.ceil(document.documentElement.scrollHeight);
+      await getCurrentWindow().setSize(new LogicalSize(320, Math.max(512, h)));
+    } catch {
+      // Resizing is best-effort; ignore failures.
+    }
+  }
+
+  /** Maps a band to its CSS class for bar fill + percent label. */
+  function bandClass(band: Band): string {
+    return `band-${band}`;
   }
 
   async function refreshPaused() {
@@ -109,12 +139,18 @@
     const unlistenPaused = listen<CaptureStatus>(PAUSED_CHANGED_EVENT, (event) => {
       paused = event.payload.paused;
     });
+    // Refetch budget status when config changes and on the coarse 60s tick
+    // (covers month rollover); live spend is already covered by INGESTED.
+    const unlistenBudgetConfig = listen(BUDGET_CONFIG_CHANGED, () => void refresh());
+    const unlistenMetricsTick = listen(METRICS_TICK_EVENT, () => void refresh());
 
     return () => {
       window.removeEventListener("focus", onFocus);
       clearTimeout(ingestTimer);
       void unlistenIngested.then((unlisten) => unlisten());
       void unlistenPaused.then((unlisten) => unlisten());
+      void unlistenBudgetConfig.then((unlisten) => unlisten());
+      void unlistenMetricsTick.then((unlisten) => unlisten());
     };
   });
 </script>
@@ -151,6 +187,49 @@
         {metrics.unpriced_requests} request{metrics.unpriced_requests === 1 ? "" : "s"} with unknown pricing
         excluded from cost (tokens counted).
       </p>
+    {/if}
+
+    {#if budgetStatus?.daily || budgetStatus?.monthly}
+      <section class="budgets">
+        {#each [{ label: "Daily budget", line: budgetStatus.daily }, { label: "Monthly budget", line: budgetStatus.monthly }] as entry (entry.label)}
+          {#if entry.line}
+            {@const line = entry.line}
+            <div class="budget-line">
+              <div class="budget-row-head">
+                <span class="budget-label">
+                  {#if line.band === "amber" || line.band === "red"}
+                    <span class="warn-glyph" aria-hidden="true">⚠</span>
+                  {/if}
+                  {entry.label}
+                </span>
+              </div>
+              <div class="budget-bar" class:exceeded={line.exceeded}>
+                <div
+                  class="budget-fill {line.exceeded ? 'band-red' : bandClass(line.band)}"
+                  style="width: {Math.min(line.percent, 100)}%"
+                ></div>
+              </div>
+              <div class="budget-amounts">
+                <span class="muted">
+                  {formatCost(line.spent_priced_usd)} / {formatCost(line.amount_usd)}
+                </span>
+                {#if line.exceeded}
+                  <span class="budget-percent exceeded">· {line.percent}%</span>
+                  <span class="exceeded-tag">Exceeded</span>
+                {:else}
+                  <span class="budget-percent">· {line.percent}%</span>
+                {/if}
+              </div>
+              {#if line.unpriced_requests > 0}
+                <p class="footnote">
+                  {line.unpriced_requests} request{line.unpriced_requests === 1 ? "" : "s"} with unknown
+                  pricing excluded
+                </p>
+              {/if}
+            </div>
+          {/if}
+        {/each}
+      </section>
     {/if}
 
     <section class="tokens">
@@ -342,6 +421,96 @@
     font-size: 0.75rem;
   }
 
+  .budgets {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin-top: 0.85rem;
+  }
+
+  .budget-line {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .budget-row-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .budget-label {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6b6b6b;
+  }
+
+  .warn-glyph {
+    color: #93530a;
+  }
+
+  .budget-bar {
+    height: 7px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.08);
+    overflow: hidden;
+  }
+
+  .budget-fill {
+    height: 100%;
+    border-radius: 4px;
+  }
+
+  .budget-fill.band-green {
+    background: rgba(26, 127, 55, 0.18);
+  }
+
+  .budget-fill.band-yellow {
+    background: rgba(180, 142, 10, 0.18);
+  }
+
+  .budget-fill.band-amber {
+    background: rgba(255, 159, 10, 0.18);
+  }
+
+  .budget-fill.band-red {
+    background: rgba(180, 35, 24, 0.18);
+  }
+
+  .budget-amounts {
+    display: flex;
+    align-items: baseline;
+    gap: 0.3rem;
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .budget-percent {
+    color: #6b6b6b;
+  }
+
+  .budget-percent.exceeded {
+    font-weight: 700;
+    color: #b42318;
+  }
+
+  .exceeded-tag {
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.05rem 0.3rem;
+    border-radius: 4px;
+    color: #b42318;
+    background: rgba(180, 35, 24, 0.14);
+  }
+
   .tokens {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -521,6 +690,44 @@
 
     .paused-badge {
       color: #ffb55c;
+    }
+
+    .budget-label,
+    .budget-percent {
+      color: #9b9b9f;
+    }
+
+    .warn-glyph {
+      color: #ffb55c;
+    }
+
+    .budget-bar {
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .budget-fill.band-green {
+      background: rgba(126, 231, 135, 0.22);
+    }
+
+    .budget-fill.band-yellow {
+      background: rgba(255, 181, 92, 0.22);
+    }
+
+    .budget-fill.band-amber {
+      background: rgba(255, 159, 10, 0.22);
+    }
+
+    .budget-fill.band-red {
+      background: rgba(255, 161, 152, 0.22);
+    }
+
+    .budget-percent.exceeded {
+      color: #ffa198;
+    }
+
+    .exceeded-tag {
+      color: #ffa198;
+      background: rgba(255, 161, 152, 0.2);
     }
 
     .resume-button {
