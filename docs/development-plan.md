@@ -2,7 +2,7 @@
 
 > **Generated from:** docs/prd.md
 > **Created:** 2026-06-11
-> **Last synced:** 2026-06-11
+> **Last synced:** 2026-06-12
 > **Status:** Active Planning Document
 > **VibeKanban Project ID:** [To be assigned]
 
@@ -23,25 +23,25 @@ A single open-source Tauri macOS app that makes Claude Code token/cost usage vis
 
 | Epic | Status | Progress |
 |------|--------|----------|
-| 1. Capture Pipeline | Not Started | 0% |
-| 2. Self-Install & Lifecycle | Not Started | 0% |
-| 3. Transcript Backfill | Not Started | 0% |
-| 4. Menu Bar UI | Not Started | 0% |
-| 5. Desktop UI | Not Started | 0% |
-| 6. OSS Release | Not Started | 0% |
+| 1. Capture Pipeline | Complete | 100% |
+| 2. Self-Install & Lifecycle | Complete | 100% |
+| 3. Transcript Backfill | Complete | 100% |
+| 4. Menu Bar UI | Complete | 100% |
+| 5. Desktop UI | Complete | 100% |
+| 6. OSS Release | In Progress | 70% |
 
 ---
 
-## Epic 1: Capture Pipeline (NOT STARTED)
+## Epic 1: Capture Pipeline (COMPLETE)
 
 Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLite schema, and the session→cwd mapping endpoint. Exit state: with manually-configured env vars, a real Claude Code session produces queryable rows in SQLite. No UI beyond a stub window.
 
 ### Acceptance Criteria
 
-- [ ] A real Claude Code session (manually configured to export OTLP) results in correct per-request rows in `usage.db`
-- [ ] Receiver binds `127.0.0.1:43177` only; non-loopback connections are rejected
-- [ ] `session_id → cwd` mappings are captured via `POST /session`
-- [ ] Unknown/extra fields in OTel payloads never crash ingestion (version-tolerant parsing)
+- [x] A real Claude Code session (manually configured to export OTLP) results in correct per-request rows in `usage.db`
+- [x] Receiver binds `127.0.0.1:43177` only; non-loopback connections are rejected
+- [x] `session_id → cwd` mappings are captured via `POST /session`
+- [x] Unknown/extra fields in OTel payloads never crash ingestion (version-tolerant parsing)
 
 ### Tasks
 
@@ -92,16 +92,16 @@ Foundation: Tauri scaffold, the embedded OTLP receiver, event parsing, the SQLit
 
 ---
 
-## Epic 2: Self-Install & Lifecycle (NOT STARTED)
+## Epic 2: Self-Install & Lifecycle (COMPLETE)
 
 The zero-config promise: safe settings.json merge/unmerge, onboarding with diff preview and conflict detection, LaunchAgent autostart, uninstall, and the health view. Highest-blast-radius epic — fixture tests are non-negotiable.
 
 ### Acceptance Criteria
 
 - [ ] Fresh machine: install app → click through onboarding → restart Claude Code session → data flows, with zero manual file edits
-- [ ] settings.json modifications are previewed, backed up, strictly additive to app-owned keys, and fully reversible
-- [ ] Pre-existing OTel/telemetry config is detected and never silently overwritten
-- [ ] Health view accurately reports receiver, config, and data-flow state
+- [x] settings.json modifications are previewed, backed up, strictly additive to app-owned keys, and fully reversible
+- [x] Pre-existing OTel/telemetry config is detected and never silently overwritten
+- [x] Health view accurately reports receiver, config, and data-flow state
 
 ### Tasks
 
@@ -143,16 +143,16 @@ The zero-config promise: safe settings.json merge/unmerge, onboarding with diff 
 
 ---
 
-## Epic 3: Transcript Backfill (NOT STARTED)
+## Epic 3: Transcript Backfill (COMPLETE)
 
 Day-one history and gap recovery: JSONL parsing, pricing, dedup against live rows, and incremental offset-based recovery. Starts with the dedup-identity spike flagged in the PRD review.
 
 ### Acceptance Criteria
 
-- [ ] First launch populates all available transcript history (up to ~30 days) with computed costs
-- [ ] Live OTel rows and backfilled rows never double-count the same activity
-- [ ] Sessions missed while the app was down (including their cwd mappings) are recovered on next start
-- [ ] Backfill diff report quantifies capture completeness (<1% missing target)
+- [x] First launch populates all available transcript history (up to ~30 days) with computed costs
+- [x] Live OTel rows and backfilled rows never double-count the same activity
+- [x] Sessions missed while the app was down (including their cwd mappings) are recovered on next start
+- [x] Backfill diff report quantifies capture completeness (<1% missing target)
 
 ### Tasks
 
@@ -194,16 +194,16 @@ Day-one history and gap recovery: JSONL parsing, pricing, dedup against live row
 
 ---
 
-## Epic 4: Menu Bar UI (NOT STARTED)
+## Epic 4: Menu Bar UI (COMPLETE)
 
 The daily-driver surface: tray icon, popover with today's metrics, sparkline, live updates, pause/resume.
 
 ### Acceptance Criteria
 
-- [ ] Popover shows today's cost, token split, session count, 7/30-day sparkline, top 3 projects — rendering in <100ms
-- [ ] Values update near-real-time (~5s) as events arrive
-- [ ] No Dock icon in menu-bar-only mode
-- [ ] Pause discards incoming events (200 + drop) with a visible paused badge
+- [x] Popover shows today's cost, token split, session count, 7/30-day sparkline, top 3 projects — rendering in <100ms
+- [x] Values update near-real-time (~5s) as events arrive
+- [x] No Dock icon in menu-bar-only mode
+- [x] Pause discards incoming events (200 + drop) with a visible paused badge
 
 ### Tasks
 
@@ -238,15 +238,15 @@ The daily-driver surface: tray icon, popover with today's metrics, sparkline, li
 
 ---
 
-## Epic 5: Desktop UI (NOT STARTED)
+## Epic 5: Desktop UI (COMPLETE)
 
 The analysis surface: faceted query layer and the four main views. Can develop against seeded fixture data in parallel with Epics 2–3.
 
 ### Acceptance Criteria
 
-- [ ] All four views (cost over time, sessions, tokens/cache, projects) functional with global facets: project, model, date range, query_source
-- [ ] Queries over ~1M rows return in <500ms
-- [ ] Cost consistently labeled API-equivalent; tokens-only rows (unknown pricing) handled visibly
+- [x] All four views (cost over time, sessions, tokens/cache, projects) functional with global facets: project, model, date range, query_source
+- [x] Queries over ~1M rows return in <500ms
+- [x] Cost consistently labeled API-equivalent; tokens-only rows (unknown pricing) handled visibly
 
 ### Tasks
 
@@ -293,7 +293,7 @@ The analysis surface: faceted query layer and the four main views. Can develop a
 
 ---
 
-## Epic 6: OSS Release (NOT STARTED)
+## Epic 6: OSS Release (IN PROGRESS)
 
 Public-readiness: naming, signing/notarization, CI releases, docs, final hardening, and the v1.0 cut.
 
@@ -301,7 +301,7 @@ Public-readiness: naming, signing/notarization, CI releases, docs, final hardeni
 
 - [ ] Notarized .dmg installs and passes Gatekeeper on a clean machine
 - [ ] Tagged release builds, signs, notarizes, and publishes via GitHub Actions
-- [ ] README/docs sufficient for a stranger to install, trust the settings.json behavior, and contribute
+- [x] README/docs sufficient for a stranger to install, trust the settings.json behavior, and contribute
 
 ### Tasks
 
