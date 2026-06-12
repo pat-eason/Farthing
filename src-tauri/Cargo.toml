@@ -20,7 +20,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # tray-icon: menu bar status item (tray.rs, task 4.1).
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# Pinned to ~2.11: the stacked menu-bar readout (tray_render.rs) reaches the
+# native NSStatusItem via `with_inner_tray_icon`, whose inner `tray-icon` type
+# can change across Tauri minor releases.
+tauri = { version = "~2.11", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 # Positions the popover window under the tray icon (multi-monitor and
 # scale-factor aware); fed by forwarding tray events in tray.rs.
@@ -45,6 +48,43 @@ similar = "2"
 # Local-midnight day boundaries for the popover metrics (metrics.rs): the
 # PRD defines "today" as the user's local calendar day, DST-correct.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Stacked menu-bar budget readout (tray_render.rs): drawn natively because the
+# layout (large centered cost + full-height pipe + two stacked rows with
+# trailing stoplight dots) can't be expressed through Tauri's plain set_title.
+# Reaches the NSStatusItem button via `with_inner_tray_icon` and draws an
+# NSImage. objc2* are already transitive via tauri/tray-icon; pinned to the
+# in-tree versions and declared directly here for the AppKit/Foundation APIs.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.4"
+objc2-foundation = { version = "=0.3.2", features = [
+    "NSString",
+    "NSAttributedString",
+    "NSDictionary",
+    "NSGeometry",
+    "NSData",
+] }
+objc2-app-kit = { version = "=0.3.2", features = [
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSButton",
+    "NSControl",
+    "NSView",
+    "NSResponder",
+    "NSImage",
+    "NSImageRep",
+    "NSBitmapImageRep",
+    "NSColor",
+    "NSFont",
+    "NSParagraphStyle",
+    "NSStringDrawing",
+    "NSBezierPath",
+    "NSGraphicsContext",
+    "NSGraphics",
+    "NSApplication",
+    "NSAppearance",
+    "NSAttributedString",
+] }
 
 
 [lints.clippy]

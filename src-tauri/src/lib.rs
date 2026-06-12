@@ -18,6 +18,8 @@ pub mod session;
 pub mod settings_merge;
 pub mod transcript;
 pub mod tray;
+#[cfg(target_os = "macos")]
+pub mod tray_render;
 pub mod tray_title;
 pub mod uninstall;
 

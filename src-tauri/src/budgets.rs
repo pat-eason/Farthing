@@ -127,9 +127,8 @@ impl BudgetState {
         clamp(&mut config.daily);
         clamp(&mut config.monthly);
 
-        let json = serde_json::to_string(&config).map_err(|err| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-        })?;
+        let json = serde_json::to_string(&config)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         {
             let db = self.db.lock().expect("db mutex poisoned");
             db.conn().execute(
@@ -516,7 +515,10 @@ mod tests {
         assert!(Band::Red > Band::Amber);
         assert!(Band::Amber > Band::Yellow);
         assert!(Band::Yellow > Band::Green);
-        assert_eq!([Band::Green, Band::Amber, Band::Yellow].iter().max(), Some(&Band::Amber));
+        assert_eq!(
+            [Band::Green, Band::Amber, Band::Yellow].iter().max(),
+            Some(&Band::Amber)
+        );
     }
 
     #[test]

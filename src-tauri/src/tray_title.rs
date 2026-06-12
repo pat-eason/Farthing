@@ -165,15 +165,107 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
         });
         (cost_usd, status)
     };
-    let title = format_budget_title(cost_usd, paused, status.as_ref());
-    let ui_app = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
-            // Always a non-empty string, so the macOS set_title(None)
-            // no-clear quirk (see task 4.4) can never bite here.
-            let _ = tray.set_title(Some(title.as_str()));
+    // macOS: when budgets show in the tray, draw the stacked readout as a
+    // status-button image (set_title can't stack); otherwise restore the bird
+    // icon and show the plain cost. Other platforms always use the title.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(model) = budget_render_model(cost_usd, paused, status.as_ref()) {
+            // Render off the title path: draw a PNG and install it via
+            // set_icon (which keeps tray-icon's click overlay sized to the
+            // button, so left-click still toggles the popover).
+            let fallback = format_budget_title(cost_usd, paused, status.as_ref());
+            let ui_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) else {
+                    return;
+                };
+                let png = objc2::MainThreadMarker::new()
+                    .and_then(|mtm| crate::tray_render::render_png(&model, mtm));
+                if let Some(img) =
+                    png.and_then(|bytes| tauri::image::Image::from_bytes(&bytes).ok())
+                {
+                    let _ = tray.set_icon_as_template(false);
+                    let _ = tray.set_icon(Some(img));
+                    // Cost lives in the drawn image; clear the text title.
+                    let _ = tray.set_title(Some(""));
+                    CUSTOM_IMAGE_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    // Rendering failed: degrade to the single-line title.
+                    let _ = tray.set_title(Some(fallback.as_str()));
+                }
+            });
+            return;
         }
-    });
+        // Plain mode: restore the bird template icon if a drawn image replaced
+        // it, then show the plain cost as the title.
+        let plain = format_title(cost_usd, paused);
+        let ui_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
+                if CUSTOM_IMAGE_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = tray.set_icon_as_template(true);
+                    let _ = tray.set_icon(Some(crate::tray::template_icon()));
+                }
+                let _ = tray.set_title(Some(plain.as_str()));
+            }
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let title = format_budget_title(cost_usd, paused, status.as_ref());
+        let ui_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
+                // Always a non-empty string, so the macOS set_title(None)
+                // no-clear quirk (see task 4.4) can never bite here.
+                let _ = tray.set_title(Some(title.as_str()));
+            }
+        });
+    }
+}
+
+/// True while the macOS status button shows a drawn budget image instead of
+/// the bird icon; lets [`refresh`] restore the icon on return to plain mode.
+#[cfg(target_os = "macos")]
+static CUSTOM_IMAGE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Build the stacked-readout model when budgets should show in the tray.
+/// `None` => plain mode (no budgets set, or the tray toggle is off).
+#[cfg(target_os = "macos")]
+fn budget_render_model(
+    cost_usd: f64,
+    paused: bool,
+    status: Option<&crate::budgets::BudgetStatus>,
+) -> Option<crate::tray_render::Model> {
+    let status = status?;
+    if !status.show_in_tray {
+        return None;
+    }
+    let mut rows = Vec::new();
+    if let Some(daily) = status.daily.as_ref() {
+        rows.push(crate::tray_render::Row {
+            marker: "D",
+            percent: daily.percent,
+            band: daily.band,
+        });
+    }
+    if let Some(monthly) = status.monthly.as_ref() {
+        rows.push(crate::tray_render::Row {
+            marker: "M",
+            percent: monthly.percent,
+            band: monthly.band,
+        });
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(crate::tray_render::Model {
+        cost: format_title(cost_usd, paused),
+        rows,
+    })
 }
 
 #[cfg(test)]
@@ -280,7 +372,10 @@ mod tests {
     fn warn_without_show_in_tray_drops_percents() {
         // Red worst band warns even with the tray readout off, but no percents.
         let s = status(Some(line(120, Band::Red)), None, false, Band::Red);
-        assert_eq!(format_budget_title(12.34, false, Some(&s)), "⚠\u{FE0E} $12.34");
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "⚠\u{FE0E} $12.34"
+        );
     }
 
     #[test]
@@ -315,7 +410,10 @@ mod tests {
     #[test]
     fn only_monthly_amber_tray_off_warns_without_percents() {
         let s = status(None, Some(line(80, Band::Amber)), false, Band::Amber);
-        assert_eq!(format_budget_title(12.34, false, Some(&s)), "⚠\u{FE0E} $12.34");
+        assert_eq!(
+            format_budget_title(12.34, false, Some(&s)),
+            "⚠\u{FE0E} $12.34"
+        );
     }
 
     // ---- today-cost query ----
