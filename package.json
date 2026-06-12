@@ -4,6 +4,7 @@
   "description": "Zero-config macOS menu bar app for Claude Code token/cost usage",
   "license": "MIT",
   "type": "module",
+  "private": true,
   "packageManager": "pnpm@10.19.0",
   "author": {
     "name": "Pat Eason",
@@ -22,7 +23,9 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "changeset": "changeset",
+    "version": "changeset version && node scripts/sync-version.mjs && prettier --write package.json CHANGELOG.md src-tauri/tauri.conf.json"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -34,6 +37,8 @@
     "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {
+    "@changesets/changelog-github": "^0.7.0",
+    "@changesets/cli": "^2.31.0",
     "@eslint/js": "^10.0.1",
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.9.0",

@@ -9,11 +9,24 @@ name: Release
 #   - no secrets        -> unsigned .dmg, release is created as a DRAFT
 #   - signing secrets   -> Developer ID signed .dmg
 #   - + notary secrets  -> notarized + stapled, Gatekeeper-verified, published
+#
+# Three ways in:
+#   - push a `v*` tag             -> builds and publishes that tag
+#   - workflow_call (tag input)   -> the Version workflow calls this after a
+#                                    "Version Packages" PR merges; this job
+#                                    creates and pushes the tag, then publishes
+#   - workflow_dispatch           -> build-only dry run, no tag, no release
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to create, build, and publish (e.g. v0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -34,6 +47,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Resolve the release tag and mode once: a `workflow_call` passes the tag
+      # as an input (the tag does not exist in git yet — we create it below);
+      # a tag push carries it on the ref; a manual dispatch has neither and is
+      # treated as a build-only dry run. `github.event_name` is unreliable here
+      # (a called workflow reports the caller's event), so key off inputs.tag
+      # and ref_type instead.
+      - name: Resolve release tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "RELEASE_TAG=${{ inputs.tag }}" >> "$GITHUB_ENV"
+            echo "RELEASE_MODE=call" >> "$GITHUB_ENV"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "RELEASE_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+            echo "RELEASE_MODE=tag" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=" >> "$GITHUB_ENV"
+            echo "RELEASE_MODE=dispatch" >> "$GITHUB_ENV"
+          fi
+
       - uses: pnpm/action-setup@v4
 
       - uses: actions/setup-node@v4
@@ -53,12 +85,12 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Verify tag matches app version
-        if: startsWith(github.ref, 'refs/tags/')
+        if: env.RELEASE_TAG != ''
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TAG_VERSION="${RELEASE_TAG#v}"
           APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           if [ "$TAG_VERSION" != "$APP_VERSION" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match tauri.conf.json version $APP_VERSION"
+            echo "::error::Tag $RELEASE_TAG does not match tauri.conf.json version $APP_VERSION"
             exit 1
           fi
 
@@ -126,8 +158,24 @@ jobs:
             checksums.txt
           if-no-files-found: error
 
+      # In call mode the tag does not exist yet: create it on the built commit
+      # and push it now so `gh release create --verify-tag` can find it. Pushing
+      # with GITHUB_TOKEN does not re-trigger the `push: tags` event (GitHub's
+      # anti-recursion rule), which is exactly what we want here.
+      - name: Create and push tag
+        if: env.RELEASE_MODE == 'call'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "Tag $RELEASE_TAG already exists; skipping create"
+          else
+            git tag "$RELEASE_TAG"
+          fi
+          git push origin "$RELEASE_TAG"
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: env.RELEASE_TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
           DMG: ${{ steps.artifacts.outputs.dmg }}
@@ -159,8 +207,8 @@ jobs:
             DRAFT_FLAG="--draft"
           fi
 
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
             --verify-tag \
             --notes-file release-notes.md \
             $DRAFT_FLAG \
