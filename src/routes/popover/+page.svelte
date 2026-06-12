@@ -36,9 +36,15 @@
   const INGEST_REFRESH_DEBOUNCE_MS = 200;
   const SPARKLINE_RANGES = [7, 30] as const;
 
+  /** Base popover window height (matches tauri.conf.json); the window grows
+   * past this to fit a tall budget section but never shrinks below it. */
+  const BASE_POPOVER_HEIGHT = 512;
+
   let metrics: TodayMetrics | undefined = $state();
   let dailyCosts: DailyCost[] | undefined = $state();
   let budgetStatus: BudgetStatus | undefined = $state();
+  /** The content element, measured to size the window to its content. */
+  let popoverEl: HTMLElement | undefined = $state();
   let sparklineDays: (typeof SPARKLINE_RANGES)[number] = $state(7);
   let paused = $state(false);
   let errorMessage = $state("");
@@ -62,11 +68,16 @@
     } catch (err) {
       errorMessage = String(err);
     }
-    // Grow the popover to fit its content (width stays 320). Ignore errors.
+    // Grow the popover window to fit its content (width stays 320) so a tall
+    // budget section is never clipped and the footer stays visible. Measured
+    // off the content element: `document`/viewport height is capped at the
+    // current window size, so it can never report that content overflows.
     try {
       await tick();
-      const h = Math.ceil(document.documentElement.scrollHeight);
-      await getCurrentWindow().setSize(new LogicalSize(320, Math.max(512, h)));
+      if (popoverEl) {
+        const h = Math.ceil(popoverEl.getBoundingClientRect().height);
+        await getCurrentWindow().setSize(new LogicalSize(320, Math.max(BASE_POPOVER_HEIGHT, h)));
+      }
     } catch {
       // Resizing is best-effort; ignore failures.
     }
@@ -155,7 +166,7 @@
   });
 </script>
 
-<main class="popover">
+<main class="popover" bind:this={popoverEl}>
   <header>
     <div class="title">
       <img class="app-icon" src={farthingIcon} alt="" />
@@ -320,7 +331,9 @@
 
   .popover {
     box-sizing: border-box;
-    height: 100vh;
+    /* At least fills the window (no transparent gap); grows taller when the
+       content needs it, and refresh() resizes the window to match. */
+    min-height: 100vh;
     padding: 0.9rem 1rem;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-size: 0.85rem;
