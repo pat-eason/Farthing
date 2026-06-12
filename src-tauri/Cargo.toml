@@ -3,6 +3,7 @@ name = "farthing"
 version = "0.1.0"
 description = "Zero-config macOS menu bar app for Claude Code token/cost usage"
 authors = ["Pat Eason"]
+license = "MIT"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
