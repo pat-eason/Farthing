@@ -94,6 +94,25 @@ pub fn run() {
                     // Tray title tracks today's cost; updated Rust-side so
                     // it never round-trips through the webview.
                     tray_title::refresh(&ingest_app);
+                    // Burst/delta evaluation off the live ingest path, debounced
+                    // to >=5s: a runaway agent loop emits many exports/sec, and
+                    // an unthrottled eval would serialize a windowed spend query
+                    // behind every write (and contend with a backfill-held DB
+                    // lock). The debounce gate is checked first, before the eval
+                    // lock, so a coalesced-out ingest never queues. The eval
+                    // itself runs on a blocking task (it locks the DB for two
+                    // windowed reads + a runtime persist) so it can't stall the
+                    // receiver thread that drives this callback. The spawned task
+                    // owns its own AppHandle clone (Send+Sync+Clone).
+                    if let Some(alert_state) = ingest_app.try_state::<alerts::AlertState>() {
+                        let now_ms = chrono::Local::now().timestamp_millis();
+                        if alert_state.should_run_ingest_eval(now_ms) {
+                            let eval_app = ingest_app.clone();
+                            tauri::async_runtime::spawn_blocking(move || {
+                                alerts::gather_and_apply(&eval_app);
+                            });
+                        }
+                    }
                 }));
             app.manage(ingest_state.clone());
 
@@ -125,6 +144,11 @@ pub fn run() {
                 // The pass may have recovered rows from today; reflect them
                 // in the tray title.
                 tray_title::refresh(&backfill_app);
+                // …and may have recovered a chunk of this month's pre-launch
+                // spend: re-baseline the delta ladder to the current MTD step
+                // silently so the next live eval only fires on post-launch
+                // growth, never a retroactive flood of passed milestones.
+                alerts::rebaseline_delta_now(&backfill_app);
             });
 
             // OTLP receiver on 127.0.0.1:43177. A port conflict is recorded
@@ -150,6 +174,17 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     tray_title::refresh(&tick_app);
+                    // Coarse re-evaluation each minute, undebounced: catches the
+                    // delta month-rollover (state-derived from Local::now(), no
+                    // midnight alarm) and re-checks notification permission so a
+                    // revoke surfaces as `permission_lost` even on an idle app
+                    // (no ingest to trigger it). The query is the same cheap
+                    // index-only scan; runs on a blocking task so it never holds
+                    // up the tick.
+                    let eval_app = tick_app.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        alerts::gather_and_apply(&eval_app);
+                    });
                 }
             });
             Ok(())

@@ -32,12 +32,21 @@
 //! malformed JSON row falls back to documented defaults rather than failing
 //! startup or panicking on garbage.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-use crate::db::Db;
+use crate::db::{Db, DbState};
+
+/// Minimum gap between ingest-triggered evaluations (ms). A runaway agent loop
+/// emits many OTLP exports per second; evaluating on every one would serialize
+/// a windowed spend query behind every ingest write. Coalescing to this floor
+/// holds the "alert within ~1 min" budget while bounding contention — see the
+/// plan's debounce decision. The 60s tick and config-save evals are *not*
+/// debounced (they are already rare and must always run).
+const INGEST_EVAL_DEBOUNCE_MS: i64 = 5_000;
 
 /// `meta` key holding the persisted alert config JSON ([`AlertConfig`]).
 pub const ALERT_CONFIG_KEY: &str = "alert_config";
@@ -206,6 +215,11 @@ pub struct AlertState {
     /// exclusive. `()` because it guards a *critical section*, not a value: the
     /// cached config/runtime stay independently lockable for cheap reads.
     eval_lock: Arc<Mutex<()>>,
+    /// Unix ms of the last ingest-triggered evaluation, for the debounce. Only
+    /// the ingest path consults it (via [`AlertState::should_run_ingest_eval`]);
+    /// the tick and config-save paths bypass it. `0` means "never run", so the
+    /// first ingest after launch always evaluates.
+    last_ingest_eval_ms: Arc<AtomicI64>,
 }
 
 impl AlertState {
@@ -221,6 +235,7 @@ impl AlertState {
             runtime: Arc::new(Mutex::new(runtime)),
             process_start_ms: chrono::Local::now().timestamp_millis(),
             eval_lock: Arc::new(Mutex::new(())),
+            last_ingest_eval_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -235,6 +250,25 @@ impl AlertState {
     /// the critical section. Unit 5's `gather_and_apply` is the only caller.
     pub fn eval_guard(&self) -> MutexGuard<'_, ()> {
         self.eval_lock.lock().expect("alert eval lock poisoned")
+    }
+
+    /// Debounce gate for the ingest path: return `true` (and claim the slot) iff
+    /// at least [`INGEST_EVAL_DEBOUNCE_MS`] have elapsed since the last claimed
+    /// ingest evaluation. Atomic claim-and-update so two near-simultaneous ingest
+    /// callbacks can't both pass the gate; a `false` return means "skip, a recent
+    /// eval already covered this burst of exports". Called *before* taking the
+    /// eval lock so a debounced-out ingest never even queues behind the lock.
+    pub fn should_run_ingest_eval(&self, now_ms: i64) -> bool {
+        let last = self.last_ingest_eval_ms.load(Ordering::SeqCst);
+        if now_ms - last < INGEST_EVAL_DEBOUNCE_MS {
+            return false;
+        }
+        // Claim the slot. A racing caller that read the same `last` and lost the
+        // CAS sees the other's write and (re-checking) debounces out, so at most
+        // one of a simultaneous pair proceeds.
+        self.last_ingest_eval_ms
+            .compare_exchange(last, now_ms, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     /// Current config (cheap clone of the cached value; no DB read).
@@ -575,15 +609,197 @@ fn fmt_usd(amount: f64) -> String {
 
 /// Re-evaluation seam invoked by [`alert_config_set`] after a config save.
 ///
-/// **Unit 5 fills this in.** It will acquire the [`AlertState`] eval lock and run
-/// the full `gather_and_apply` cycle (query sums → `evaluate` → `show` → persist
-/// runtime) so a config change re-evaluates immediately and atomically with the
-/// ingest-path and tick evaluations. For Unit 3 it is intentionally a no-op: the
-/// config is already persisted and the change event emitted, so the Spend UI is
-/// fully functional before the engine exists. Keeping the call site here means
-/// Unit 5 only changes this body, not `alert_config_set`.
-fn reevaluate_after_config_change<R: Runtime>(_app: &tauri::AppHandle<R>) {
-    // No-op until Unit 5 wires the evaluation engine.
+/// Runs the full [`gather_and_apply`] cycle so a config change re-evaluates
+/// immediately and atomically with the ingest-path and tick evaluations: a
+/// tightened threshold or a just-enabled rule can fire right away, and a
+/// step-size edit re-bases through the same step math (no flood of passed
+/// milestones). It is *not* debounced — config saves are rare and the user
+/// expects the change to take effect now. Keeping the call here means
+/// [`alert_config_set`] never had to change between Unit 3 and Unit 5.
+fn reevaluate_after_config_change<R: Runtime>(app: &AppHandle<R>) {
+    gather_and_apply(app);
+}
+
+// ---- runtime orchestration (Unit 5) ----
+//
+// `gather_and_apply` is the single place the pure engine meets the live system:
+// it acquires the eval lock, queries the two spend sums (event-time floored at
+// `process_start_ms` by the query, never inside `evaluate`), runs `evaluate`,
+// delivers each notification through the permission-gated `notify::show`, records
+// a permission-lost signal if a send was gated, and persists the returned runtime
+// — all under the lock so ingest-path, 60s-tick, and config-save evals are
+// mutually exclusive (no lost update, no double-fire). A failed query is logged
+// and the cycle skipped; it never crashes the caller (the tick loop or ingest
+// notifier must survive a transient DB error).
+
+/// Run one evaluation cycle for `app`: gather sums, evaluate, deliver, persist.
+///
+/// Acquires the [`AlertState`] eval lock for the whole cycle. Queries are floored
+/// at `process_start_ms` (delta MTD) and at `max(now - window, process_start_ms)`
+/// (burst window) so recovered pre-launch spend can never trip a live alert. A
+/// query error is logged and the cycle abandoned without touching runtime; a
+/// `show` that returns [`crate::notify::ShowOutcome::PermissionDenied`] sets
+/// `permission_lost` on the runtime that gets persisted. Safe to call from any
+/// trigger (ingest, tick, config save); the debounce for the ingest path is the
+/// caller's responsibility (see [`AlertState::should_run_ingest_eval`]).
+pub fn gather_and_apply<R: Runtime>(app: &AppHandle<R>) {
+    let Some(state) = app.try_state::<AlertState>() else {
+        return; // not yet managed (startup ordering / tests)
+    };
+    let Some(db_state) = app.try_state::<DbState>() else {
+        return;
+    };
+
+    // Hold the eval lock across the entire read→evaluate→persist cycle. This is
+    // the atomicity guarantee: the DB mutex only serializes individual
+    // statements, not the runtime read-modify-write.
+    let _guard = state.eval_guard();
+
+    let now_local = chrono::Local::now();
+    let config = state.config();
+    let runtime = state.runtime();
+
+    let sums = match gather_sums(&db_state.0, &config, state.process_start_ms(), now_local) {
+        Ok(sums) => sums,
+        Err(err) => {
+            // A transient query failure must never crash the tick/ingest path;
+            // skip this cycle and let the next trigger retry.
+            eprintln!("alerts: skipping evaluation, cannot query spend: {err}");
+            return;
+        }
+    };
+
+    let (notifications, next) = evaluate(now_local, &config, &runtime, sums);
+
+    // Deliver through the permission-gated OS seam and fold the permission-lost
+    // signal into the runtime to persist. Factored out so the gating contract
+    // (a denied `show` flips `permission_lost`) is unit-testable without an OS
+    // notification backend (which neither MockRuntime nor `tauri dev` provides).
+    let next = deliver_and_record(&notifications, next, |note| {
+        crate::notify::show(app, &note.title, &note.body)
+    });
+
+    if let Err(err) = state.set_runtime(next) {
+        // Persist failure leaves the cache unchanged (write-first); log and move
+        // on. The dropped runtime advance can at worst replay one milestone next
+        // cycle — acceptable versus crashing the trigger.
+        eprintln!("alerts: cannot persist alert runtime: {err}");
+    }
+}
+
+/// Deliver each notification through `show` and return the runtime to persist,
+/// with `permission_lost` set iff any delivery was gated
+/// ([`crate::notify::ShowOutcome::PermissionDenied`]). The dedup state in `next`
+/// (advanced delta step, armed burst cooldown) is preserved regardless of
+/// delivery outcome — a recovered permission must not replay a flood of the
+/// milestones suppressed while it was off.
+fn deliver_and_record(
+    notifications: &[Notification],
+    mut next: AlertRuntime,
+    mut show: impl FnMut(&Notification) -> crate::notify::ShowOutcome,
+) -> AlertRuntime {
+    for note in notifications {
+        if show(note) == crate::notify::ShowOutcome::PermissionDenied {
+            next.permission_lost = true;
+        }
+    }
+    next
+}
+
+/// Query the two priced-only, event-time-floored spend sums [`evaluate`] needs.
+///
+/// - `burst_window_priced_sum`: priced spend over `[now - window, now)`, floored
+///   at `max(now - window_ms, process_start_ms)` so a backfilled or otel-flipped
+///   row dated before launch is excluded even when its window math would include
+///   it.
+/// - `post_launch_priced_mtd`: priced spend over the local calendar-month window
+///   floored at `process_start_ms`, so the delta ladder counts only post-launch
+///   growth (the backfill re-baseline in [`rebaseline_delta_now`] bumps the
+///   stored step to match before any live eval).
+fn gather_sums(
+    db: &Mutex<Db>,
+    config: &AlertConfig,
+    process_start_ms: i64,
+    now_local: chrono::DateTime<chrono::Local>,
+) -> Result<Sums, rusqlite::Error> {
+    let now_ms = now_local.timestamp_millis();
+    let window_ms = i64::from(config.burst.window_minutes) * 60_000;
+    let burst_start = now_ms - window_ms;
+    let burst_floor = burst_start.max(process_start_ms);
+    let (month_start, month_end) = crate::metrics::local_month_window(now_local);
+
+    let db = db.lock().expect("db mutex poisoned");
+    // Burst: the rolling window is [burst_start, now); the floor drops pre-launch
+    // rows. `end` is exclusive (the [start, end) convention used everywhere), so
+    // a row stamped exactly `now_ms` is excluded — fine, it's "the future" for
+    // this instant's window and the next eval will include it.
+    let (burst_window_priced_sum, _) =
+        crate::metrics::priced_spend_for_window(&db, burst_start, now_ms, Some(burst_floor))?;
+    // Delta MTD: the calendar-month window, floored at launch so recovered
+    // pre-launch month spend never advances the ladder.
+    let (post_launch_priced_mtd, _) = crate::metrics::priced_spend_for_window(
+        &db,
+        month_start,
+        month_end,
+        Some(process_start_ms),
+    )?;
+
+    Ok(Sums {
+        burst_window_priced_sum,
+        post_launch_priced_mtd,
+    })
+}
+
+/// Silently re-baseline the delta ladder to the current post-launch MTD step,
+/// firing nothing. Called at the two `run_pass` (backfill) call sites that hold
+/// an `AppHandle`: a backfill pass can recover a large chunk of pre-launch month
+/// spend, and without this the *next* live evaluation would see MTD jump past
+/// many milestones and (absent the floor) flood. Even with the
+/// `process_start_ms` floor on the live query, re-baselining keeps `last_step`
+/// honest against the post-launch MTD so only genuine post-launch growth fires.
+///
+/// Runs under the eval lock (mutually exclusive with [`gather_and_apply`]). A
+/// query or persist error is logged and skipped — a backfill pass must complete
+/// regardless of whether the re-baseline succeeds.
+pub fn rebaseline_delta_now<R: Runtime>(app: &AppHandle<R>) {
+    let Some(state) = app.try_state::<AlertState>() else {
+        return;
+    };
+    let Some(db_state) = app.try_state::<DbState>() else {
+        return;
+    };
+
+    let _guard = state.eval_guard();
+
+    let now_local = chrono::Local::now();
+    let config = state.config();
+    let mut runtime = state.runtime();
+
+    let (month_start, month_end) = crate::metrics::local_month_window(now_local);
+    let mtd = {
+        let db = db_state.0.lock().expect("db mutex poisoned");
+        match crate::metrics::priced_spend_for_window(
+            &db,
+            month_start,
+            month_end,
+            Some(state.process_start_ms()),
+        ) {
+            Ok((sum, _)) => sum,
+            Err(err) => {
+                eprintln!("alerts: cannot re-baseline delta, spend query failed: {err}");
+                return;
+            }
+        }
+    };
+
+    // Bump silently to where MTD sits now (and key on the current month). The
+    // step math is the same `evaluate` uses, so a subsequent live eval honors
+    // this baseline verbatim and only fires on growth past it (C6/C7).
+    runtime.delta.month_key = month_key(now_local);
+    runtime.delta.last_step = delta_step(mtd, config.delta.step_usd);
+    if let Err(err) = state.set_runtime(runtime) {
+        eprintln!("alerts: cannot persist delta re-baseline: {err}");
+    }
 }
 
 #[cfg(test)]
@@ -1304,5 +1520,327 @@ mod tests {
             serde_json::to_value(RuleType::Delta).unwrap(),
             serde_json::json!("Delta")
         );
+    }
+
+    // ---- delivery + permission-lost recording (deliver_and_record seam) ----
+
+    /// R5/I6: a `show` that returns `PermissionDenied` (the user revoked
+    /// notification permission) flips `permission_lost` on the persisted runtime,
+    /// while the dedup state the engine advanced is preserved.
+    #[test]
+    fn denied_show_sets_permission_lost_and_keeps_dedup_state() {
+        let notes = vec![Notification {
+            rule_type: RuleType::Burst,
+            title: "Usage spike".into(),
+            body: "x".into(),
+        }];
+        // Engine armed a cooldown; the delivery is then denied.
+        let armed = AlertRuntime {
+            burst: BurstRuntime {
+                cooldown_until_ms: 123,
+            },
+            ..AlertRuntime::default()
+        };
+        let out = deliver_and_record(&notes, armed, |_| crate::notify::ShowOutcome::PermissionDenied);
+        assert!(out.permission_lost, "a denied show records permission_lost");
+        assert_eq!(
+            out.burst.cooldown_until_ms, 123,
+            "dedup state is preserved so a recovered permission doesn't replay"
+        );
+    }
+
+    /// A delivered notification leaves `permission_lost` false; multiple notes
+    /// are all delivered.
+    #[test]
+    fn delivered_shows_do_not_set_permission_lost() {
+        let notes = vec![
+            Notification {
+                rule_type: RuleType::Burst,
+                title: "a".into(),
+                body: "b".into(),
+            },
+            Notification {
+                rule_type: RuleType::Delta,
+                title: "c".into(),
+                body: "d".into(),
+            },
+        ];
+        let mut shown = 0;
+        let out = deliver_and_record(&notes, AlertRuntime::default(), |_| {
+            shown += 1;
+            crate::notify::ShowOutcome::Delivered
+        });
+        assert_eq!(shown, 2, "every notification is delivered");
+        assert!(!out.permission_lost);
+    }
+
+    /// Even a single denied delivery among several flips the flag.
+    #[test]
+    fn any_denied_delivery_flips_permission_lost() {
+        let notes = vec![
+            Notification {
+                rule_type: RuleType::Burst,
+                title: "a".into(),
+                body: "b".into(),
+            },
+            Notification {
+                rule_type: RuleType::Delta,
+                title: "c".into(),
+                body: "d".into(),
+            },
+        ];
+        let mut first = true;
+        let out = deliver_and_record(&notes, AlertRuntime::default(), |_| {
+            // First delivered, second denied (permission revoked between sends).
+            if std::mem::take(&mut first) {
+                crate::notify::ShowOutcome::Delivered
+            } else {
+                crate::notify::ShowOutcome::PermissionDenied
+            }
+        });
+        assert!(out.permission_lost);
+    }
+
+    // ---- debounce gate (should_run_ingest_eval) ----
+
+    #[test]
+    fn ingest_eval_debounce_coalesces_rapid_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AlertState::load(test_db(&dir));
+
+        // First call after launch always runs (last-eval is 0).
+        assert!(state.should_run_ingest_eval(1_000_000));
+        // A call 4.999s later is coalesced out.
+        assert!(!state.should_run_ingest_eval(1_000_000 + 4_999));
+        // Exactly 5s later runs again (claims the slot).
+        assert!(state.should_run_ingest_eval(1_000_000 + 5_000));
+        // Immediately after, coalesced again.
+        assert!(!state.should_run_ingest_eval(1_000_000 + 5_001));
+    }
+
+    #[test]
+    fn ingest_eval_debounce_first_call_always_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AlertState::load(test_db(&dir));
+        // The very first ingest after launch must evaluate (a runaway loop that
+        // starts seconds after boot must not be missed by the debounce). Real
+        // unix-ms clocks are ~1.7e12, far past the 5s window from the `0`
+        // "never run" sentinel, so the first real-clock call always passes.
+        let now = chrono::Local::now().timestamp_millis();
+        assert!(state.should_run_ingest_eval(now));
+    }
+
+    // ---- gather_and_apply over a mock-runtime app ----
+    //
+    // The mock runtime has no notification backend, so the assertion target is the
+    // *persisted runtime* the orchestrator writes (the evaluate+show()-seam
+    // contract): an armed burst cooldown means burst fired; an advanced delta
+    // last_step means delta fired. The notification plugin (desktop) reports
+    // `Granted` unconditionally, so `show` "delivers" and `permission_lost` stays
+    // false. Real OS delivery is manual-bundle-only (see the plan).
+
+    /// Build a mock app managing a fresh `DbState` + `AlertState` (sharing one DB
+    /// handle) with the notification plugin registered so `show` reports
+    /// `Granted`. Returns the app and the shared DB handle for row inserts.
+    fn mock_app_with_alerts() -> (
+        tauri::App<tauri::test::MockRuntime>,
+        Arc<Mutex<Db>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Mutex::new(Db::open_in_dir(dir.path()).unwrap()));
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_notification::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        app.manage(DbState(Arc::clone(&db)));
+        app.manage(AlertState::load(Arc::clone(&db)));
+        (app, db, dir)
+    }
+
+    /// Insert a priced `api_request` row at `timestamp_ms`.
+    fn insert_priced(db: &Mutex<Db>, timestamp_ms: i64, cost_usd: f64, source: &str) {
+        let db = db.lock().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO requests (session_id, timestamp_ms, cost_usd, event_type, source)
+                 VALUES ('sess', ?1, ?2, 'api_request', ?3)",
+                rusqlite::params![timestamp_ms, cost_usd, source],
+            )
+            .unwrap();
+    }
+
+    /// Storm guard: rows recovered from *before* launch — one tagged `backfill`,
+    /// one flipped to `otel` (the re-delivered-export case) — both keep their real
+    /// pre-launch `timestamp_ms`, so the `process_start_ms` floor excludes them
+    /// from both the burst window and the delta MTD. No alert fires.
+    ///
+    /// THIS TEST MUST INCLUDE THE OTEL-FLIP ROW (per the plan): a `source='otel'`
+    /// filter would be defeated by it, but the event-time floor is not.
+    #[test]
+    fn storm_guard_excludes_prelaunch_rows_even_after_otel_flip() {
+        let (app, db, _dir) = mock_app_with_alerts();
+        let state = app.state::<AlertState>();
+        let launch = state.process_start_ms();
+
+        // Two big pre-launch rows inside the 10-min burst window by wall-clock,
+        // but before launch by event time. One is plain backfill; the other was
+        // flipped to otel with its real (pre-launch) timestamp by a re-delivered
+        // export — the exact case `source` filtering can't catch.
+        insert_priced(&db, launch - 60_000, 500.0, "backfill");
+        insert_priced(&db, launch - 30_000, 500.0, "otel");
+
+        // Enable both rules so either firing would be observable.
+        let mut config = AlertConfig::default();
+        config.delta.enabled = true;
+        config.delta.step_usd = 50.0;
+        config.burst.threshold_usd = 10.0;
+        state.set_config(config).unwrap();
+
+        gather_and_apply(app.handle());
+
+        let runtime = app.state::<AlertState>().runtime();
+        assert_eq!(
+            runtime.burst.cooldown_until_ms, 0,
+            "pre-launch spend must not arm the burst cooldown"
+        );
+        // Delta: the rollover/first-eval re-baseline keys the month and sets
+        // last_step to the (floored, post-launch) MTD step, which is 0 here.
+        assert_eq!(
+            runtime.delta.last_step, 0,
+            "pre-launch spend must not advance the delta ladder"
+        );
+        assert!(!runtime.permission_lost);
+    }
+
+    /// I4: two over-threshold otel batches 30s apart produce exactly one burst —
+    /// the cooldown armed by the first eval persists and suppresses the second.
+    #[test]
+    fn two_overthreshold_batches_fire_exactly_one_burst() {
+        let (app, db, _dir) = mock_app_with_alerts();
+        let state = app.state::<AlertState>();
+        let launch = state.process_start_ms();
+
+        // Burst only (default delta disabled). First batch: $20 of post-launch
+        // otel spend stamped at `launch` (== the process_start floor). The short
+        // sleep guarantees the eval's `now` is strictly after `launch`, so the
+        // row falls inside `[floor, now)` deterministically (a row stamped at the
+        // exact `now` ms would be excluded by the window's exclusive end).
+        insert_priced(&db, launch, 20.0, "otel");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        gather_and_apply(app.handle());
+        let after_first = app.state::<AlertState>().runtime();
+        assert!(
+            after_first.burst.cooldown_until_ms > 0,
+            "first over-threshold batch arms the cooldown (burst fired)"
+        );
+
+        // Second batch still over threshold, but inside the 15-min cooldown: the
+        // persisted cooldown suppresses a second fire.
+        insert_priced(&db, launch + 1, 20.0, "otel");
+        gather_and_apply(app.handle());
+        let after_second = app.state::<AlertState>().runtime();
+        assert_eq!(
+            after_second.burst.cooldown_until_ms, after_first.burst.cooldown_until_ms,
+            "the second batch must not re-arm the cooldown (no double-fire)"
+        );
+    }
+
+    /// Concurrency: a config-save eval (via the public seam) and an ingest eval
+    /// racing on the same state serialize through the eval lock, so the burst
+    /// cooldown is armed exactly once — no lost update, no double-fire.
+    #[test]
+    fn racing_config_and_ingest_evals_serialize_without_double_fire() {
+        let (app, db, _dir) = mock_app_with_alerts();
+        let state = app.state::<AlertState>();
+        let launch = state.process_start_ms();
+        insert_priced(&db, launch, 50.0, "otel");
+        std::thread::sleep(std::time::Duration::from_millis(5)); // now > launch
+
+        // Spawn two threads that both drive a full evaluation cycle against the
+        // shared managed state. The eval lock must serialize them.
+        let h1 = app.handle().clone();
+        let h2 = app.handle().clone();
+        let t1 = std::thread::spawn(move || gather_and_apply(&h1));
+        let t2 = std::thread::spawn(move || gather_and_apply(&h2));
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let runtime = app.state::<AlertState>().runtime();
+        assert!(
+            runtime.burst.cooldown_until_ms > 0,
+            "the burst fired and armed a cooldown"
+        );
+        // Whichever eval ran first armed the cooldown; the second saw it armed
+        // and did not re-fire. We can't pin the exact ms (wall clock), but the
+        // lock guarantees a single coherent runtime, never an interleaved one.
+        assert!(!runtime.permission_lost);
+    }
+
+    /// A config save runs a re-evaluation through the same orchestrator: enabling
+    /// the burst rule with in-window spend fires immediately on save.
+    #[test]
+    fn config_save_reevaluates_immediately() {
+        let (app, db, _dir) = mock_app_with_alerts();
+        let launch = app.state::<AlertState>().process_start_ms();
+        insert_priced(&db, launch, 30.0, "otel");
+        std::thread::sleep(std::time::Duration::from_millis(5)); // now > launch
+
+        // Save a config with burst enabled at a $10 threshold; the save-time
+        // re-eval should arm the cooldown right away.
+        let config = AlertConfig {
+            burst: BurstConfig {
+                enabled: true,
+                threshold_usd: 10.0,
+                ..BurstConfig::default()
+            },
+            ..AlertConfig::default()
+        };
+        alert_config_set(app.handle().clone(), config).expect("set");
+
+        let runtime = app.state::<AlertState>().runtime();
+        assert!(
+            runtime.burst.cooldown_until_ms > 0,
+            "a config save re-evaluates and can fire immediately"
+        );
+    }
+
+    /// `gather_and_apply` tolerates an app with no managed `AlertState`/`DbState`
+    /// (startup ordering / minimal test apps): a no-op, never a panic.
+    #[test]
+    fn gather_and_apply_tolerates_missing_state() {
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_notification::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        gather_and_apply(app.handle()); // nothing managed yet
+    }
+
+    /// The backfill re-baseline bumps `last_step` to the current post-launch MTD
+    /// step silently (no fire) and keys the current month, so a later live eval
+    /// only fires on growth past it.
+    #[test]
+    fn rebaseline_delta_bumps_last_step_to_current_mtd_silently() {
+        let (app, db, _dir) = mock_app_with_alerts();
+        let state = app.state::<AlertState>();
+        let launch = state.process_start_ms();
+
+        // Enable delta; $230 of post-launch month spend at a $50 step → step 4.
+        let mut config = AlertConfig::default();
+        config.delta.enabled = true;
+        config.delta.step_usd = 50.0;
+        state.set_config(config).unwrap();
+        insert_priced(&db, launch, 230.0, "otel");
+
+        rebaseline_delta_now(app.handle());
+
+        let runtime = app.state::<AlertState>().runtime();
+        assert_eq!(runtime.delta.last_step, 4, "re-baselined to floor(230/50)");
+        assert_eq!(runtime.delta.month_key, month_key(chrono::Local::now()));
+
+        // A subsequent live eval at the same MTD fires nothing (already baselined).
+        gather_and_apply(app.handle());
+        let after = app.state::<AlertState>().runtime();
+        assert_eq!(after.delta.last_step, 4, "no retroactive flood after re-baseline");
     }
 }
