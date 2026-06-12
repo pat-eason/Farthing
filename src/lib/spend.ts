@@ -92,3 +92,39 @@ export function getAlertConfig(): Promise<AlertConfig> {
 export function setAlertConfig(config: AlertConfig): Promise<AlertConfig> {
   return invoke<AlertConfig>("alert_config_set", { config });
 }
+
+// --- Notification delivery + permission (src-tauri/src/notify.rs) ---------
+//
+// The Rust permission commands return the plugin's own lowercase strings;
+// `"granted"` / `"denied"` / `"prompt"` are the values the Spend UI branches
+// on. The `rule_type` values match `RULE_TYPE_BURST` / `RULE_TYPE_DELTA`.
+
+/** The two rule kinds a test notification can preview. */
+export type AlertRuleType = "burst" | "delta";
+
+/**
+ * Read-only: current OS notification permission as the plugin's string
+ * (`"granted"`, `"denied"`, `"prompt"`, ...). Never throws — a failed read
+ * resolves to the safe-closed `"prompt"` on the Rust side.
+ */
+export function getNotificationPermission(): Promise<string> {
+  return invoke<string>("notification_permission_state");
+}
+
+/**
+ * Prompt for notification permission, returning the resulting string. macOS
+ * only prompts once: a prior `"denied"` returns `"denied"` again and the UI
+ * must deep-link to System Settings rather than re-prompt.
+ */
+export function requestNotificationPermission(): Promise<string> {
+  return invoke<string>("notification_request_permission");
+}
+
+/**
+ * Deliver a test notification with fixed placeholder copy for the given rule
+ * type (never live data). Errors only on an unknown `rule_type`; a denied
+ * permission is a silent non-delivery, surfaced via {@link getNotificationPermission}.
+ */
+export function sendTestNotification(ruleType: AlertRuleType): Promise<void> {
+  return invoke<void>("notification_send_test", { ruleType });
+}
