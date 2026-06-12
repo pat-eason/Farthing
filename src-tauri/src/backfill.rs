@@ -211,6 +211,10 @@ pub async fn backfill_run<R: tauri::Runtime>(
     // The pass may have recovered rows from today; reflect them in the
     // tray title.
     crate::tray_title::refresh(&app);
+    // …and may have recovered pre-launch month spend: re-baseline the delta
+    // ladder silently (mirrors the startup pass in lib.rs) so the next live
+    // eval only fires on post-launch growth, never a retroactive flood.
+    crate::alerts::rebaseline_delta_now(&app);
     Ok(summary)
 }
 
