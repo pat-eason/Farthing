@@ -32,7 +32,7 @@
 //! malformed JSON row falls back to documented defaults rather than failing
 //! startup or panicking on garbage.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -220,6 +220,14 @@ pub struct AlertState {
     /// the tick and config-save paths bypass it. `0` means "never run", so the
     /// first ingest after launch always evaluates.
     last_ingest_eval_ms: Arc<AtomicI64>,
+    /// In-flight guard for the `spawn_blocking` eval tasks: `true` while a
+    /// `gather_and_apply` task is queued or running on the thread pool. Prevents
+    /// unbounded task accumulation under eval-lock contention (e.g. during a
+    /// backfill pass). Swapped `false → true` before spawning and cleared at the
+    /// end of the task (even on panic, via a drop-guard). A `compare_exchange`
+    /// failure means "already in flight; skip this spawn". The debounce gate
+    /// (frequency) and this flag (concurrency) are complementary concerns.
+    eval_in_flight: Arc<AtomicBool>,
 }
 
 impl AlertState {
@@ -227,7 +235,7 @@ impl AlertState {
     /// and capture `process_start_ms` from the current wall clock. A bad `meta`
     /// row never fails startup, mirroring [`CaptureState::load`].
     pub fn load(db: Arc<Mutex<Db>>) -> Self {
-        let config = read_json(&db, ALERT_CONFIG_KEY);
+        let config: AlertConfig = sanitize_config(read_json(&db, ALERT_CONFIG_KEY));
         let runtime = read_json(&db, ALERT_RUNTIME_KEY);
         Self {
             db,
@@ -236,6 +244,7 @@ impl AlertState {
             process_start_ms: chrono::Local::now().timestamp_millis(),
             eval_lock: Arc::new(Mutex::new(())),
             last_ingest_eval_ms: Arc::new(AtomicI64::new(0)),
+            eval_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -248,8 +257,35 @@ impl AlertState {
     /// Acquire the evaluation lock for the duration of a gather→evaluate→persist
     /// cycle. Hold the returned guard across the whole cycle; dropping it releases
     /// the critical section. Unit 5's `gather_and_apply` is the only caller.
+    ///
+    /// **Poison recovery**: unlike the DB mutex (which guards real state that a
+    /// panic could leave inconsistent), the eval lock guards a *critical section*
+    /// — its protected value is `()`, so there is no invariant to uphold and no
+    /// corruption to carry forward. Recovering from a poison lets the next
+    /// evaluation cycle proceed normally instead of permanently silencing alerts.
+    /// The DB mutex in contrast keeps its `.expect` because a panicked write
+    /// half-way through a statement could leave the DB in a bad state.
     pub fn eval_guard(&self) -> MutexGuard<'_, ()> {
-        self.eval_lock.lock().expect("alert eval lock poisoned")
+        self.eval_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Try to claim the in-flight slot for a spawned eval task. Returns `true`
+    /// and marks the slot taken when no task is already in flight; returns
+    /// `false` (don't spawn) when one is. The caller MUST call
+    /// [`end_eval`](Self::end_eval) after the task finishes, even on panic
+    /// (use an [`EvalGuard`] drop-guard).
+    pub fn try_begin_eval(&self) -> bool {
+        self.eval_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Release the in-flight slot. Called at the end of a spawned eval task
+    /// (via [`EvalGuard`] drop so panics don't leave the slot permanently set).
+    pub fn end_eval(&self) {
+        self.eval_in_flight.store(false, Ordering::SeqCst);
     }
 
     /// Debounce gate for the ingest path: return `true` (and claim the slot) iff
@@ -283,8 +319,11 @@ impl AlertState {
 
     /// Persist `config` then update the cache. Write-first (like
     /// [`CaptureState::set_paused`]): if the DB write fails the in-memory cache is
-    /// left unchanged so disk and memory never disagree.
+    /// left unchanged so disk and memory never disagree. The config is sanitized
+    /// before persist so the on-disk value is always clamped (matching the
+    /// UI-level validation).
     pub fn set_config(&self, config: AlertConfig) -> Result<(), rusqlite::Error> {
+        let config = sanitize_config(config);
         write_json(&self.db, ALERT_CONFIG_KEY, &config)?;
         *self.config.lock().expect("alert config mutex poisoned") = config;
         Ok(())
@@ -331,20 +370,75 @@ fn write_json<T: Serialize>(db: &Mutex<Db>, key: &str, value: &T) -> Result<(), 
     Ok(())
 }
 
+/// Clamp `config` to valid ranges, mirroring the UI-level validation. Guards
+/// against corrupt or hand-edited `meta` rows producing pathological behaviour:
+/// - `burst.cooldown_minutes = 0` would make burst fire every tick with no
+///   suppression gap, potentially spamming the OS notification center
+/// - `burst.window_minutes = 0` would produce a zero-length window sum (always
+///   zero), so burst could never fire at all
+/// - `burst.threshold_usd <= 0` or `delta.step_usd <= 0` would cause division
+///   by zero or infinite step ladders in `delta_step`
+///
+/// The UI enforces `window_minutes >= 1`, `cooldown_minutes >= 1`,
+/// `threshold_usd > 0`, and `step_usd > 0`; this function applies the same
+/// constraints so the backend is independently correct regardless of how the
+/// config row was written.
+fn sanitize_config(mut config: AlertConfig) -> AlertConfig {
+    if config.burst.window_minutes < 1 {
+        config.burst.window_minutes = default_burst_window_minutes();
+    }
+    if config.burst.cooldown_minutes < 1 {
+        config.burst.cooldown_minutes = default_burst_cooldown_minutes();
+    }
+    if config.burst.threshold_usd <= 0.0 {
+        config.burst.threshold_usd = default_burst_threshold_usd();
+    }
+    if config.delta.step_usd <= 0.0 {
+        config.delta.step_usd = default_delta_step_usd();
+    }
+    config
+}
+
+/// RAII guard that clears the eval in-flight flag when dropped, so a panic
+/// inside a spawned `gather_and_apply` task cannot permanently block future
+/// evaluations. Construct via [`AlertState::try_begin_eval`].
+pub struct EvalGuard(AlertState);
+
+impl Drop for EvalGuard {
+    fn drop(&mut self) {
+        self.0.end_eval();
+    }
+}
+
 /// Frontend query: the current alert config (Spend UI reads this on mount).
 #[tauri::command]
 pub fn alert_config_get(state: tauri::State<'_, AlertState>) -> AlertConfig {
     state.config()
 }
 
+/// Frontend query: the current alert runtime (Spend UI reads this for cooldown
+/// and permission-lost state on mount and after config changes). Returns a
+/// cheap clone of the in-memory cache; no DB read.
+#[tauri::command]
+pub fn alert_runtime_get(state: tauri::State<'_, AlertState>) -> AlertRuntime {
+    state.runtime()
+}
+
 /// Frontend action: persist a new alert config, re-evaluate, and notify the UI.
 ///
-/// Persists the config, then runs a re-evaluation so a tightened threshold or a
-/// just-enabled rule can fire immediately (and a re-baseline takes effect), and
-/// emits [`ALERT_CONFIG_CHANGED_EVENT`] so other windows refresh. The
-/// re-evaluation goes through [`crate::alerts::reevaluate_after_config_change`]
-/// (see its docs) — a seam Unit 5 fills with the real engine; for this unit it
-/// is a no-op so config save is fully functional ahead of the engine landing.
+/// Persists the config and emits [`ALERT_CONFIG_CHANGED_EVENT`] synchronously
+/// on the IPC thread (these are cheap, always safe). The re-evaluation is
+/// offloaded to a `spawn_blocking` task so the IPC thread is never stalled by
+/// the eval lock or DB queries — the same pattern the 60s tick and ingest path
+/// use. The re-eval runs promptly (the task is submitted immediately) but does
+/// not block the caller's return.
+///
+/// Why offload and not inline? `alert_config_set` runs on the Tauri IPC thread;
+/// `gather_and_apply` takes the eval lock and runs two DB queries plus a write.
+/// Under backfill the eval lock can be held for the duration of the pass; an
+/// inline call would stall the IPC thread for the same duration, making the UI
+/// unresponsive. Offloading keeps the "fires immediately on config save"
+/// guarantee (the task is submitted before we return) without the stall risk.
 #[tauri::command]
 pub fn alert_config_set<R: Runtime>(
     app: tauri::AppHandle<R>,
@@ -355,10 +449,11 @@ pub fn alert_config_set<R: Runtime>(
         .set_config(config)
         .map_err(|err| format!("cannot persist alert config: {err}"))?;
     let saved = state.config();
-    // Re-evaluate under the engine seam so a config change can fire right away
-    // (Unit 5 wires the real gather_and_apply; today this is a documented no-op).
-    reevaluate_after_config_change(&app);
     let _ = app.emit(ALERT_CONFIG_CHANGED_EVENT, &saved);
+    // Offload re-eval so this IPC call returns immediately even under eval-lock
+    // contention. The task is submitted now so the immediate-effect intent is
+    // preserved: a tightened threshold or just-enabled rule can fire right away.
+    reevaluate_after_config_change(&app);
     Ok(saved)
 }
 
@@ -609,15 +704,42 @@ fn fmt_usd(amount: f64) -> String {
 
 /// Re-evaluation seam invoked by [`alert_config_set`] after a config save.
 ///
-/// Runs the full [`gather_and_apply`] cycle so a config change re-evaluates
-/// immediately and atomically with the ingest-path and tick evaluations: a
-/// tightened threshold or a just-enabled rule can fire right away, and a
-/// step-size edit re-bases through the same step math (no flood of passed
-/// milestones). It is *not* debounced — config saves are rare and the user
-/// expects the change to take effect now. Keeping the call here means
-/// [`alert_config_set`] never had to change between Unit 3 and Unit 5.
+/// Submits a `spawn_blocking` task for [`gather_and_apply`] rather than calling
+/// it inline — the IPC thread must not block under the eval lock (see
+/// [`alert_config_set`] docs). The task is submitted synchronously so the
+/// immediate-effect intent is preserved: the eval runs as soon as the thread
+/// pool has capacity, without the IPC caller waiting for it. Not debounced —
+/// config saves are rare and the user expects the change to take effect now.
 fn reevaluate_after_config_change<R: Runtime>(app: &AppHandle<R>) {
-    gather_and_apply(app);
+    spawn_eval(app);
+}
+
+/// Submit a `gather_and_apply` task on the blocking thread pool, guarded by the
+/// in-flight flag. If a task is already queued or running, the spawn is skipped
+/// (the in-flight eval will pick up any config/spend changes it sees on wakeup).
+///
+/// This is the single spawn site used by the 60s tick, ingest path, and config
+/// save — centralising the in-flight guard so all three callers share one
+/// concurrency cap. The debounce gate ([`AlertState::should_run_ingest_eval`])
+/// is a *frequency* cap; this flag is a *concurrency* cap — complementary
+/// concerns. Call this instead of `gather_and_apply` from async contexts.
+pub fn spawn_eval<R: Runtime>(app: &AppHandle<R>) {
+    let Some(state) = app.try_state::<AlertState>() else {
+        return;
+    };
+    // If a task is already in flight, skip this spawn. The running task will
+    // process the latest state when it wakes up under the eval lock.
+    if !state.try_begin_eval() {
+        return;
+    }
+    // The drop-guard clears the flag at the end of the task, including on panic,
+    // so a panicking task cannot permanently block future evaluations.
+    let guard = EvalGuard(state.inner().clone());
+    let eval_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _g = guard; // dropped at end of closure (or on panic)
+        gather_and_apply(&eval_app);
+    });
 }
 
 // ---- runtime orchestration (Unit 5) ----
@@ -675,7 +797,18 @@ pub fn gather_and_apply<R: Runtime>(app: &AppHandle<R>) {
     // signal into the runtime to persist. Factored out so the gating contract
     // (a denied `show` flips `permission_lost`) is unit-testable without an OS
     // notification backend (which neither MockRuntime nor `tauri dev` provides).
-    let next = deliver_and_record(&notifications, next, |note| {
+    //
+    // Permission state is sampled here (not in deliver_and_record) so it
+    // reflects the *current* OS state on every cycle — including idle ticks
+    // where no notifications are queued. This makes `permission_lost` track the
+    // actual permission rather than latching permanently on the first denial.
+    use tauri::plugin::PermissionState;
+    use tauri_plugin_notification::NotificationExt;
+    let current_permission = app
+        .notification()
+        .permission_state()
+        .unwrap_or(PermissionState::Prompt);
+    let next = deliver_and_record(&notifications, next, current_permission, |note| {
         crate::notify::show(app, &note.title, &note.body)
     });
 
@@ -688,18 +821,37 @@ pub fn gather_and_apply<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// Deliver each notification through `show` and return the runtime to persist,
-/// with `permission_lost` set iff any delivery was gated
-/// ([`crate::notify::ShowOutcome::PermissionDenied`]). The dedup state in `next`
-/// (advanced delta step, armed burst cooldown) is preserved regardless of
-/// delivery outcome — a recovered permission must not replay a flood of the
-/// milestones suppressed while it was off.
+/// with `permission_lost` reflecting the *actual* current OS permission state
+/// (`current_permission`). This keeps `permission_lost` as a live signal rather
+/// than a one-way latch:
+///
+/// - `Granted` → `permission_lost = false`, even if it was previously `true`
+///   (the user re-granted permission in System Settings)
+/// - anything else → `permission_lost = true` (denied or not yet prompted)
+///
+/// Individual delivery outcomes are still checked: a `PermissionDenied` result
+/// from `show` also sets the flag (defensive belt-and-suspenders), but the
+/// *clearing* path comes from `current_permission` so an idle cycle with no
+/// notifications to deliver still clears a stale flag.
+///
+/// The dedup state in `next` (advanced delta step, armed burst cooldown) is
+/// preserved regardless of delivery outcome — a recovered permission must not
+/// replay a flood of the milestones suppressed while it was off.
 fn deliver_and_record(
     notifications: &[Notification],
     mut next: AlertRuntime,
+    current_permission: tauri::plugin::PermissionState,
     mut show: impl FnMut(&Notification) -> crate::notify::ShowOutcome,
 ) -> AlertRuntime {
+    // Set permission_lost based on the actual OS state sampled this cycle.
+    // This is the only clearing path: `current_permission == Granted` clears a
+    // previously-set flag when the user re-grants in System Settings.
+    next.permission_lost = current_permission != tauri::plugin::PermissionState::Granted;
     for note in notifications {
         if show(note) == crate::notify::ShowOutcome::PermissionDenied {
+            // Belt-and-suspenders: the gate also observed denial; set the flag
+            // (it may already be set from current_permission above, but this
+            // path is correct for defensive coverage).
             next.permission_lost = true;
         }
     }
@@ -1078,6 +1230,145 @@ mod tests {
         assert_eq!(config.delta.step_usd, 50.0);
     }
 
+    // #4: a prior panic that poisoned the eval lock must not permanently silence
+    // alerts. Because the guarded value is `()` (no invariant to uphold), the
+    // lock recovers rather than propagating the panic.
+    #[test]
+    fn poisoned_eval_lock_still_yields_a_usable_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AlertState::load(test_db(&dir));
+
+        // Poison the lock by panicking inside a thread that holds it, then
+        // catching the panic (std::panic::catch_unwind so the test thread lives).
+        let lock = Arc::clone(&state.eval_lock);
+        let _ = std::panic::catch_unwind(move || {
+            let _g = lock.lock().unwrap();
+            panic!("intentional poisoning");
+        });
+        assert!(state.eval_lock.is_poisoned(), "lock must be poisoned now");
+
+        // eval_guard must recover from the poisoned state and return a usable guard
+        // (no panic, not permanently stuck).
+        let _guard = state.eval_guard(); // must not panic
+        // The guard is exclusive: a concurrent try_lock fails while held.
+        assert!(
+            state.eval_lock.try_lock().is_err(),
+            "recovered guard still exclusive"
+        );
+    }
+
+    // #9: malformed config with pathological values (cooldown_minutes=0, etc.)
+    // must be clamped to defaults, never stored as-is.
+    #[test]
+    fn malformed_config_with_zero_cooldown_loads_as_clamped_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(&dir);
+        // Write a config with every guarded field set to a pathological value.
+        {
+            let conn = db.lock().unwrap();
+            conn.conn()
+                .execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        ALERT_CONFIG_KEY,
+                        r#"{"burst":{"enabled":true,"threshold_usd":-1,"window_minutes":0,"cooldown_minutes":0},"delta":{"enabled":true,"step_usd":0}}"#
+                    ],
+                )
+                .unwrap();
+        }
+
+        let state = AlertState::load(db);
+        let config = state.config();
+        assert!(
+            config.burst.cooldown_minutes >= 1,
+            "cooldown_minutes=0 must be clamped, got {}",
+            config.burst.cooldown_minutes
+        );
+        assert!(
+            config.burst.window_minutes >= 1,
+            "window_minutes=0 must be clamped, got {}",
+            config.burst.window_minutes
+        );
+        assert!(
+            config.burst.threshold_usd > 0.0,
+            "threshold_usd<=0 must be clamped, got {}",
+            config.burst.threshold_usd
+        );
+        assert!(
+            config.delta.step_usd > 0.0,
+            "step_usd<=0 must be clamped, got {}",
+            config.delta.step_usd
+        );
+    }
+
+    // #10: alert_runtime_get command returns the current managed runtime.
+    #[test]
+    fn alert_runtime_get_returns_managed_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(&dir);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        let state = AlertState::load(Arc::clone(&db));
+
+        // Write a non-default runtime so we can confirm it's the one returned.
+        let runtime = AlertRuntime {
+            delta: DeltaRuntime {
+                month_key: "2026-06".into(),
+                last_step: 5,
+            },
+            burst: BurstRuntime {
+                cooldown_until_ms: 999_999,
+            },
+            permission_lost: true,
+        };
+        state.set_runtime(runtime.clone()).unwrap();
+        app.manage(state);
+
+        let returned = alert_runtime_get(app.state::<AlertState>());
+        assert_eq!(returned, runtime, "alert_runtime_get must return the current managed runtime");
+    }
+
+    // #12: try_begin_eval/end_eval: only one eval task in flight at a time.
+    #[test]
+    fn eval_in_flight_guard_prevents_concurrent_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AlertState::load(test_db(&dir));
+
+        // First claim succeeds.
+        assert!(state.try_begin_eval(), "first try_begin_eval must succeed");
+        // A second attempt while in-flight is rejected.
+        assert!(!state.try_begin_eval(), "second try_begin_eval must fail while in-flight");
+        // Releasing clears the flag.
+        state.end_eval();
+        // Now a fresh claim succeeds again.
+        assert!(state.try_begin_eval(), "try_begin_eval must succeed after end_eval");
+        state.end_eval();
+    }
+
+    // #12: EvalGuard drop clears the flag even on panic, so a panicking eval
+    // task cannot permanently block future evaluations.
+    #[test]
+    fn eval_guard_drop_clears_in_flight_flag_on_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AlertState::load(test_db(&dir));
+        assert!(state.try_begin_eval());
+
+        // Simulate a panicking task that holds an EvalGuard.
+        let guard = EvalGuard(state.clone());
+        let _ = std::panic::catch_unwind(move || {
+            let _g = guard;
+            panic!("task panic");
+        });
+
+        // The flag must be cleared by the drop-guard's Drop impl.
+        assert!(
+            state.try_begin_eval(),
+            "in-flight flag must be cleared after panicking task's EvalGuard drops"
+        );
+        state.end_eval();
+    }
+
     // ---- evaluation engine (Unit 4) ----
     //
     // `evaluate` is pure; these table-driven cases ARE the spec (the flow-analysis
@@ -1317,6 +1608,30 @@ mod tests {
         let (notes, after) = evaluate(at_noon(), &config, &runtime, sums(0.0, 200.0));
         assert!(notes.is_empty());
         assert_eq!(after.delta.last_step, 0, "disabled rule does not advance mid-month");
+
+        // Month rollover with a disabled rule: the rollover re-baseline branch
+        // fires unconditionally (it is not gated on `enabled`) so the new
+        // month's baseline is set to the current MTD step — no notification.
+        // Evaluation instant is June; prior runtime is keyed to May.
+        let prior_month_runtime = AlertRuntime {
+            delta: DeltaRuntime {
+                month_key: "2026-05".into(), // a prior month
+                last_step: 10,
+            },
+            ..AlertRuntime::default()
+        };
+        let now_june = local_at(2026, 6, 15, 12, 0);
+        // MTD in the new month is $150 → step 3 at $50/step.
+        let (notes2, after2) = evaluate(now_june, &config, &prior_month_runtime, sums(0.0, 150.0));
+        assert!(notes2.is_empty(), "rollover with disabled delta never fires");
+        assert_eq!(
+            after2.delta.month_key, "2026-06",
+            "rollover updates the month key even when delta is disabled"
+        );
+        assert_eq!(
+            after2.delta.last_step, 3,
+            "rollover re-baselines last_step to current MTD step"
+        );
     }
 
     /// R17: a delta milestone that would fire but lands in quiet hours is dropped
@@ -1529,6 +1844,7 @@ mod tests {
     /// while the dedup state the engine advanced is preserved.
     #[test]
     fn denied_show_sets_permission_lost_and_keeps_dedup_state() {
+        use tauri::plugin::PermissionState;
         let notes = vec![Notification {
             rule_type: RuleType::Burst,
             title: "Usage spike".into(),
@@ -1541,7 +1857,9 @@ mod tests {
             },
             ..AlertRuntime::default()
         };
-        let out = deliver_and_record(&notes, armed, |_| crate::notify::ShowOutcome::PermissionDenied);
+        let out = deliver_and_record(&notes, armed, PermissionState::Denied, |_| {
+            crate::notify::ShowOutcome::PermissionDenied
+        });
         assert!(out.permission_lost, "a denied show records permission_lost");
         assert_eq!(
             out.burst.cooldown_until_ms, 123,
@@ -1553,6 +1871,7 @@ mod tests {
     /// are all delivered.
     #[test]
     fn delivered_shows_do_not_set_permission_lost() {
+        use tauri::plugin::PermissionState;
         let notes = vec![
             Notification {
                 rule_type: RuleType::Burst,
@@ -1566,7 +1885,7 @@ mod tests {
             },
         ];
         let mut shown = 0;
-        let out = deliver_and_record(&notes, AlertRuntime::default(), |_| {
+        let out = deliver_and_record(&notes, AlertRuntime::default(), PermissionState::Granted, |_| {
             shown += 1;
             crate::notify::ShowOutcome::Delivered
         });
@@ -1577,6 +1896,7 @@ mod tests {
     /// Even a single denied delivery among several flips the flag.
     #[test]
     fn any_denied_delivery_flips_permission_lost() {
+        use tauri::plugin::PermissionState;
         let notes = vec![
             Notification {
                 rule_type: RuleType::Burst,
@@ -1590,8 +1910,9 @@ mod tests {
             },
         ];
         let mut first = true;
-        let out = deliver_and_record(&notes, AlertRuntime::default(), |_| {
-            // First delivered, second denied (permission revoked between sends).
+        // current_permission is Granted but one show() returns PermissionDenied —
+        // belt-and-suspenders path: the individual denial still flips the flag.
+        let out = deliver_and_record(&notes, AlertRuntime::default(), PermissionState::Granted, |_| {
             if std::mem::take(&mut first) {
                 crate::notify::ShowOutcome::Delivered
             } else {
@@ -1599,6 +1920,41 @@ mod tests {
             }
         });
         assert!(out.permission_lost);
+    }
+
+    /// Permission-lost clears when the OS state is Granted on the next cycle,
+    /// even with no notifications to deliver (pure permission re-check path).
+    /// This is the clearing path that makes permission_lost track the actual
+    /// OS state rather than latching permanently once set.
+    #[test]
+    fn permission_lost_clears_when_os_grants_permission_on_next_cycle() {
+        use tauri::plugin::PermissionState;
+        // Prior cycle recorded permission_lost = true.
+        let prior = AlertRuntime {
+            permission_lost: true,
+            ..AlertRuntime::default()
+        };
+        // This cycle: no notifications to send, OS now reports Granted.
+        let out = deliver_and_record(&[], prior, PermissionState::Granted, |_| {
+            crate::notify::ShowOutcome::Delivered // never called
+        });
+        assert!(
+            !out.permission_lost,
+            "Granted OS permission clears permission_lost even with no notifications"
+        );
+
+        // Denied OS state sets the flag even with no notifications.
+        let cleared = AlertRuntime {
+            permission_lost: false,
+            ..AlertRuntime::default()
+        };
+        let out2 = deliver_and_record(&[], cleared, PermissionState::Denied, |_| {
+            crate::notify::ShowOutcome::Delivered
+        });
+        assert!(
+            out2.permission_lost,
+            "Denied OS permission sets permission_lost even with no notifications to deliver"
+        );
     }
 
     // ---- debounce gate (should_run_ingest_eval) ----
@@ -1778,7 +2134,10 @@ mod tests {
     }
 
     /// A config save runs a re-evaluation through the same orchestrator: enabling
-    /// the burst rule with in-window spend fires immediately on save.
+    /// the burst rule with in-window spend fires immediately on save. The eval is
+    /// now offloaded to spawn_blocking so we give the thread pool a short window
+    /// to complete (the task is submitted synchronously before the command returns,
+    /// so it runs promptly — this is not a race, just async scheduling).
     #[test]
     fn config_save_reevaluates_immediately() {
         let (app, db, _dir) = mock_app_with_alerts();
@@ -1798,11 +2157,22 @@ mod tests {
         };
         alert_config_set(app.handle().clone(), config).expect("set");
 
-        let runtime = app.state::<AlertState>().runtime();
-        assert!(
-            runtime.burst.cooldown_until_ms > 0,
-            "a config save re-evaluates and can fire immediately"
-        );
+        // The re-eval was submitted to the thread pool synchronously before the
+        // command returned. Wait up to 500ms for it to complete (generous; the
+        // actual task completes in single-digit ms).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let runtime = app.state::<AlertState>().runtime();
+            if runtime.burst.cooldown_until_ms > 0 {
+                break; // eval completed and fired
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "a config save re-evaluates and can fire immediately (timed out waiting)"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// `gather_and_apply` tolerates an app with no managed `AlertState`/`DbState`

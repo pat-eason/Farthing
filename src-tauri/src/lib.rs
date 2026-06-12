@@ -107,10 +107,10 @@ pub fn run() {
                     if let Some(alert_state) = ingest_app.try_state::<alerts::AlertState>() {
                         let now_ms = chrono::Local::now().timestamp_millis();
                         if alert_state.should_run_ingest_eval(now_ms) {
-                            let eval_app = ingest_app.clone();
-                            tauri::async_runtime::spawn_blocking(move || {
-                                alerts::gather_and_apply(&eval_app);
-                            });
+                            // spawn_eval applies the in-flight guard (one task at
+                            // a time across all triggers) before submitting to the
+                            // thread pool.
+                            alerts::spawn_eval(&ingest_app);
                         }
                     }
                 }));
@@ -181,10 +181,9 @@ pub fn run() {
                     // (no ingest to trigger it). The query is the same cheap
                     // index-only scan; runs on a blocking task so it never holds
                     // up the tick.
-                    let eval_app = tick_app.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        alerts::gather_and_apply(&eval_app);
-                    });
+                    // spawn_eval applies the in-flight guard so a slow
+                    // backfill-held eval cannot queue unbounded tick tasks.
+                    alerts::spawn_eval(&tick_app);
                 }
             });
             Ok(())
@@ -212,6 +211,7 @@ pub fn run() {
             notify::notification_send_test,
             alerts::alert_config_get,
             alerts::alert_config_set,
+            alerts::alert_runtime_get,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,
