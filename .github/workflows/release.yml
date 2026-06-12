@@ -1,0 +1,167 @@
+name: Release
+
+# Tag-driven release pipeline: pushing a `v*` tag builds a universal macOS
+# .dmg, signs and notarizes it when the Apple secrets are configured (see
+# docs/release.md), and publishes a GitHub Release with the artifacts.
+#
+# Signing/notarization is OPTIONAL and gated on repo secrets so that forks
+# (and this repo before credentials exist) still get a working pipeline:
+#   - no secrets        -> unsigned .dmg, release is created as a DRAFT
+#   - signing secrets   -> Developer ID signed .dmg
+#   - + notary secrets  -> notarized + stapled, Gatekeeper-verified, published
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, sign, notarize, publish
+    runs-on: macos-latest
+    env:
+      # Secrets are not allowed in step `if:` expressions, so surface their
+      # presence as job-level env flags. All-or-nothing per group.
+      HAS_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify tag matches app version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          APP_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [ "$TAG_VERSION" != "$APP_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match tauri.conf.json version $APP_VERSION"
+            exit 1
+          fi
+
+      - name: Report signing configuration
+        run: |
+          echo "Signing secrets present:      $HAS_SIGNING"
+          echo "Notarization secrets present: $HAS_NOTARY"
+          if [ "$HAS_SIGNING" != "true" ]; then
+            echo "::warning::APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY not configured; building an UNSIGNED .dmg and publishing as a draft. See docs/release.md."
+          elif [ "$HAS_NOTARY" != "true" ]; then
+            echo "::warning::APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID not configured; the build will be signed but NOT notarized. See docs/release.md."
+          fi
+
+      # Tauri's bundler picks up the APPLE_* env vars natively: it imports the
+      # certificate into a temporary keychain, signs with the hardened runtime,
+      # and (when the notary vars are present) submits to Apple's notary
+      # service and staples the ticket. No extra tooling needed.
+      - name: Build universal .dmg (signed & notarized)
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: pnpm tauri build --target universal-apple-darwin --bundles app,dmg
+
+      - name: Build universal .dmg (unsigned)
+        if: env.HAS_SIGNING != 'true'
+        run: pnpm tauri build --target universal-apple-darwin --bundles app,dmg
+
+      - name: Verify code signature
+        if: env.HAS_SIGNING == 'true'
+        run: |
+          APP="$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          echo "Verifying: $APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Verify notarization (Gatekeeper assessment)
+        if: env.HAS_NOTARY == 'true'
+        run: |
+          APP="$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          xcrun stapler validate "$APP"
+          spctl --assess --type exec --verbose=2 "$APP"
+
+      - name: Collect artifacts
+        id: artifacts
+        run: |
+          DMG="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          if [ -z "$DMG" ]; then
+            echo "::error::No .dmg produced by the bundler"
+            exit 1
+          fi
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
+          shasum -a 256 "$DMG" | tee checksums.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifacts.outputs.dmg_name }}
+          path: |
+            ${{ steps.artifacts.outputs.dmg }}
+            checksums.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG: ${{ steps.artifacts.outputs.dmg }}
+        run: |
+          {
+            echo "## Install"
+            echo
+            echo "Download the .dmg below, open it, and drag the app to /Applications."
+            echo
+            if [ "$HAS_NOTARY" = "true" ]; then
+              echo "This build is Developer ID signed and notarized by Apple (Gatekeeper-verified in CI)."
+            elif [ "$HAS_SIGNING" = "true" ]; then
+              echo "> [!WARNING]"
+              echo "> This build is signed but **not notarized**; Gatekeeper will warn on first launch."
+            else
+              echo "> [!WARNING]"
+              echo "> This build is **unsigned** (built without Apple credentials); macOS will refuse to open it without right-click > Open. Do not ship this to users."
+            fi
+            echo
+            echo "### SHA-256"
+            echo
+            echo '```'
+            cat checksums.txt
+            echo '```'
+          } > release-notes.md
+
+          DRAFT_FLAG=""
+          if [ "$HAS_NOTARY" != "true" ]; then
+            DRAFT_FLAG="--draft"
+          fi
+
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --notes-file release-notes.md \
+            $DRAFT_FLAG \
+            "$DMG" checksums.txt

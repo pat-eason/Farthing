@@ -308,7 +308,7 @@ Public-readiness: naming, signing/notarization, CI releases, docs, final hardeni
 | ID | Title | Description | Priority | Complexity | Depends On | Status |
 |----|-------|-------------|----------|------------|------------|--------|
 | 6.1 | Name & branding | Final name (avoid ccusage/CCSeva collision), icon set, bundle identifier | Medium | S | — | done <!-- vk: --> |
-| 6.2 | Signing, notarization & release CI | Developer ID signing, notarization, GitHub Actions tag→.dmg release pipeline | High | L | 1.1 | <!-- vk: --> |
+| 6.2 | Signing, notarization & release CI | Developer ID signing, notarization, GitHub Actions tag→.dmg release pipeline | High | L | 1.1 | done <!-- vk: --> |
 | 6.3 | Docs & license | README (incl. exact settings.json changes made), architecture doc, contribution guide, LICENSE | Medium | M | 6.1 | <!-- vk: --> |
 | 6.4 | Onboarding polish & hardening | First-run UX pass, error/edge-case sweep (locked files, permission denials, odd configs), copy review | Medium | M | 2.2, 2.4, 2.5 | <!-- vk: --> |
 | 6.5 | v1.0 release | Clean-machine QA against the zero-config success metric, cut and publish v1.0 | High | M | 3.5, 4.4, 5.6, 6.2, 6.3, 6.4 | <!-- vk: --> |
@@ -320,9 +320,9 @@ Public-readiness: naming, signing/notarization, CI releases, docs, final hardeni
 - [x] Tray icon (template image, dark/light) and app icon assets in place — placeholder set from `scripts/generate-icons.py` (PIL, deterministic): `art/app-icon.png` 1024px master regenerated into `src-tauri/icons/` via `pnpm tauri icon`, plus `src-tauri/icons/tray-icon.png` 32px black+alpha glyph wired in `tray.rs` via `include_bytes!` + `Image::from_bytes` (tauri `image-png` feature) with `icon_as_template(true)` so macOS recolors it for dark/light menu bars; decode pinned by a unit test (207 total green)
 
 **6.2 - Signing, notarization & release CI**
-- [ ] Local signed build passes `spctl --assess`; notarization succeeds
-- [ ] Pushing a version tag produces a published GitHub Release with a notarized .dmg
-- [ ] Secrets (signing cert, notarization creds) stored as repo secrets, documented for forks
+- [ ] Local signed build passes `spctl --assess`; notarization succeeds — **blocked on human: no Apple Developer credentials exist yet** (see `docs/release.md` "Status / blockers"). Everything automatable is in place: `bundle.macOS.hardenedRuntime: true` + `minimumSystemVersion: 10.15` in `tauri.conf.json` (notarization requires the hardened runtime), local signed-build + `codesign`/`stapler`/`spctl` verification steps documented in `docs/release.md`. Unsigned local build verified: `pnpm tauri build --bundles app` produces the `.app` (ad-hoc linker signature; `spctl` rejects it as expected for an un-notarized build)
+- [ ] Pushing a version tag produces a published GitHub Release with a notarized .dmg — pipeline built and `actionlint`-clean, end-to-end run **blocked on the same Apple credentials**: `.github/workflows/release.yml` triggers on `v*` tags (+ `workflow_dispatch` dry runs), verifies tag == `tauri.conf.json` version, builds a universal (arm64+x86_64) `.dmg`, signs/notarizes via Tauri's native `APPLE_*` env support when secrets exist, hard-verifies with `codesign --verify --deep --strict` + `xcrun stapler validate` + `spctl --assess --type exec` so an un-assessed build can't publish, uploads `.dmg` + SHA-256 checksums, and creates the GitHub Release (published only when notarized; signed-only/unsigned builds become drafts with warning notes)
+- [x] Secrets (signing cert, notarization creds) stored as repo secrets, documented for forks — `docs/release.md` documents all six secrets (`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`) with exact steps to produce each, the App Store Connect API-key alternative, and the fork story (no secrets → same pipeline, unsigned draft). The workflow gates each step on secret presence via job-level `HAS_SIGNING`/`HAS_NOTARY` flags, so the secrets need only be added (no workflow edits). Storing the actual secret values is the human-blocked half
 
 **6.3 - Docs & license**
 - [ ] README covers: what it does, install, the exact settings.json modifications (verbatim), uninstall, privacy posture (loopback-only, local-only data)
