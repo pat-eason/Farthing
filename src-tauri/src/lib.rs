@@ -9,6 +9,7 @@ pub mod db;
 pub mod health;
 pub mod ingest;
 pub mod metrics;
+pub mod notify;
 pub mod onboarding;
 pub mod pricing;
 pub mod queries;
@@ -30,6 +31,9 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // Native desktop notifications for cost alerts (notify.rs). Driven
+        // from Rust via NotificationExt; display-only (no click handlers).
+        .plugin(tauri_plugin_notification::init())
         // Anchors the popover window to the tray icon (tray.rs feeds it the
         // tray events it positions against).
         .plugin(tauri_plugin_positioner::init())
@@ -159,6 +163,9 @@ pub fn run() {
             queries::home_dir,
             capture::capture_status,
             capture::capture_set_paused,
+            notify::notification_permission_state,
+            notify::notification_request_permission,
+            notify::notification_send_test,
             onboarding::onboarding_status,
             onboarding::onboarding_apply,
             autostart::autostart_status,
