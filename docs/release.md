@@ -90,6 +90,16 @@ spctl --assess --type exec --verbose=2 "$APP"   # must report "accepted, source=
 
 `spctl --assess` only accepts notarized Developer ID builds; an ad-hoc or unsigned local build is expected to be rejected.
 
+## Stable download URL
+
+Every release uploads two assets: the versioned DMG (`Farthing_X.Y.Z_universal.dmg`) and a stable-named copy (`Farthing.dmg`). The stable copy enables a permanent direct-download link for the brochure site:
+
+```
+https://github.com/pat-eason/Farthing/releases/latest/download/Farthing.dmg
+```
+
+GitHub's `/releases/latest/download/` redirect always resolves to the most recently published (non-draft) release, so this URL updates automatically on every notarized release.
+
 ## Status / blockers
 
 - [ ] **Blocked on human**: no Apple Developer credentials exist yet. Add the six secrets above, push a tag, and confirm the `Verify notarization` step passes and the release publishes non-draft. Until then the automated flow still works end to end: it produces an unsigned `.dmg` and a **draft** release.
