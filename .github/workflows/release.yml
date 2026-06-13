@@ -145,9 +145,12 @@ jobs:
             echo "::error::No .dmg produced by the bundler"
             exit 1
           fi
+          STABLE_DMG="$(dirname "$DMG")/Farthing.dmg"
+          cp "$DMG" "$STABLE_DMG"
           echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
           echo "dmg_name=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
-          shasum -a 256 "$DMG" | tee checksums.txt
+          echo "stable_dmg=$STABLE_DMG" >> "$GITHUB_OUTPUT"
+          shasum -a 256 "$DMG" "$STABLE_DMG" | tee checksums.txt
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -212,4 +215,4 @@ jobs:
             --verify-tag \
             --notes-file release-notes.md \
             $DRAFT_FLAG \
-            "$DMG" checksums.txt
+            "$DMG" "${{ steps.artifacts.outputs.stable_dmg }}" checksums.txt
