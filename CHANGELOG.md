@@ -1,5 +1,21 @@
 # farthing
 
+## 0.4.0
+
+### Minor Changes
+
+- [#11](https://github.com/pat-eason/Farthing/pull/11) [`8afd004`](https://github.com/pat-eason/Farthing/commit/8afd004cebbdfe93ef897c2503f48693bd3477fd) Thanks [@pat-eason](https://github.com/pat-eason)! - Add conversation transcript viewer. Clicking a request row in Sessions opens a modal showing the full reasoning chain (user prompt → tool calls → assistant answer) with markdown rendering and collapsible thinking blocks. A "View full transcript" button on expanded sessions opens a session-level view with every request as an outlined chunk, each showing its cost.
+
+- [#13](https://github.com/pat-eason/Farthing/pull/13) [`81af89d`](https://github.com/pat-eason/Farthing/commit/81af89dec37ddb799936ecd83892435977613936) Thanks [@pat-eason](https://github.com/pat-eason)! - Add Linux support: Farthing now builds and runs on Ubuntu 22.04+, Debian Bookworm+, Fedora 38+, and Arch/Manjaro. Includes deb, rpm, and AppImage release artifacts. No changes to macOS behavior.
+
+- [#10](https://github.com/pat-eason/Farthing/pull/10) [`a147d38`](https://github.com/pat-eason/Farthing/commit/a147d382d66385041eebf874a21d8bc4e7ad772e) Thanks [@pat-eason](https://github.com/pat-eason)! - Add subscription plan usage (rolling-window limits) and display mode
+
+  Claude Max/Pro subscribers can now opt in to see their 5-hour session and weekly usage windows — as utilization percentages with reset countdowns — instead of (or alongside) API-equivalent cost. A new display mode toggle in Settings and onboarding switches the menu-bar readout between "$1.23" (API Mode) and "5h 4% · $1.23" (Subscription Mode). A near-limit warning (>75%) appears in both modes. New Plan Usage desktop view, compact popover block, and a mode-choice step in onboarding.
+
+### Patch Changes
+
+- [#15](https://github.com/pat-eason/Farthing/pull/15) [`7a8c4f7`](https://github.com/pat-eason/Farthing/commit/7a8c4f7f3636fb022fabb74f934a15ae669dd8f3) Thanks [@pat-eason](https://github.com/pat-eason)! - Notify the farthing-web marketing site on published releases: a new `notify-web.yml` workflow sends a `repository_dispatch` carrying the release tag, so the site's version badge stays in sync. Requires a `FARTHING_WEB_DISPATCH_TOKEN` secret (see docs/release.md).
+
 ## 0.3.0
 
 ### Minor Changes
