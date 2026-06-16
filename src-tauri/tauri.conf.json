@@ -44,9 +44,19 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Pat Eason",
+    "category": "Utility",
     "macOS": {
       "hardenedRuntime": true,
       "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {
+        "section": "utils"
+      },
+      "rpm": {
+        "release": "1"
+      }
     },
     "icon": [
       "icons/32x32.png",

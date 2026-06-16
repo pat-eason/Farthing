@@ -33,8 +33,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         // Native save dialog for the report-export destination (export.rs).
         .plugin(tauri_plugin_dialog::init())
-        // LaunchAgent mode per PRD; enabled during onboarding, toggleable
-        // on the settings view (autostart.rs).
+        // Login-item / autostart registration. The MacosLauncher::LaunchAgent
+        // argument selects the macOS launcher strategy (writes
+        // ~/Library/LaunchAgents/<id>.plist); it is ignored on Linux, where the
+        // plugin uses XDG autostart (~/.config/autostart/<id>.desktop). The
+        // MacosLauncher type is re-exported unconditionally by the plugin and
+        // compiles on all platforms (verified by the rust-linux CI job).
+        // Enabled during onboarding, toggleable on the settings view (autostart.rs).
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,

@@ -6,7 +6,7 @@
 
 > Keeps count of every farthing of your Claude Code spend.
 
-A macOS menu bar app that makes Claude Code token and dollar usage visible with **zero manual configuration**. Install it, click "Set up" once, and every Claude Code session on your machine starts reporting per-request usage: cost, tokens (input/output/cache read/cache creation), model, project, and session, surfaced through a menu bar popover and a full desktop UI.
+A macOS and Linux menu bar app that makes Claude Code token and dollar usage visible with **zero manual configuration**. Install it, click "Set up" once, and every Claude Code session on your machine starts reporting per-request usage: cost, tokens (input/output/cache read/cache creation), model, project, and session, surfaced through a menu bar popover and a full desktop UI.
 
 ## What it does
 
@@ -25,12 +25,29 @@ Costs are **API-equivalent spend**: computed the way the API would bill those to
 
 ## Install
 
+### macOS
+
 1. Download the latest `.dmg` from the GitHub Releases page.
 2. Open it and drag the app to Applications.
 3. Launch the app, then click the menu bar icon. First run opens onboarding:
    - It shows the exact `settings.json` diff and any conflicts with existing OTel configuration. Nothing is written until you confirm.
    - It registers the app as a login item (LaunchAgent) so the receiver is always up. This is shown and toggleable in Settings.
 4. **Restart any running Claude Code sessions.** The `env` block is read at session startup, so sessions started before setup never export.
+
+### Linux
+
+**Requirements**: Ubuntu 22.04+, Debian Bookworm+, Fedora 38+, or any distro with WebKit2GTK 4.1 and a compatible system tray. Ubuntu 20.04 is not supported (ships WebKit2GTK 4.0).
+
+1. Download the package for your distro from the GitHub Releases page:
+   - `.deb` — Ubuntu / Debian: `sudo dpkg -i farthing_*.deb`
+   - `.rpm` — Fedora / RHEL: `sudo rpm -i farthing-*.rpm`
+   - `.AppImage` — any distro: `chmod +x Farthing_*.AppImage && ./Farthing_*.AppImage`
+2. Launch Farthing. The tray icon appears in a compatible system tray; onboarding opens from there.
+3. **Restart any running Claude Code sessions** after onboarding completes.
+
+**GNOME users**: the tray icon requires the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) extension. It ships pre-enabled on Ubuntu. On Fedora Workstation (vanilla GNOME) you need to install it manually — the app still starts and the main window is reachable from the `.desktop` launcher, but the tray icon is invisible without the extension.
+
+**Wayland**: the popover window opens near the tray icon on X11 and XWayland. On native Wayland sessions the position is approximate (best-effort via `tauri-plugin-positioner`; precise layer-shell anchoring is deferred to a future release).
 
 That's it: new Claude Code sessions report usage automatically, and the first backfill pass fills in your existing history.
 
@@ -81,7 +98,7 @@ Safety properties of the merge (all fixture-tested; see `src-tauri/src/settings_
 Settings → Uninstall reverses everything, with a confirmation screen listing exactly what will and won't be removed:
 
 1. **settings.json**: a strict unmerge removes only app-owned content: each of the five env keys (only if still holding the exact value the app wrote; values you edited are left alone) and any `SessionStart` hook whose command targets `http://127.0.0.1:43177/session`. One last backup is taken first. Everything else in the file is untouched.
-2. **LaunchAgent**: the login item is removed.
+2. **Login item / autostart**: the LaunchAgent (macOS) or XDG autostart entry (Linux) is removed.
 3. **Database**: deleted only if you explicitly opt in; otherwise your usage history stays on disk.
 
 Not removed: the settings.json backups (kept so you can restore any earlier state) and the app bundle itself (drag it to the Trash).
@@ -89,7 +106,7 @@ Not removed: the settings.json backups (kept so you can restore any earlier stat
 ## Privacy posture
 
 - **Loopback only**: the receiver binds `127.0.0.1` exclusively. Nothing listens on a network interface; no data ever leaves your machine.
-- **Local-only data**: all usage data lives in a SQLite database at `~/Library/Application Support/com.peason.farthing/usage.db`. There is no telemetry, no analytics, no remote sync of any kind.
+- **Local-only data**: all usage data lives in a SQLite database — `~/Library/Application Support/com.peason.farthing/usage.db` on macOS, `~/.local/share/com.peason.farthing/usage.db` on Linux. There is no telemetry, no analytics, no remote sync of any kind.
 - **No content stored**: only usage numbers and metadata (tokens, cost, model, session id, timestamps, project directory paths). Prompt and response content is never stored. Account-identity attributes present on Claude Code's OTel events (`user.email`, `user.id`, `organization.id`, ...) are deliberately not persisted.
 - **One outbound request, optional in effect**: on startup the app refreshes its model-pricing table from a pinned LiteLLM pricing JSON URL (fail-silent, cached locally, used only to price backfilled rows for which Claude Code did not report a cost). No usage data is sent; it is a plain GET for a public file. If it fails or is blocked, the bundled pricing snapshot is used.
 
