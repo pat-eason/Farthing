@@ -1,0 +1,17 @@
+{
+  "five_hour": {
+    "utilization": 87.5,
+    "resets_at": "2026-06-13T04:10:00+00:00",
+    "future_field": "ignored"
+  },
+  "seven_day": { "utilization": 42.0, "resets_at": 1750197600, "unused_key": 999 },
+  "seven_day_sonnet": { "utilization": 12.3, "resets_at": "2026-06-17T20:00:00+00:00" },
+  "seven_day_opus": { "utilization": 67.8, "resets_at": "2026-06-17T20:00:00+00:00" },
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": 50.0,
+    "used_credits": 12.5,
+    "utilization": 25.0
+  },
+  "new_top_level_bucket": { "utilization": 10.0, "resets_at": "2026-06-20T00:00:00+00:00" }
+}

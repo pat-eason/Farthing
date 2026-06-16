@@ -15,6 +15,13 @@
     type UninstallStatus,
   } from "$lib/uninstall";
   import { getBudgetConfig, setBudgetConfig, type BudgetConfig } from "$lib/budgets";
+  import {
+    getUsageLimitsConfig,
+    setUsageLimitsConfig,
+    setDisplayMode,
+    type UsageLimitsConfig,
+    type DisplayMode,
+  } from "$lib/usage";
 
   // --- Budgets (configured here in Settings) ---
   // The config also carries notify/approach_pct for the deferred
@@ -36,6 +43,10 @@
   let uninstallOutcome: UninstallOutcome | undefined = $state();
   let uninstallError = $state("");
   let deleteDatabase = $state(false);
+
+  let usageConfig: UsageLimitsConfig | undefined = $state();
+  let usageError = $state("");
+  let usageBusy = $state(false);
 
   // `budgetConfig` is the working/optimistic copy bound to the inputs;
   // `budgetConfirmed` is the last value the backend accepted (revert target).
@@ -114,6 +125,45 @@
       show_in_tray: c.show_in_tray,
       approach_pct: c.approach_pct,
     };
+  }
+
+  async function loadUsageConfig() {
+    usageError = "";
+    try {
+      usageConfig = await getUsageLimitsConfig();
+    } catch (err) {
+      usageError = String(err);
+    }
+  }
+
+  async function toggleUsagePoller() {
+    if (!usageConfig || usageBusy) return;
+    usageBusy = true;
+    try {
+      const next = { ...usageConfig, enabled: !usageConfig.enabled };
+      // When disabling, backend resets mode to 'api' — reflect that locally
+      if (!next.enabled) next.display_mode = "api";
+      await setUsageLimitsConfig(next);
+      usageConfig = await getUsageLimitsConfig();
+    } catch (err) {
+      usageError = String(err);
+    } finally {
+      usageBusy = false;
+    }
+  }
+
+  async function toggleDisplayMode() {
+    if (!usageConfig || usageBusy) return;
+    usageBusy = true;
+    try {
+      const next: DisplayMode = usageConfig.display_mode === "api" ? "subscription" : "api";
+      await setDisplayMode(next);
+      usageConfig = await getUsageLimitsConfig();
+    } catch (err) {
+      usageError = String(err);
+    } finally {
+      usageBusy = false;
+    }
   }
 
   async function loadBudgets() {
@@ -210,6 +260,7 @@
   $effect(() => {
     void refresh();
     void loadBudgets();
+    void loadUsageConfig();
   });
 </script>
 
@@ -278,6 +329,65 @@
         </span>
       </div>
     </section>
+  {/if}
+
+  {#if usageError}
+    <p class="error-box">{usageError}</p>
+  {/if}
+  {#if usageConfig}
+    <section class="setting">
+      <div class="setting-text">
+        <h2>Plan Usage polling</h2>
+        <p class="muted">
+          Reads your Claude Code login token from the macOS keychain and queries Anthropic for your
+          plan-usage percentages (5h session and weekly limits) every 5 minutes. Subscription plan
+          only.
+        </p>
+        {#if usageConfig.enabled}
+          <p class="muted" style="margin-top: 0.4rem; font-size: 0.85em;">
+            ✓ Enabled — check the <a href={resolve("/(app)/usage")}>Plan Usage</a> view for current windows.
+          </p>
+        {/if}
+      </div>
+      <div class="setting-control">
+        <button
+          class:primary={!usageConfig.enabled}
+          disabled={usageBusy}
+          onclick={() => void toggleUsagePoller()}
+          aria-pressed={usageConfig.enabled}
+        >
+          {usageBusy ? "Working…" : usageConfig.enabled ? "Turn off" : "Turn on"}
+        </button>
+        <span class="state {usageConfig.enabled ? 'good' : 'muted'}">
+          {usageConfig.enabled ? "On" : "Off"}
+        </span>
+      </div>
+    </section>
+
+    {#if usageConfig.enabled}
+      <section class="setting">
+        <div class="setting-text">
+          <h2>Display mode</h2>
+          <p class="muted">
+            Decides what the menu-bar readout shows as primary.<br />
+            <strong>API Mode:</strong> today's cost (e.g. $1.23).<br />
+            <strong>Subscription Mode:</strong> window utilization (e.g. 5h 4%) with cost secondary.
+          </p>
+        </div>
+        <div class="setting-control">
+          <button
+            class:primary={usageConfig.display_mode === "api"}
+            disabled={usageBusy}
+            onclick={() => void toggleDisplayMode()}
+          >
+            {usageConfig.display_mode === "api" ? "Switch to Subscription" : "Switch to API"}
+          </button>
+          <span class="state good">
+            {usageConfig.display_mode === "api" ? "API Mode" : "Subscription Mode"}
+          </span>
+        </div>
+      </section>
+    {/if}
   {/if}
 
   <section class="setting">
