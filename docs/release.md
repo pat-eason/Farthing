@@ -102,9 +102,9 @@ GitHub's `/releases/latest/download/` redirect always resolves to the most recen
 
 ## Marketing site notification
 
-Publishing a GitHub Release also notifies the marketing site (`pat-eason/farthing-web`) via `.github/workflows/notify-web.yml`. The workflow sends a `repository_dispatch` of type `farthing-release` carrying the release tag as `client_payload.version`; farthing-web's `update-version` workflow then writes the version into its source and redeploys.
+Publishing a GitHub Release also notifies the marketing site (`pat-eason/farthing-web`) so it can refresh its version badge. A final step in the `release` job of `.github/workflows/release.yml` sends a `repository_dispatch` of type `farthing-release` carrying the release tag as `client_payload.version`; farthing-web's `update-version` workflow then writes the version into its source and redeploys.
 
-Because it keys on `release: published` (not the tag push), **draft releases — the unsigned/not-notarized path — do not notify the site** until you explicitly publish them.
+The dispatch lives inside `release.yml` rather than in a separate `release: published` workflow on purpose: the release is created with `GITHUB_TOKEN`, and GitHub **suppresses workflow triggers from `GITHUB_TOKEN`-generated events**, so a release-event workflow would never fire. The step is gated on a real (non-draft, notarized) publish — **draft releases, the unsigned/not-notarized path, do not notify the site.**
 
 ### Required secret: `FARTHING_WEB_DISPATCH_TOKEN`
 
