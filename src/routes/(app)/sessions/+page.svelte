@@ -18,6 +18,8 @@
     type SessionSort,
     type UsageSummary,
   } from "$lib/queries";
+  import TranscriptModal from "$lib/TranscriptModal.svelte";
+  import SessionTranscriptModal from "$lib/SessionTranscriptModal.svelte";
   import { facets } from "$lib/facets.svelte";
   import {
     formatCost,
@@ -64,6 +66,8 @@
   let detailError = $state("");
   let detailLoading = $state(false);
   let detailSeq = 0;
+  let openTranscript: { sessionId: string; requestId: string } | null = $state(null);
+  let openSessionTranscript: string | null = $state(null);
 
   $effect(() => {
     void refreshKey;
@@ -495,6 +499,15 @@
                       <div class="detail-header">
                         <span class="detail-project">{detail.cwd ?? "(unknown project)"}</span>
                         <span class="muted mono">{detail.session_id}</span>
+                        <button
+                          type="button"
+                          class="transcript-btn"
+                          onclick={() => {
+                            openSessionTranscript = detail!.session_id;
+                          }}
+                        >
+                          View full transcript
+                        </button>
                       </div>
 
                       <div class="detail-panels">
@@ -588,7 +601,32 @@
                           </thead>
                           <tbody>
                             {#each detail.requests as request, i (i)}
-                              <tr class:error-row={request.event_type === "api_error"}>
+                              <tr
+                                class:error-row={request.event_type === "api_error"}
+                                class:transcript-row={request.request_id !== null}
+                                role={request.request_id !== null ? "button" : undefined}
+                                tabindex={request.request_id !== null ? 0 : undefined}
+                                onclick={() => {
+                                  if (request.request_id !== null) {
+                                    openTranscript = {
+                                      sessionId: row.session_id,
+                                      requestId: request.request_id,
+                                    };
+                                  }
+                                }}
+                                onkeydown={(e) => {
+                                  if (
+                                    request.request_id !== null &&
+                                    (e.key === "Enter" || e.key === " ")
+                                  ) {
+                                    e.preventDefault();
+                                    openTranscript = {
+                                      sessionId: row.session_id,
+                                      requestId: request.request_id,
+                                    };
+                                  }
+                                }}
+                              >
                                 <td class="nowrap" title={formatDateTime(request.timestamp_ms)}>
                                   {formatTime(request.timestamp_ms)}
                                 </td>
@@ -661,6 +699,25 @@
     {/if}
   {/if}
 </div>
+
+{#if openTranscript}
+  <TranscriptModal
+    sessionId={openTranscript.sessionId}
+    requestId={openTranscript.requestId}
+    onclose={() => {
+      openTranscript = null;
+    }}
+  />
+{/if}
+
+{#if openSessionTranscript}
+  <SessionTranscriptModal
+    sessionId={openSessionTranscript}
+    onclose={() => {
+      openSessionTranscript = null;
+    }}
+  />
+{/if}
 
 <style>
   .sessions-view {
@@ -955,6 +1012,38 @@
     color: #b42318;
   }
 
+  .transcript-btn {
+    appearance: none;
+    border: 1px solid rgba(10, 132, 255, 0.4);
+    border-radius: 5px;
+    background: rgba(10, 132, 255, 0.07);
+    color: #0a6ad1;
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 550;
+    padding: 0.2rem 0.55rem;
+    cursor: pointer;
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
+  .transcript-btn:hover {
+    background: rgba(10, 132, 255, 0.14);
+  }
+
+  .transcript-row {
+    cursor: pointer;
+  }
+
+  .transcript-row:hover {
+    background: rgba(10, 132, 255, 0.05);
+  }
+
+  .transcript-row:focus-visible {
+    outline: 2px solid #0a84ff;
+    outline-offset: -2px;
+  }
+
   .load-more {
     appearance: none;
     margin-top: 0.8rem;
@@ -1072,6 +1161,20 @@
 
     .error-row td {
       color: #ffa198;
+    }
+
+    .transcript-btn {
+      border-color: rgba(64, 156, 255, 0.4);
+      background: rgba(64, 156, 255, 0.1);
+      color: #8cc1ff;
+    }
+
+    .transcript-btn:hover {
+      background: rgba(64, 156, 255, 0.18);
+    }
+
+    .transcript-row:hover {
+      background: rgba(64, 156, 255, 0.08);
     }
 
     .load-more {

@@ -36,6 +36,17 @@ results, attachments collapsed to their `type`, any other string > 80 chars).
   - line 12: a real assistant line truncated mid-JSON (hand-truncated) —
     counted malformed, not fatal
 
+- `content-blocks.jsonl` — synthetic fixture (hand-written) exercising message
+  content extraction and `collapse_messages`. 4 lines:
+  - line 1: `user` turn with a plain text prompt ("What files are here?")
+  - line 2: first streaming `assistant` chunk (`req_content_001`), partial
+    content — a `thinking` block and a `tool_use` block; `output_tokens: 5`
+  - line 3: second (final) streaming `assistant` chunk, same `requestId`,
+    fuller content — adds a `text` block between the existing blocks;
+    `output_tokens: 15`; this line should win when collapsing
+  - line 4: `user` tool-result turn (`tool_result` content block) with a
+    non-null `toolUseResult` field; `parentUuid` points to stream2
+
 ## Regenerating
 
 Fixtures were produced by a one-shot script that reads the source

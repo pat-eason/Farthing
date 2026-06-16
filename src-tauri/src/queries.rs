@@ -767,6 +767,9 @@ pub struct RequestDetail {
     pub cache_creation_1h_tokens: Option<i64>,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
+    /// The `requests.request_id` for this row; `None` for api_error rows and
+    /// rows ingested before the request_id column was populated.
+    pub request_id: Option<String>,
 }
 
 /// One model's share of a session (the drill-in model mix), aggregated over
@@ -839,7 +842,7 @@ pub fn session_detail_for(
             r.source, r.cost_usd, r.input_tokens, r.output_tokens,
             r.cache_read_tokens, r.cache_creation_tokens,
             r.cache_creation_5m_tokens, r.cache_creation_1h_tokens,
-            r.duration_ms, r.error
+            r.duration_ms, r.error, r.request_id
          FROM requests r {where_clause}
          ORDER BY r.timestamp_ms, r.id
          LIMIT ?"
@@ -864,6 +867,7 @@ pub fn session_detail_for(
                 cache_creation_1h_tokens: row.get(11)?,
                 duration_ms: row.get(12)?,
                 error: row.get(13)?,
+                request_id: row.get(14)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -910,6 +914,408 @@ pub fn session_detail<R: Runtime>(
         chrono::Local::now(),
     )
     .map_err(|err| format!("cannot query session detail: {err}"))
+}
+
+// ---------------------------------------------------------------------------
+// request_transcript (conversation chain for a clicked request)
+// ---------------------------------------------------------------------------
+
+/// One parsed content block from a transcript message.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+        #[serde(default)]
+        is_error: bool,
+    },
+    /// Forward-compat: unknown block type stored verbatim.
+    Unknown {
+        raw_type: Option<String>,
+        raw: serde_json::Value,
+    },
+}
+
+/// One turn (user or assistant) in a conversation chain.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TranscriptTurn {
+    pub role: String,
+    pub timestamp_ms: i64,
+    pub request_id: Option<String>,
+    pub blocks: Vec<ContentBlock>,
+    /// Raw parsed `toolUseResult` for user turns that carry one.
+    pub tool_use_result: Option<serde_json::Value>,
+}
+
+/// Full reasoning chain for one request: the originating human prompt →
+/// intermediate tool-use/tool-result turns → this assistant answer.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RequestTranscript {
+    pub request_id: String,
+    pub session_id: String,
+    /// Turns in chronological order (oldest prompt first).
+    pub turns: Vec<TranscriptTurn>,
+    /// `false` if the parent-chain walk hit a missing node (cleaned-up transcript).
+    pub chain_complete: bool,
+}
+
+/// Parse a JSON content array into [`ContentBlock`]s. Returns an empty vec on
+/// any parse failure or if the value is not an array (version-tolerant).
+fn parse_blocks(content_json: &str) -> Vec<ContentBlock> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(content_json) else {
+        return vec![];
+    };
+    let Some(arr) = val.as_array() else {
+        return vec![];
+    };
+    arr.iter()
+        .map(|elem| {
+            let type_str = elem.get("type").and_then(|v| v.as_str());
+            match type_str {
+                Some("text") => ContentBlock::Text {
+                    text: elem
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                },
+                Some("thinking") => ContentBlock::Thinking {
+                    thinking: elem
+                        .get("thinking")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                },
+                Some("tool_use") => ContentBlock::ToolUse {
+                    id: elem
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    name: elem
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    input: elem
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                },
+                Some("tool_result") => ContentBlock::ToolResult {
+                    tool_use_id: elem
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    content: elem
+                        .get("content")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    is_error: elem
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                },
+                other => ContentBlock::Unknown {
+                    raw_type: other.map(str::to_string),
+                    raw: elem.clone(),
+                },
+            }
+        })
+        .collect()
+}
+
+/// Internal row type for the parent-chain walk.
+struct MessageRow {
+    parent_uuid: Option<String>,
+    role: String,
+    timestamp_ms: i64,
+    request_id: Option<String>,
+    content: String,
+    tool_use_result: Option<String>,
+}
+
+/// Walk the parent_uuid chain backward from the assistant turn identified by
+/// `request_id`, returning the full conversation chain in chronological order.
+///
+/// Returns an empty `turns` vec (with `chain_complete = false`) if no message
+/// row is linked to `request_id`. Returns a single-turn result (with
+/// `chain_complete = true`) when the assistant turn has no parent. A missing
+/// intermediate parent sets `chain_complete = false`.
+pub fn request_transcript_for(
+    db: &Db,
+    session_id: &str,
+    request_id: &str,
+) -> Result<RequestTranscript, rusqlite::Error> {
+    let conn = db.conn();
+
+    // Step 1: look up the assistant row by request_id.
+    let assistant: Option<MessageRow> = conn
+        .query_row(
+            "SELECT parent_uuid, role, timestamp_ms, request_id, content, tool_use_result
+             FROM messages WHERE request_id = ?1 LIMIT 1",
+            [request_id],
+            |row| {
+                Ok(MessageRow {
+                    parent_uuid: row.get(0)?,
+                    role: row.get(1)?,
+                    timestamp_ms: row.get(2)?,
+                    request_id: row.get(3)?,
+                    content: row.get(4)?,
+                    tool_use_result: row.get(5)?,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+
+    let Some(assistant) = assistant else {
+        return Ok(RequestTranscript {
+            request_id: request_id.to_owned(),
+            session_id: session_id.to_owned(),
+            turns: vec![],
+            chain_complete: false,
+        });
+    };
+
+    // Step 2: walk backward via parent_uuid, collecting rows.
+    let mut rows: Vec<MessageRow> = Vec::new();
+    rows.push(assistant);
+
+    let mut chain_complete = true;
+    const MAX_HOPS: usize = 64;
+
+    for _ in 0..MAX_HOPS {
+        let parent_uuid = match rows.last().and_then(|r| r.parent_uuid.as_deref()) {
+            Some(p) => p.to_owned(),
+            None => break, // reached the root (parent_uuid IS NULL)
+        };
+
+        let parent: Option<MessageRow> = conn
+            .query_row(
+                "SELECT parent_uuid, role, timestamp_ms, request_id, content, tool_use_result
+                 FROM messages WHERE uuid = ?1",
+                [&parent_uuid],
+                |row| {
+                    Ok(MessageRow {
+                        parent_uuid: row.get(0)?,
+                        role: row.get(1)?,
+                        timestamp_ms: row.get(2)?,
+                        request_id: row.get(3)?,
+                        content: row.get(4)?,
+                        tool_use_result: row.get(5)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+
+        match parent {
+            Some(row) => rows.push(row),
+            None => {
+                chain_complete = false;
+                break;
+            }
+        }
+    }
+
+    // If we exhausted MAX_HOPS without hitting a root, mark incomplete.
+    if rows.len() > MAX_HOPS {
+        chain_complete = false;
+    }
+
+    // Step 3: reverse to chronological order, map to TranscriptTurn.
+    rows.reverse();
+    let turns = rows
+        .into_iter()
+        .map(|row| TranscriptTurn {
+            role: row.role,
+            timestamp_ms: row.timestamp_ms,
+            request_id: row.request_id,
+            blocks: parse_blocks(&row.content),
+            tool_use_result: row
+                .tool_use_result
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
+        })
+        .collect();
+
+    Ok(RequestTranscript {
+        request_id: request_id.to_owned(),
+        session_id: session_id.to_owned(),
+        turns,
+        chain_complete,
+    })
+}
+
+/// Frontend query: full reasoning chain for a clicked request.
+#[tauri::command]
+pub fn request_transcript<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    session_id: String,
+    request_id: String,
+) -> Result<RequestTranscript, String> {
+    let state = app.state::<DbState>();
+    let db = state.0.lock().expect("db mutex poisoned");
+    request_transcript_for(&db, &session_id, &request_id)
+        .map_err(|err| format!("cannot query request transcript: {err}"))
+}
+
+// ---------------------------------------------------------------------------
+// session_transcript (all request chunks for a session)
+// ---------------------------------------------------------------------------
+
+/// One request's worth of turns in a session transcript, with its cost.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionTranscriptChunk {
+    pub request_id: String,
+    pub timestamp_ms: i64,
+    pub cost_usd: Option<f64>,
+    pub model: Option<String>,
+    pub turns: Vec<TranscriptTurn>,
+}
+
+/// All transcript chunks for a session, in chronological order.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionTranscript {
+    pub session_id: String,
+    /// Only requests that have at least one stored message are included.
+    pub chunks: Vec<SessionTranscriptChunk>,
+}
+
+pub fn session_transcript_for(
+    db: &Db,
+    session_id: &str,
+) -> Result<SessionTranscript, rusqlite::Error> {
+    let conn = db.conn();
+
+    // All api_request rows for the session that have a request_id.
+    struct ReqRow {
+        request_id: String,
+        timestamp_ms: i64,
+        cost_usd: Option<f64>,
+        model: Option<String>,
+    }
+    let mut req_stmt = conn.prepare(
+        "SELECT request_id, timestamp_ms, cost_usd, model
+         FROM requests
+         WHERE session_id = ?1 AND event_type = 'api_request' AND request_id IS NOT NULL
+         ORDER BY timestamp_ms ASC",
+    )?;
+    let requests: Vec<ReqRow> = req_stmt
+        .query_map([session_id], |row| {
+            Ok(ReqRow {
+                request_id: row.get(0)?,
+                timestamp_ms: row.get(1)?,
+                cost_usd: row.get(2)?,
+                model: row.get(3)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+
+    if requests.is_empty() {
+        return Ok(SessionTranscript {
+            session_id: session_id.to_owned(),
+            chunks: vec![],
+        });
+    }
+
+    // All messages for the session that belong to a request, oldest first.
+    struct MsgRow {
+        request_id: String,
+        role: String,
+        timestamp_ms: i64,
+        content: String,
+        tool_use_result: Option<String>,
+    }
+    let mut msg_stmt = conn.prepare(
+        "SELECT request_id, role, timestamp_ms, content, tool_use_result
+         FROM messages
+         WHERE session_id = ?1 AND request_id IS NOT NULL
+         ORDER BY timestamp_ms ASC",
+    )?;
+    let messages: Vec<MsgRow> = msg_stmt
+        .query_map([session_id], |row| {
+            Ok(MsgRow {
+                request_id: row.get(0)?,
+                role: row.get(1)?,
+                timestamp_ms: row.get(2)?,
+                content: row.get(3)?,
+                tool_use_result: row.get(4)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+
+    // Group messages by request_id (messages arrived ordered by timestamp).
+    let mut msg_map: std::collections::HashMap<String, Vec<MsgRow>> =
+        std::collections::HashMap::new();
+    for msg in messages {
+        msg_map.entry(msg.request_id.clone()).or_default().push(msg);
+    }
+
+    // Build one chunk per request that has messages, in request order.
+    let chunks: Vec<SessionTranscriptChunk> = requests
+        .into_iter()
+        .filter_map(|req| {
+            let msgs = msg_map.remove(&req.request_id)?;
+            let turns = msgs
+                .into_iter()
+                .map(|m| TranscriptTurn {
+                    role: m.role,
+                    timestamp_ms: m.timestamp_ms,
+                    request_id: Some(m.request_id),
+                    blocks: parse_blocks(&m.content),
+                    tool_use_result: m
+                        .tool_use_result
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok()),
+                })
+                .collect();
+            Some(SessionTranscriptChunk {
+                request_id: req.request_id,
+                timestamp_ms: req.timestamp_ms,
+                cost_usd: req.cost_usd,
+                model: req.model,
+                turns,
+            })
+        })
+        .collect();
+
+    Ok(SessionTranscript {
+        session_id: session_id.to_owned(),
+        chunks,
+    })
+}
+
+/// Frontend query: all transcript chunks for a session with per-chunk costs.
+#[tauri::command]
+pub fn session_transcript<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    session_id: String,
+) -> Result<SessionTranscript, String> {
+    let state = app.state::<DbState>();
+    let db = state.0.lock().expect("db mutex poisoned");
+    session_transcript_for(&db, &session_id)
+        .map_err(|err| format!("cannot query session transcript: {err}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2115,6 +2521,7 @@ mod tests {
                     "cache_creation_1h_tokens": null,
                     "duration_ms": null,
                     "error": null,
+                    "request_id": null,
                 }],
                 "models": [{
                     "model": "sonnet",
@@ -2889,5 +3296,181 @@ mod tests {
         ] {
             assert!(elapsed < budget, "{name} took {elapsed:?} on 150k rows");
         }
+    }
+
+    // ---- request_transcript ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_message(
+        db: &Db,
+        uuid: &str,
+        parent_uuid: Option<&str>,
+        session_id: &str,
+        request_id: Option<&str>,
+        role: &str,
+        timestamp_ms: i64,
+        content: &str,
+        tool_use_result: Option<&str>,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO messages (uuid, parent_uuid, session_id, request_id, role,
+                 timestamp_ms, is_sidechain, content, tool_use_result)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+                params![
+                    uuid,
+                    parent_uuid,
+                    session_id,
+                    request_id,
+                    role,
+                    timestamp_ms,
+                    content,
+                    tool_use_result
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn request_transcript_returns_full_chain_in_chronological_order() {
+        let (_dir, db) = test_db();
+        insert_session(&db, "sess1", Some("/proj/test"));
+
+        // u1 (user) → a1 (assistant, req_A) → u2 (tool_result) → a2 (assistant, req_B)
+        insert_message(
+            &db,
+            "u1",
+            None,
+            "sess1",
+            None,
+            "user",
+            1,
+            r#"[{"type":"text","text":"What files?"}]"#,
+            None,
+        );
+        insert_message(
+            &db,
+            "a1",
+            Some("u1"),
+            "sess1",
+            Some("req_A"),
+            "assistant",
+            2,
+            r#"[{"type":"tool_use","id":"tu1","name":"bash","input":{"command":"ls"}}]"#,
+            None,
+        );
+        insert_message(
+            &db,
+            "u2",
+            Some("a1"),
+            "sess1",
+            None,
+            "user",
+            3,
+            r#"[{"type":"tool_result","tool_use_id":"tu1","content":"f.txt","is_error":false}]"#,
+            Some(r#"{"tool_use_id":"tu1","content":"f.txt"}"#),
+        );
+        insert_message(
+            &db,
+            "a2",
+            Some("u2"),
+            "sess1",
+            Some("req_B"),
+            "assistant",
+            4,
+            r#"[{"type":"text","text":"Found f.txt"}]"#,
+            None,
+        );
+
+        let result = request_transcript_for(&db, "sess1", "req_B").unwrap();
+        assert_eq!(result.request_id, "req_B");
+        assert_eq!(result.session_id, "sess1");
+        assert!(result.chain_complete, "chain should be complete");
+        assert_eq!(result.turns.len(), 4, "expected 4 turns: u1, a1, u2, a2");
+
+        assert_eq!(result.turns[0].role, "user");
+        assert_eq!(result.turns[0].timestamp_ms, 1);
+        assert_eq!(result.turns[0].request_id, None);
+
+        assert_eq!(result.turns[1].role, "assistant");
+        assert_eq!(result.turns[1].timestamp_ms, 2);
+        assert_eq!(result.turns[1].request_id, Some("req_A".to_string()));
+        assert_eq!(result.turns[1].blocks.len(), 1);
+        assert!(
+            matches!(&result.turns[1].blocks[0], ContentBlock::ToolUse { name, .. } if name == "bash"),
+            "expected ToolUse with name bash"
+        );
+
+        assert_eq!(result.turns[2].role, "user");
+        assert_eq!(result.turns[2].timestamp_ms, 3);
+        assert!(
+            result.turns[2].tool_use_result.is_some(),
+            "tool_use_result should be Some"
+        );
+
+        assert_eq!(result.turns[3].role, "assistant");
+        assert_eq!(result.turns[3].timestamp_ms, 4);
+        assert_eq!(result.turns[3].request_id, Some("req_B".to_string()));
+        assert!(
+            matches!(&result.turns[3].blocks[0], ContentBlock::Text { text } if text == "Found f.txt"),
+            "expected Text block with 'Found f.txt'"
+        );
+    }
+
+    #[test]
+    fn request_transcript_unknown_request_id_returns_empty_turns() {
+        let (_dir, db) = test_db();
+        let result = request_transcript_for(&db, "sess1", "req_unknown").unwrap();
+        assert_eq!(result.turns.len(), 0, "unknown request_id → empty turns");
+        assert!(!result.chain_complete, "chain should be incomplete");
+        assert_eq!(result.request_id, "req_unknown");
+    }
+
+    #[test]
+    fn content_blocks_parse_all_kinds() {
+        let json = r#"[
+            {"type":"text","text":"hello"},
+            {"type":"thinking","thinking":"reasoning"},
+            {"type":"tool_use","id":"tu1","name":"bash","input":{"cmd":"ls"}},
+            {"type":"tool_result","tool_use_id":"tu1","content":"out","is_error":false},
+            {"type":"image","source":{"type":"url","url":"http://example.com"}}
+        ]"#;
+        let blocks = parse_blocks(json);
+        assert_eq!(blocks.len(), 5);
+        assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "hello"));
+        assert!(
+            matches!(&blocks[1], ContentBlock::Thinking { thinking } if thinking == "reasoning")
+        );
+        assert!(
+            matches!(&blocks[2], ContentBlock::ToolUse { id, name, .. } if id == "tu1" && name == "bash")
+        );
+        assert!(
+            matches!(&blocks[3], ContentBlock::ToolResult { tool_use_id, is_error, .. } if tool_use_id == "tu1" && !is_error)
+        );
+        assert!(
+            matches!(&blocks[4], ContentBlock::Unknown { raw_type, .. } if raw_type.as_deref() == Some("image"))
+        );
+    }
+
+    #[test]
+    fn request_transcript_for_adds_request_id_to_session_detail() {
+        let (_dir, db) = test_db();
+        insert_session(&db, "s_req", Some("/proj/test"));
+        // Insert a request with an explicit request_id.
+        db.conn()
+            .execute(
+                "INSERT INTO requests (request_id, session_id, timestamp_ms, event_type,
+                 input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+                 VALUES (?1, ?2, ?3, 'api_request', 0, 0, 0, 0)",
+                params!["rid-001", "s_req", t() + 100],
+            )
+            .unwrap();
+        let detail = session_detail_for(&db, "s_req", &Facets::default(), 1000, now()).unwrap();
+        assert_eq!(detail.requests.len(), 1);
+        assert_eq!(
+            detail.requests[0].request_id,
+            Some("rid-001".to_string()),
+            "request_id should be populated from the requests table"
+        );
     }
 }
