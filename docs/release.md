@@ -100,6 +100,29 @@ https://github.com/pat-eason/Farthing/releases/latest/download/Farthing.dmg
 
 GitHub's `/releases/latest/download/` redirect always resolves to the most recently published (non-draft) release, so this URL updates automatically on every notarized release.
 
+## Marketing site notification
+
+Publishing a GitHub Release also notifies the marketing site (`pat-eason/farthing-web`) via `.github/workflows/notify-web.yml`. The workflow sends a `repository_dispatch` of type `farthing-release` carrying the release tag as `client_payload.version`; farthing-web's `update-version` workflow then writes the version into its source and redeploys.
+
+Because it keys on `release: published` (not the tag push), **draft releases — the unsigned/not-notarized path — do not notify the site** until you explicitly publish them.
+
+### Required secret: `FARTHING_WEB_DISPATCH_TOKEN`
+
+`GITHUB_TOKEN` cannot trigger dispatches on a different repo, so this uses a separate fine-grained PAT:
+
+| Setting | Value |
+|---|---|
+| Repository access | `pat-eason/farthing-web` only |
+| Permission | **Contents: Read and write** (what the repository-dispatch REST endpoint requires) |
+
+Add it once:
+
+```sh
+gh secret set FARTHING_WEB_DISPATCH_TOKEN -R pat-eason/Farthing
+```
+
+If the secret is absent the workflow logs a warning and exits cleanly — it does not fail the release.
+
 ## Status / blockers
 
 - [ ] **Blocked on human**: no Apple Developer credentials exist yet. Add the six secrets above, push a tag, and confirm the `Verify notarization` step passes and the release publishes non-draft. Until then the automated flow still works end to end: it produces an unsigned `.dmg` and a **draft** release.
