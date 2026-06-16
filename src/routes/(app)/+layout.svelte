@@ -26,6 +26,7 @@
     { route: "/(app)/projects", label: "Projects" },
   ] as const;
   const secondary = [
+    { route: "/(app)/usage", label: "Plan Usage" },
     { route: "/(app)/spend", label: "Spend" },
     { route: "/(app)/health", label: "Health" },
     { route: "/(app)/settings", label: "Settings" },

@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn legacy_migration_moves_db_and_wal_shm_siblings() {
         let root = tempfile::tempdir().unwrap();
-        let old_dir = root.path().join("old");
+        let old_dir = root.path().join("com.peason.farthing");
         let new_dir = root.path().join("new");
         std::fs::create_dir_all(&old_dir).unwrap();
         write_file(&old_dir.join("usage.db"), "db");

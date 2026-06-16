@@ -1,0 +1,7 @@
+{
+  "five_hour": { "utilization": null, "resets_at": null },
+  "seven_day": { "utilization": null, "resets_at": null },
+  "seven_day_sonnet": { "utilization": null, "resets_at": null },
+  "seven_day_opus": { "utilization": null, "resets_at": null },
+  "extra_usage": null
+}

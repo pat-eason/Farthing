@@ -121,6 +121,76 @@ pub fn format_budget_title(
     title
 }
 
+/// Build the tray title for Subscription Mode.
+///
+/// Returns `None` when:
+/// - mode is `Api` (caller falls through to the API path), or
+/// - no snapshot is available yet (first launch, or disabled poller), or
+/// - the snapshot has no window with a non-null utilization (server returned nulls).
+///
+/// When `Some`, the title format is `{warn?}{label_short} {pct:.0}% · ${cost}`,
+/// e.g. `"5h 4% · $0.12"` or `"⚠\u{FE0E} 5h 92% · $1.23"`.
+/// The paused badge is prepended if `paused` is true.
+fn subscription_title(
+    cost_usd: f64,
+    paused: bool,
+    display_mode: &crate::usage_limits::DisplayMode,
+    snapshot: Option<&crate::usage_limits::UsageSnapshot>,
+) -> Option<String> {
+    if *display_mode != crate::usage_limits::DisplayMode::Subscription {
+        return None;
+    }
+    let snapshot = snapshot?;
+
+    let windows = [
+        &snapshot.five_hour,
+        &snapshot.seven_day,
+        &snapshot.seven_day_sonnet,
+        &snapshot.seven_day_opus,
+    ];
+
+    // Pick the most-utilized window with a non-null percent.
+    let best = windows
+        .iter()
+        .filter(|w| w.percent.is_some())
+        .max_by(|a, b| {
+            a.percent
+                .unwrap_or(0.0)
+                .partial_cmp(&b.percent.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+
+    let pct = best.percent?;
+
+    // Near-limit warning: any window over 75%.
+    let any_near_limit = windows.iter().any(|w| w.percent.unwrap_or(0.0) > 75.0);
+
+    // Short label for the tray (space is limited).
+    let label_short = match best.label.as_str() {
+        "5h session" => "5h",
+        "7d overall" => "7d",
+        "7d Sonnet" => "7d·S",
+        "7d Opus" => "7d·O",
+        other => other,
+    };
+
+    let cost = format!("${:.2}", cost_usd.max(0.0));
+    let usage_str = format!("{} {:.0}%", label_short, pct);
+
+    let mut title = String::new();
+    if any_near_limit {
+        title.push_str(WARN_PREFIX);
+    }
+    if paused {
+        title.push_str(PAUSED_BADGE);
+        title.push_str(" · ");
+    }
+    title.push_str(&usage_str);
+    title.push_str(" · ");
+    title.push_str(&cost);
+    Some(title)
+}
+
 /// Recompute today's cost and set the tray title. Safe from any thread:
 /// the query runs on the caller, the `set_title` is dispatched to the main
 /// thread (tray mutations elsewhere are silently dropped, live-verified in
@@ -130,6 +200,16 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
     let Some(db_state) = app.try_state::<DbState>() else {
         return;
     };
+
+    // Read display mode from config (brief DB lock).
+    let display_mode = crate::usage_limits::read_config(&db_state).display_mode;
+
+    // Read current usage snapshot from managed state (falls back to None if
+    // the state isn't managed yet, e.g. on startup before lib.rs runs manage).
+    let usage_snapshot: Option<crate::usage_limits::UsageSnapshot> = app
+        .try_state::<crate::usage_limits::UsageLimitsState>()
+        .and_then(|state| state.read().ok().map(|guard| guard.clone()))
+        .flatten();
     let paused = app
         .try_state::<CaptureState>()
         .map(|state| state.paused())
@@ -170,6 +250,27 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
     // icon and show the plain cost. Other platforms always use the title.
     #[cfg(target_os = "macos")]
     {
+        // Subscription Mode: window-utilization primary, cost secondary.
+        // Takes over the title before the budget-image path so both can coexist
+        // with budget warning still prepended by subscription_title's near-limit
+        // check. If subscription_title returns None we fall through to the
+        // existing API-mode / budget-image path unchanged.
+        if let Some(sub_title) =
+            subscription_title(cost_usd, paused, &display_mode, usage_snapshot.as_ref())
+        {
+            let ui_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
+                    // Restore the template icon if a drawn budget image was active.
+                    if CUSTOM_IMAGE_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = tray.set_icon_as_template(true);
+                        let _ = tray.set_icon(Some(crate::tray::template_icon()));
+                    }
+                    let _ = tray.set_title(Some(sub_title.as_str()));
+                }
+            });
+            return;
+        }
         if let Some(model) = budget_render_model(cost_usd, paused, status.as_ref()) {
             // Render off the title path: draw a PNG and install it via
             // set_icon (which keeps tray-icon's click overlay sized to the
@@ -214,7 +315,13 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let title = format_budget_title(cost_usd, paused, status.as_ref());
+        let title = if let Some(sub_title) =
+            subscription_title(cost_usd, paused, &display_mode, usage_snapshot.as_ref())
+        {
+            sub_title
+        } else {
+            format_budget_title(cost_usd, paused, status.as_ref())
+        };
         let ui_app = app.clone();
         let _ = app.run_on_main_thread(move || {
             if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
@@ -414,6 +521,79 @@ mod tests {
             format_budget_title(12.34, false, Some(&s)),
             "⚠\u{FE0E} $12.34"
         );
+    }
+
+    // ---- subscription_title ----
+
+    use crate::usage_limits::{DisplayMode, UsageSnapshot, UsageStatus, WindowSnapshot};
+
+    fn window(label: &str, percent: Option<f64>) -> WindowSnapshot {
+        WindowSnapshot {
+            label: label.to_string(),
+            percent,
+            resets_at_ms: None,
+        }
+    }
+
+    fn snapshot(five_pct: Option<f64>, seven_pct: Option<f64>) -> UsageSnapshot {
+        UsageSnapshot {
+            five_hour: window("5h session", five_pct),
+            seven_day: window("7d overall", seven_pct),
+            seven_day_sonnet: window("7d Sonnet", Some(0.0)),
+            seven_day_opus: window("7d Opus", Some(0.0)),
+            extra_usage: None,
+            fetched_at_ms: 0,
+            status: UsageStatus::Ok,
+        }
+    }
+
+    #[test]
+    fn api_mode_returns_none() {
+        let snap = snapshot(Some(4.0), Some(0.0));
+        assert!(subscription_title(1.0, false, &DisplayMode::Api, Some(&snap)).is_none());
+    }
+
+    #[test]
+    fn subscription_no_snapshot_returns_none() {
+        assert!(subscription_title(1.0, false, &DisplayMode::Subscription, None).is_none());
+    }
+
+    #[test]
+    fn subscription_formats_most_utilized_window() {
+        let snap = snapshot(Some(4.0), Some(20.0));
+        let title =
+            subscription_title(1.23, false, &DisplayMode::Subscription, Some(&snap)).unwrap();
+        assert_eq!(title, "7d 20% · $1.23");
+    }
+
+    #[test]
+    fn subscription_near_limit_prepends_warn() {
+        let snap = snapshot(Some(92.0), Some(0.0));
+        let title =
+            subscription_title(1.23, false, &DisplayMode::Subscription, Some(&snap)).unwrap();
+        assert!(title.starts_with("⚠"), "expected warn prefix, got: {title}");
+        assert!(title.contains("5h 92%"), "got: {title}");
+    }
+
+    #[test]
+    fn subscription_paused_includes_badge() {
+        let snap = snapshot(Some(4.0), Some(0.0));
+        let title = subscription_title(0.0, true, &DisplayMode::Subscription, Some(&snap)).unwrap();
+        assert!(title.contains("Paused"), "got: {title}");
+    }
+
+    #[test]
+    fn subscription_all_null_percents_returns_none() {
+        let snap = UsageSnapshot {
+            five_hour: window("5h session", None),
+            seven_day: window("7d overall", None),
+            seven_day_sonnet: window("7d Sonnet", None),
+            seven_day_opus: window("7d Opus", None),
+            extra_usage: None,
+            fetched_at_ms: 0,
+            status: UsageStatus::Ok,
+        };
+        assert!(subscription_title(1.0, false, &DisplayMode::Subscription, Some(&snap)).is_none());
     }
 
     // ---- today-cost query ----
