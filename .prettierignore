@@ -25,3 +25,7 @@ src-tauri/data/
 # Icon source art + pre-generated manifests (e.g. Xcode appiconset
 # Contents.json), not authored in this repo
 art/
+
+# Tool-generated directories (Claude Code worktrees, Kudzu feature state)
+.claude/
+.kudzu/
