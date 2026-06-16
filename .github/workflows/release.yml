@@ -225,6 +225,30 @@ jobs:
             $DRAFT_FLAG \
             "$DMG" "${{ steps.artifacts.outputs.stable_dmg }}" checksums.txt
 
+      # Notify the farthing-web marketing site of the freshly published release
+      # so it can refresh its version badge. We dispatch here, from the job that
+      # publishes, rather than via a separate `release: published` workflow: the
+      # release above is created with GITHUB_TOKEN, and GitHub suppresses
+      # workflow triggers from GITHUB_TOKEN-generated events, so a release-event
+      # workflow would never fire. Gated on a real (non-draft, notarized)
+      # publish — drafts must not touch the live site. Uses a dedicated PAT
+      # because GITHUB_TOKEN cannot dispatch to another repo; a missing token is
+      # a warning, never a release failure.
+      - name: Notify marketing site (farthing-web)
+        if: env.HAS_NOTARY == 'true' && env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.FARTHING_WEB_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::FARTHING_WEB_DISPATCH_TOKEN not set; skipping marketing-site notification."
+            exit 0
+          fi
+          gh api -X POST repos/pat-eason/farthing-web/dispatches \
+            --input - <<EOF
+          {"event_type":"farthing-release","client_payload":{"version":"${RELEASE_TAG}"}}
+          EOF
+          echo "Dispatched farthing-release for ${RELEASE_TAG} to pat-eason/farthing-web."
+
   release-linux:
     name: Build and publish Linux artifacts (deb, rpm, AppImage)
     runs-on: ubuntu-22.04
