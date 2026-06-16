@@ -255,7 +255,9 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
         // with budget warning still prepended by subscription_title's near-limit
         // check. If subscription_title returns None we fall through to the
         // existing API-mode / budget-image path unchanged.
-        if let Some(sub_title) = subscription_title(cost_usd, paused, &display_mode, usage_snapshot.as_ref()) {
+        if let Some(sub_title) =
+            subscription_title(cost_usd, paused, &display_mode, usage_snapshot.as_ref())
+        {
             let ui_app = app.clone();
             let _ = app.run_on_main_thread(move || {
                 if let Some(tray) = ui_app.tray_by_id(crate::tray::TRAY_ID) {
@@ -313,7 +315,9 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>) {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let title = if let Some(sub_title) = subscription_title(cost_usd, paused, &display_mode, usage_snapshot.as_ref()) {
+        let title = if let Some(sub_title) =
+            subscription_title(cost_usd, paused, &display_mode, usage_snapshot.as_ref())
+        {
             sub_title
         } else {
             format_budget_title(cost_usd, paused, status.as_ref())
@@ -524,7 +528,11 @@ mod tests {
     use crate::usage_limits::{DisplayMode, UsageSnapshot, UsageStatus, WindowSnapshot};
 
     fn window(label: &str, percent: Option<f64>) -> WindowSnapshot {
-        WindowSnapshot { label: label.to_string(), percent, resets_at_ms: None }
+        WindowSnapshot {
+            label: label.to_string(),
+            percent,
+            resets_at_ms: None,
+        }
     }
 
     fn snapshot(five_pct: Option<f64>, seven_pct: Option<f64>) -> UsageSnapshot {
@@ -553,14 +561,16 @@ mod tests {
     #[test]
     fn subscription_formats_most_utilized_window() {
         let snap = snapshot(Some(4.0), Some(20.0));
-        let title = subscription_title(1.23, false, &DisplayMode::Subscription, Some(&snap)).unwrap();
+        let title =
+            subscription_title(1.23, false, &DisplayMode::Subscription, Some(&snap)).unwrap();
         assert_eq!(title, "7d 20% · $1.23");
     }
 
     #[test]
     fn subscription_near_limit_prepends_warn() {
         let snap = snapshot(Some(92.0), Some(0.0));
-        let title = subscription_title(1.23, false, &DisplayMode::Subscription, Some(&snap)).unwrap();
+        let title =
+            subscription_title(1.23, false, &DisplayMode::Subscription, Some(&snap)).unwrap();
         assert!(title.starts_with("⚠"), "expected warn prefix, got: {title}");
         assert!(title.contains("5h 92%"), "got: {title}");
     }

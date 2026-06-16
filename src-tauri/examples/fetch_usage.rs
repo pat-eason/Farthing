@@ -15,7 +15,12 @@ fn main() {
 async fn run() {
     // Step 1: read the keychain credential JSON via the `security` CLI.
     let output = Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
         .expect("failed to run `security` — is this macOS with Claude Code installed?");
 
@@ -41,7 +46,10 @@ async fn run() {
         .and_then(|v| v.as_str())
         .expect("claudeAiOauth.accessToken not found in keychain credential");
 
-    println!("token prefix: {}…", &access_token[..access_token.len().min(12)]);
+    println!(
+        "token prefix: {}…",
+        &access_token[..access_token.len().min(12)]
+    );
 
     // Step 3: GET https://api.anthropic.com/api/oauth/usage
     let client = reqwest::Client::new();
@@ -70,7 +78,12 @@ async fn run() {
 
     println!("\n--- parsed fields ---");
 
-    for bucket in &["five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"] {
+    for bucket in &[
+        "five_hour",
+        "seven_day",
+        "seven_day_sonnet",
+        "seven_day_opus",
+    ] {
         match parsed.get(*bucket) {
             None => println!("{bucket}: (absent)"),
             Some(serde_json::Value::Null) => println!("{bucket}: null"),
@@ -138,7 +151,9 @@ async fn run() {
             Err(e) => println!("(could not read: {e})"),
         }
     } else {
-        println!("\n(ccstatusline cache not found at {ccstatusline_path} — skipping cross-reference)");
+        println!(
+            "\n(ccstatusline cache not found at {ccstatusline_path} — skipping cross-reference)"
+        );
     }
 }
 

@@ -106,7 +106,7 @@ pub fn compute_status(settings_path: &Path) -> Result<OnboardingStatus, String> 
         before,
         after,
         diff,
-        mode_chosen: false,  // filled in by onboarding_status with DB access
+        mode_chosen: false, // filled in by onboarding_status with DB access
     })
 }
 

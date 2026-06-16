@@ -178,7 +178,12 @@ pub type UsageLimitsState = Arc<std::sync::RwLock<Option<UsageSnapshot>>>;
 /// The token value is never logged.
 fn read_keychain_token() -> Result<String, String> {
     let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
         .map_err(|e| format!("keychain: security command failed to launch: {e}"))?;
 
@@ -191,8 +196,8 @@ fn read_keychain_token() -> Result<String, String> {
         .map_err(|e| format!("keychain: output is not UTF-8: {e}"))?;
     let raw = raw.trim();
 
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|e| format!("keychain: JSON parse failed: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("keychain: JSON parse failed: {e}"))?;
 
     value
         .get("claudeAiOauth")
@@ -246,10 +251,7 @@ fn now_ms() -> i64 {
 fn normalize_window(bucket: Option<&UsageBucket>, label: &str) -> WindowSnapshot {
     let (percent, resets_at_ms) = match bucket {
         Some(b) => {
-            let resets_at_ms = b
-                .resets_at
-                .as_ref()
-                .and_then(normalize_resets_at);
+            let resets_at_ms = b.resets_at.as_ref().and_then(normalize_resets_at);
             (b.utilization, resets_at_ms)
         }
         None => (None, None),
@@ -398,10 +400,7 @@ pub async fn refresh<R: tauri::Runtime>(
     };
 
     // Build reqwest client and fetch.
-    let client = match reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-    {
+    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("usage_limits: cannot build HTTP client: {e}");
