@@ -143,6 +143,37 @@ const MIGRATIONS: &[&str] = &[
 
     DELETE FROM ingest_state;
     ",
+    // v5: conversation transcript storage (feat-conversation-transcript).
+    // `messages` holds every assistant/user message parsed from
+    // `~/.claude/projects/**/*.jsonl`. `uuid` is the dedup key; backfill
+    // inserts use `ON CONFLICT(uuid) DO NOTHING` so re-reading a file is
+    // idempotent. `content` is stored as raw JSON text — version-tolerant
+    // against future transcript schema changes (unknown fields are ignored at
+    // parse time, never at query time).
+    //
+    // `DELETE FROM ingest_state` follows the v4 precedent: resetting the
+    // per-file byte offsets forces the next startup backfill pass to re-read
+    // every transcript from byte 0, populating `messages` for all existing
+    // installs. The re-read is safe because `requests` dedups on `request_id`
+    // and `messages` dedups on `uuid`, so no data is double-counted.
+    "
+    CREATE TABLE messages (
+        uuid            TEXT PRIMARY KEY,
+        session_id      TEXT NOT NULL,
+        request_id      TEXT,
+        parent_uuid     TEXT,
+        role            TEXT NOT NULL,
+        timestamp_ms    INTEGER NOT NULL,
+        is_sidechain    INTEGER NOT NULL DEFAULT 0,
+        content         TEXT NOT NULL,
+        tool_use_result TEXT
+    ) WITHOUT ROWID;
+
+    CREATE INDEX idx_messages_request_id ON messages (request_id) WHERE request_id IS NOT NULL;
+    CREATE INDEX idx_messages_session_time ON messages (session_id, timestamp_ms);
+
+    DELETE FROM ingest_state;
+    ",
 ];
 
 /// Errors from opening or migrating the database.
@@ -397,7 +428,7 @@ mod tests {
         assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u64);
 
         let tables = table_names(db.conn());
-        for table in ["requests", "sessions", "ingest_state", "meta"] {
+        for table in ["requests", "sessions", "ingest_state", "meta", "messages"] {
             assert!(tables.iter().any(|t| t == table), "missing table {table}");
         }
 
@@ -407,6 +438,8 @@ mod tests {
             "idx_requests_session_rollup",
             "idx_requests_model",
             "idx_requests_request_id",
+            "idx_messages_request_id",
+            "idx_messages_session_time",
         ] {
             assert!(indexes.iter().any(|i| i == index), "missing index {index}");
         }
@@ -462,6 +495,60 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ingest_state", [], |row| row.get(0))
             .unwrap();
         assert_eq!(offsets, 0, "v4 must clear stored backfill offsets");
+    }
+
+    #[test]
+    fn v5_creates_messages_table_and_resets_backfill_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DB_FILE_NAME);
+
+        // Boot at v4 with a stored backfill offset and a request row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            configure_connection(&conn).unwrap();
+            apply_migrations(&conn, &MIGRATIONS[..4]).unwrap();
+            conn.execute(
+                "INSERT INTO ingest_state (file_path, byte_offset, updated_at_ms)
+                 VALUES ('/projects/a/s.jsonl', 8192, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO requests (request_id, session_id, timestamp_ms)
+                 VALUES ('req_v4', 's', 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u64);
+
+        // messages table and both new indexes must exist.
+        let tables = table_names(db.conn());
+        assert!(
+            tables.iter().any(|t| t == "messages"),
+            "missing table messages"
+        );
+
+        let indexes = index_names(db.conn());
+        assert!(indexes.iter().any(|i| i == "idx_messages_request_id"));
+        assert!(indexes.iter().any(|i| i == "idx_messages_session_time"));
+
+        // Existing request data must be intact.
+        let requests: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 1);
+
+        // Offsets cleared so the next backfill pass re-reads all transcripts
+        // and populates messages for existing installs.
+        let offsets: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM ingest_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(offsets, 0, "v5 must clear stored backfill offsets");
     }
 
     #[test]
@@ -674,8 +761,8 @@ mod tests {
     #[test]
     fn legacy_migration_moves_db_and_wal_shm_siblings() {
         let root = tempfile::tempdir().unwrap();
-        let old_dir = root.path().join("com.peason.farthing");
-        let new_dir = root.path().join("com.peason.farthing");
+        let old_dir = root.path().join("old");
+        let new_dir = root.path().join("new");
         std::fs::create_dir_all(&old_dir).unwrap();
         write_file(&old_dir.join("usage.db"), "db");
         write_file(&old_dir.join("usage.db-wal"), "wal");

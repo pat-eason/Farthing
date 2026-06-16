@@ -70,7 +70,7 @@ use serde::Serialize;
 
 use crate::db::Db;
 use crate::pricing::{PricingState, UsageTokens};
-use crate::transcript::{self, AssistantUsage, ParseStats};
+use crate::transcript::{self, AssistantUsage, ParseStats, TranscriptMessage};
 
 /// Env override for the transcripts root (dev/testing); production resolves
 /// `~/.claude/projects` via [`projects_root`].
@@ -101,6 +101,8 @@ pub struct BackfillSummary {
     pub sessions_created: u64,
     /// Existing sessions whose missing `cwd` was healed.
     pub sessions_healed: u64,
+    /// New `messages` rows inserted (`ON CONFLICT(uuid) DO NOTHING` makes it idempotent).
+    pub messages_inserted: u64,
     /// Files/directories that could not be read or stored; logged and
     /// skipped, never fatal.
     pub io_errors: u64,
@@ -327,6 +329,7 @@ fn backfill_file(
     // Parse outside the DB lock: this is the slow part of a full pass.
     let parse = transcript::parse_file_from(path, offset)?;
     let requests = transcript::collapse_requests(&parse.lines);
+    let messages = transcript::collapse_messages(&parse.messages);
     summary.files_read += 1;
     summary.requests_seen += requests.len() as u64;
     merge_parse_stats(&mut summary.parse, &parse.stats);
@@ -337,6 +340,9 @@ fn backfill_file(
         store_request(&tx, pricing, request, summary)?;
     }
     store_sessions(&tx, &parse.lines, summary)?;
+    for message in &messages {
+        store_message(&tx, message, summary)?;
+    }
     tx.execute(
         "INSERT INTO ingest_state (file_path, byte_offset, updated_at_ms)
          VALUES (?1, ?2, ?3)
@@ -528,6 +534,39 @@ fn store_sessions(
     Ok(())
 }
 
+/// Insert one collapsed message into the `messages` table. Dedup is on
+/// `uuid` (`ON CONFLICT DO NOTHING`), making re-reads after an offset reset
+/// idempotent.
+fn store_message(
+    conn: &Connection,
+    message: &TranscriptMessage,
+    summary: &mut BackfillSummary,
+) -> Result<(), rusqlite::Error> {
+    let role = match message.role {
+        crate::transcript::MessageRole::User => "user",
+        crate::transcript::MessageRole::Assistant => "assistant",
+    };
+    let inserted = conn.execute(
+        "INSERT INTO messages (uuid, session_id, request_id, parent_uuid, role,
+             timestamp_ms, is_sidechain, content, tool_use_result)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(uuid) DO NOTHING",
+        rusqlite::params![
+            message.uuid,
+            message.session_id,
+            message.request_id,
+            message.parent_uuid,
+            role,
+            message.timestamp_ms,
+            message.is_sidechain as i64,
+            message.content,
+            message.tool_use_result,
+        ],
+    )?;
+    summary.messages_inserted += inserted as u64;
+    Ok(())
+}
+
 fn merge_parse_stats(total: &mut ParseStats, stats: &ParseStats) {
     total.lines_read += stats.lines_read;
     total.assistant_lines += stats.assistant_lines;
@@ -707,6 +746,7 @@ mod tests {
     const MAIN_SESSION: &str = include_str!("../tests/fixtures/transcripts/main-session.jsonl");
     const SIDECHAIN: &str = include_str!("../tests/fixtures/transcripts/sidechain.jsonl");
     const EDGE_CASES: &str = include_str!("../tests/fixtures/transcripts/edge-cases.jsonl");
+    const CONTENT_BLOCKS: &str = include_str!("../tests/fixtures/transcripts/content-blocks.jsonl");
 
     /// Fixture layout mirrors the real tree: per-project dirs with session
     /// files plus a `subagents` subdir for the sidechain transcript.
@@ -1245,5 +1285,61 @@ mod tests {
         assert_eq!(json["window_hours"], 24);
         assert_eq!(json["transcript_requests"], 0);
         assert_eq!(json["parse"]["lines_read"], 0);
+    }
+
+    // ---- messages table (schema v5) ----
+
+    #[test]
+    fn pass_inserts_messages_and_second_pass_is_idempotent() {
+        let (db, pricing, state, dir) = test_env();
+        let root = dir.path().join("projects");
+        let project = root.join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("sess-content.jsonl"), CONTENT_BLOCKS).unwrap();
+
+        // First pass: 3 messages (user + collapsed assistant + tool-result user).
+        let first = run_pass(&db, &pricing, &state, &root);
+        assert_eq!(first.messages_inserted, 3);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM messages"), 3);
+
+        // Second pass: offsets → file not re-read, no new messages.
+        let second = run_pass(&db, &pricing, &state, &root);
+        assert_eq!(second.messages_inserted, 0);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM messages"), 3);
+    }
+
+    #[test]
+    fn messages_dedup_on_uuid_across_reruns() {
+        let (db, pricing, state, dir) = test_env();
+        let root = dir.path().join("projects");
+        let project = root.join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("sess-content.jsonl"), CONTENT_BLOCKS).unwrap();
+
+        // First pass inserts 3 messages.
+        let first = run_pass(&db, &pricing, &state, &root);
+        assert_eq!(first.messages_inserted, 3);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM messages"), 3);
+
+        // Force re-read from byte 0 by clearing ingest_state.
+        {
+            let db = db.lock().unwrap();
+            db.conn().execute("DELETE FROM ingest_state", []).unwrap();
+        }
+
+        // Second pass re-reads the file but ON CONFLICT DO NOTHING → 0 new rows.
+        let second = run_pass(&db, &pricing, &state, &root);
+        assert_eq!(second.messages_inserted, 0);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM messages"), 3);
+    }
+
+    #[test]
+    fn backfill_summary_serializes_messages_inserted() {
+        let summary = BackfillSummary {
+            messages_inserted: 5,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["messages_inserted"], 5);
     }
 }

@@ -145,6 +145,7 @@ export interface RequestDetail {
   cache_creation_1h_tokens: number | null;
   duration_ms: number | null;
   error: string | null;
+  request_id: string | null;
 }
 
 /** One model's share of a session (the drill-in model mix). */
@@ -297,4 +298,58 @@ export function runExportCommand(args: ExportArgs): Promise<ExportResult> {
  * this in try/catch so a missing/denied notification never breaks the flow. */
 export function notifyExportDone(title: string, body: string): Promise<void> {
   return invoke<void>("notify_export_done", { title, body });
+}
+
+/** Content block kinds from a transcript message. */
+export type ContentBlock =
+  | { kind: "text"; text: string }
+  | { kind: "thinking"; thinking: string }
+  | { kind: "tool_use"; id: string; name: string; input: unknown }
+  | { kind: "tool_result"; tool_use_id: string; content: unknown; is_error: boolean }
+  | { kind: "unknown"; raw_type: string | null; raw: unknown };
+
+/** One turn (user or assistant) in a conversation chain. */
+export interface TranscriptTurn {
+  role: "user" | "assistant";
+  timestamp_ms: number;
+  request_id: string | null;
+  blocks: ContentBlock[];
+  tool_use_result: unknown | null;
+}
+
+/** Full reasoning chain for one request. */
+export interface RequestTranscript {
+  request_id: string;
+  session_id: string;
+  turns: TranscriptTurn[];
+  /** false if the parent-chain walk hit a missing node (cleaned-up transcript). */
+  chain_complete: boolean;
+}
+
+/** Read-only: full reasoning chain for a clicked request. */
+export function getRequestTranscript(
+  sessionId: string,
+  requestId: string
+): Promise<RequestTranscript> {
+  return invoke<RequestTranscript>("request_transcript", { sessionId, requestId });
+}
+
+/** One request's turns with its cost, part of a session-level transcript. */
+export interface SessionTranscriptChunk {
+  request_id: string;
+  timestamp_ms: number;
+  cost_usd: number | null;
+  model: string | null;
+  turns: TranscriptTurn[];
+}
+
+/** All transcript chunks for a session (only requests with stored messages). */
+export interface SessionTranscript {
+  session_id: string;
+  chunks: SessionTranscriptChunk[];
+}
+
+/** Read-only: all transcript chunks for a session with per-chunk costs. */
+export function getSessionTranscript(sessionId: string): Promise<SessionTranscript> {
+  return invoke<SessionTranscript>("session_transcript", { sessionId });
 }

@@ -220,6 +220,8 @@ pub fn run() {
             queries::usage_series,
             queries::session_rollups,
             queries::session_detail,
+            queries::request_transcript,
+            queries::session_transcript,
             queries::project_rollups,
             queries::home_dir,
             export::export,

@@ -8,6 +8,11 @@
 //! event lacks. This module turns those lines into [`AssistantUsage`] values
 //! for the backfill engine (task 3.4).
 //!
+//! It also extracts full message content (user + assistant turns) into
+//! [`TranscriptMessage`] values, enabling conversation-level features without
+//! re-reading the file. Message extraction is best-effort and never touches
+//! [`ParseStats`] — missing fields are silently skipped.
+//!
 //! # Tolerance rules
 //!
 //! Transcripts are an undocumented, fast-moving format (a 481-file corpus
@@ -35,6 +40,10 @@
 //! between lines), trailing all-zero lines are ignored, and lines with
 //! `model == "<synthetic>"` or no `requestId` are dropped entirely (they
 //! represent no API traffic).
+//!
+//! [`collapse_messages`] applies the same last-wins logic to message content:
+//! assistant lines collapse per `requestId` (last streaming chunk has fullest
+//! content); user lines pass through unchanged.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
@@ -46,6 +55,35 @@ use serde_json::Value;
 /// ("No response requested."). They carry all-zero usage and represent no
 /// API request; backfill must skip them.
 pub const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// Role of a message turn in the conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+}
+
+/// A single conversation turn (user or assistant) extracted from a transcript
+/// line. Used to reconstruct conversation history without a second file pass.
+///
+/// `content` and `tool_use_result` are re-serialized verbatim from the
+/// parsed JSON, so downstream consumers get exactly what Claude Code wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptMessage {
+    pub uuid: String,
+    pub parent_uuid: Option<String>,
+    /// Present on `assistant` lines only (`requestId`).
+    pub request_id: Option<String>,
+    pub session_id: String,
+    pub role: MessageRole,
+    /// Line `timestamp` in unix milliseconds.
+    pub timestamp_ms: i64,
+    pub is_sidechain: bool,
+    /// `message.content` re-serialized to JSON (always a JSON array).
+    pub content: String,
+    /// `toolUseResult` re-serialized to JSON; `None` when absent or null.
+    pub tool_use_result: Option<String>,
+}
 
 /// Usage extracted from one `assistant` transcript line. Token fields mirror
 /// the `requests` columns; `cache_creation_{5m,1h}_tokens` are the
@@ -120,6 +158,10 @@ pub struct TranscriptParse {
     /// (`parse_file_from(path, offset + bytes_consumed)`) re-reads it once
     /// complete. This is the byte-offset contract for task 3.4.
     pub bytes_consumed: u64,
+    /// Every `user` and `assistant` line for which message content could be
+    /// extracted, in file order — *not* yet collapsed; see
+    /// [`collapse_messages`]. Missing required fields → silently absent.
+    pub messages: Vec<TranscriptMessage>,
 }
 
 /// Parse a whole transcript file from the beginning.
@@ -170,16 +212,31 @@ fn parse_line(raw: &[u8], parse: &mut TranscriptParse) {
         stats.malformed_lines += 1;
         return;
     }
-    if value.get("type").and_then(Value::as_str) != Some("assistant") {
-        stats.skipped_lines += 1;
-        return;
-    }
-    match parse_assistant(&value) {
-        Some(line) => {
-            stats.assistant_lines += 1;
-            parse.lines.push(line);
+    let line_type = value.get("type").and_then(Value::as_str);
+    match line_type {
+        Some("assistant") => {
+            match parse_assistant(&value) {
+                Some(line) => {
+                    stats.assistant_lines += 1;
+                    parse.lines.push(line);
+                }
+                None => stats.invalid_assistant_lines += 1,
+            }
+            // Best-effort message extraction: never touches stats.
+            if let Some(msg) = parse_message(&value, MessageRole::Assistant) {
+                parse.messages.push(msg);
+            }
         }
-        None => stats.invalid_assistant_lines += 1,
+        Some("user") => {
+            stats.skipped_lines += 1;
+            // Best-effort message extraction: never touches stats.
+            if let Some(msg) = parse_message(&value, MessageRole::User) {
+                parse.messages.push(msg);
+            }
+        }
+        _ => {
+            stats.skipped_lines += 1;
+        }
     }
 }
 
@@ -222,6 +279,58 @@ fn parse_assistant(line: &Value) -> Option<AssistantUsage> {
     })
 }
 
+/// Extract message content from a `user` or `assistant` transcript line.
+/// Returns `None` when any required field (`uuid`, `sessionId`, `timestamp`,
+/// `message.content` array) is missing or unparseable. Never touches
+/// [`ParseStats`] — all failures are silent.
+fn parse_message(value: &Value, role: MessageRole) -> Option<TranscriptMessage> {
+    let uuid = value.get("uuid")?.as_str()?.to_owned();
+    let session_id = value.get("sessionId")?.as_str()?.to_owned();
+    let timestamp_ms = rfc3339_utc_to_ms(value.get("timestamp")?.as_str()?)?;
+    let message = value.get("message")?;
+    let content_val = message.get("content")?;
+    // Require content to be a JSON array.
+    content_val.as_array()?;
+    let content = serde_json::to_string(content_val).ok()?;
+
+    let parent_uuid = value
+        .get("parentUuid")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
+    let request_id = if role == MessageRole::Assistant {
+        value
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else {
+        None
+    };
+
+    let is_sidechain = value
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Re-serialize toolUseResult verbatim; drop if absent or null.
+    let tool_use_result = value
+        .get("toolUseResult")
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::to_string(v).ok());
+
+    Some(TranscriptMessage {
+        uuid,
+        parent_uuid,
+        request_id,
+        session_id,
+        role,
+        timestamp_ms,
+        is_sidechain,
+        content,
+        tool_use_result,
+    })
+}
+
 /// A token count: absent or wrong-typed → 0 (counts are additive; absence
 /// means "none"), but numeric strings are tolerated like in `ingest.rs`.
 fn usage_i64(usage: &Value, key: &str) -> i64 {
@@ -261,6 +370,37 @@ pub fn collapse_requests(lines: &[AssistantUsage]) -> Vec<AssistantUsage> {
             Some(existing) => {
                 if line.has_usage() || !existing.has_usage() {
                     *existing = line.clone();
+                }
+            }
+        }
+    }
+    collapsed
+}
+
+/// Collapse parsed messages to one entry per conversation turn, applying the
+/// same streaming-collapse rules as [`collapse_requests`]:
+///
+/// - `user` lines pass through unchanged (unique uuids, no collapsing).
+/// - `assistant` lines collapse to **one per `request_id`**; the **last**
+///   line wins (the last streamed chunk has the fullest cumulative content).
+/// - `assistant` lines without a `request_id` are dropped entirely.
+///
+/// Output preserves first-seen order.
+pub fn collapse_messages(messages: &[TranscriptMessage]) -> Vec<TranscriptMessage> {
+    let mut collapsed: Vec<TranscriptMessage> = Vec::new();
+    for msg in messages {
+        match msg.role {
+            MessageRole::User => collapsed.push(msg.clone()),
+            MessageRole::Assistant => {
+                let Some(request_id) = msg.request_id.as_deref() else {
+                    // No request_id → drop entirely.
+                    continue;
+                };
+                match collapsed.iter_mut().find(|c| {
+                    c.role == MessageRole::Assistant && c.request_id.as_deref() == Some(request_id)
+                }) {
+                    None => collapsed.push(msg.clone()),
+                    Some(existing) => *existing = msg.clone(),
                 }
             }
         }
@@ -347,6 +487,8 @@ mod tests {
     const MAIN_SESSION: &str = include_str!("../tests/fixtures/transcripts/main-session.jsonl");
     const SIDECHAIN: &str = include_str!("../tests/fixtures/transcripts/sidechain.jsonl");
     const EDGE_CASES: &str = include_str!("../tests/fixtures/transcripts/edge-cases.jsonl");
+    /// Synthetic fixture for message content extraction tests.
+    const CONTENT_BLOCKS: &str = include_str!("../tests/fixtures/transcripts/content-blocks.jsonl");
 
     fn parse(s: &str) -> TranscriptParse {
         parse_reader(s.as_bytes())
@@ -618,6 +760,129 @@ mod tests {
         assert_eq!(parsed.stats.malformed_lines, 5);
         assert_eq!(parsed.stats.lines_read, 5);
         assert!(parsed.lines.is_empty());
+    }
+
+    // ── Message content extraction tests ─────────────────────────────────────
+
+    #[test]
+    fn content_blocks_extracts_messages_without_touching_stats() {
+        let parsed = parse(CONTENT_BLOCKS);
+
+        // Existing stats are unchanged.
+        assert_eq!(
+            parsed.stats,
+            ParseStats {
+                lines_read: 4,
+                assistant_lines: 2,
+                skipped_lines: 2, // two user lines
+                malformed_lines: 0,
+                invalid_assistant_lines: 0,
+            }
+        );
+
+        // All 4 lines yielded a message.
+        assert_eq!(parsed.messages.len(), 4);
+
+        // Line 1: user prompt.
+        let u1 = &parsed.messages[0];
+        assert_eq!(u1.role, MessageRole::User);
+        assert_eq!(u1.uuid, "uuid-u1");
+        assert_eq!(u1.parent_uuid, None);
+        assert_eq!(u1.request_id, None);
+        assert_eq!(u1.session_id, "sess-content");
+
+        // Lines 2 & 3: both assistant streaming chunks for req_content_001.
+        assert_eq!(parsed.messages[1].role, MessageRole::Assistant);
+        assert_eq!(
+            parsed.messages[1].request_id.as_deref(),
+            Some("req_content_001")
+        );
+        assert_eq!(parsed.messages[2].role, MessageRole::Assistant);
+        assert_eq!(
+            parsed.messages[2].request_id.as_deref(),
+            Some("req_content_001")
+        );
+
+        // Line 4: tool-result user line with parent pointing at stream2.
+        let u2 = &parsed.messages[3];
+        assert_eq!(u2.role, MessageRole::User);
+        assert_eq!(u2.uuid, "uuid-u2");
+        assert_eq!(u2.parent_uuid.as_deref(), Some("uuid-a1-stream2"));
+    }
+
+    #[test]
+    fn collapse_messages_last_streaming_line_wins() {
+        let parsed = parse(CONTENT_BLOCKS);
+        let collapsed = collapse_messages(&parsed.messages);
+
+        // 2 user pass-through + 1 collapsed assistant = 3 total.
+        assert_eq!(collapsed.len(), 3);
+
+        // First: user prompt (uuid-u1).
+        assert_eq!(collapsed[0].uuid, "uuid-u1");
+        assert_eq!(collapsed[0].role, MessageRole::User);
+
+        // Second: collapsed assistant — last stream line wins.
+        assert_eq!(collapsed[1].uuid, "uuid-a1-stream2");
+        assert_eq!(collapsed[1].role, MessageRole::Assistant);
+        // The final chunk's content includes the "text" block.
+        assert!(
+            collapsed[1].content.contains("I'll list them."),
+            "collapsed assistant content should contain the fuller stream2 text"
+        );
+
+        // Third: tool-result user line (uuid-u2).
+        assert_eq!(collapsed[2].uuid, "uuid-u2");
+        assert_eq!(collapsed[2].role, MessageRole::User);
+    }
+
+    #[test]
+    fn collapse_messages_drops_assistant_without_request_id() {
+        let msg = TranscriptMessage {
+            uuid: "no-req".into(),
+            parent_uuid: None,
+            request_id: None,
+            session_id: "s".into(),
+            role: MessageRole::Assistant,
+            timestamp_ms: 0,
+            is_sidechain: false,
+            content: "[]".into(),
+            tool_use_result: None,
+        };
+        let result = collapse_messages(&[msg]);
+        assert!(
+            result.is_empty(),
+            "assistant message without request_id must be dropped"
+        );
+    }
+
+    #[test]
+    fn offset_resume_still_yields_correct_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("content-blocks.jsonl");
+        std::fs::write(&path, CONTENT_BLOCKS).unwrap();
+
+        // First full parse.
+        let first = parse_file(&path).unwrap();
+        assert_eq!(first.messages.len(), 4);
+
+        // Append a new user line.
+        let extra = concat!(
+            r#"{"type":"user","uuid":"uuid-extra","parentUuid":"uuid-u2","sessionId":"sess-content","timestamp":"2026-06-11T15:00:04.000Z","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"done"}]}}"#,
+            "\n"
+        );
+        let mut full = String::from(CONTENT_BLOCKS);
+        full.push_str(extra);
+        std::fs::write(&path, &full).unwrap();
+
+        // Incremental parse from where the first left off.
+        let incremental = parse_file_from(&path, first.bytes_consumed).unwrap();
+        assert_eq!(
+            incremental.messages.len(),
+            1,
+            "incremental parse should see only the newly appended line"
+        );
+        assert_eq!(incremental.messages[0].uuid, "uuid-extra");
     }
 
     #[test]
