@@ -14,8 +14,17 @@
     type ApplyOutcome,
     type OnboardingStatus,
   } from "$lib/onboarding";
+  import { setDisplayMode } from "$lib/usage";
 
-  type Screen = "loading" | "error" | "configured" | "preview" | "conflicts" | "applying" | "done";
+  type Screen =
+    | "loading"
+    | "error"
+    | "configured"
+    | "preview"
+    | "conflicts"
+    | "applying"
+    | "done"
+    | "mode_choice";
 
   let screen: Screen = $state("loading");
   let status: OnboardingStatus | undefined = $state();
@@ -31,12 +40,28 @@
       } else {
         // Already configured: the desktop window's home is the dashboard.
         screen = "configured";
-        await goto(resolve("/(app)/cost"), { replaceState: true });
+        if (!status.mode_chosen) {
+          // First time seeing an already-configured machine (e.g. upgraded from
+          // an old Farthing without subscription support): offer the mode choice
+          // before navigating to the dashboard.
+          screen = "mode_choice";
+        } else {
+          await goto(resolve("/(app)/cost"), { replaceState: true });
+        }
       }
     } catch (err) {
       errorMessage = String(err);
       screen = "error";
     }
+  }
+
+  async function chooseMode(mode: "api" | "subscription") {
+    try {
+      await setDisplayMode(mode);
+    } catch {
+      // non-fatal: user can set this in settings
+    }
+    await goto(resolve("/(app)/cost"), { replaceState: true });
   }
 
   // The preview's confirm button: with conflicts present, route through the
@@ -53,7 +78,13 @@
     screen = "applying";
     try {
       outcome = await applyOnboarding(acknowledgeConflicts);
-      screen = "done";
+      // Re-fetch status to check mode_chosen (backend updated after apply)
+      status = await getOnboardingStatus();
+      if (!status.mode_chosen) {
+        screen = "mode_choice";
+      } else {
+        screen = "done";
+      }
     } catch (err) {
       errorMessage = String(err);
       screen = "error";
@@ -169,6 +200,26 @@
       <a class="button-link" href={resolve("/(app)/cost")}>Open the dashboard</a>
       <a class="button-link" href={resolve("/(app)/health")}>Open the health view</a>
     </div>
+  {:else if screen === "mode_choice"}
+    <h1>How do you use Claude?</h1>
+    <p>
+      Farthing can show either your <strong>API-equivalent spend</strong> or your
+      <strong>subscription plan usage</strong> (% of rolling windows) as the primary readout in the menu
+      bar.
+    </p>
+    <p class="muted">You can change this any time in Settings → Plan Usage.</p>
+    <div class="row">
+      <button class="primary" onclick={() => void chooseMode("api")}>
+        I pay per token (API)
+      </button>
+      <button onclick={() => void chooseMode("subscription")}>
+        I'm on a Max / Pro subscription
+      </button>
+    </div>
+    <p class="muted" style="margin-top: 0.5rem; font-size: 0.85em;">
+      Choosing "Max / Pro subscription" reads your Claude Code login token from the macOS keychain
+      and queries Anthropic for your usage percentages every 5 minutes.
+    </p>
   {/if}
 </main>
 

@@ -28,6 +28,7 @@ export interface OnboardingStatus {
   before: string;
   after: string;
   diff: DiffLine[];
+  mode_chosen: boolean;
 }
 
 export interface ApplyOutcome {

@@ -25,6 +25,7 @@ pub mod tray;
 pub mod tray_render;
 pub mod tray_title;
 pub mod uninstall;
+pub mod usage_limits;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -95,6 +96,14 @@ pub fn run() {
             // spend. The engine (later units) reads/writes this under its own
             // eval lock; nothing here triggers an evaluation yet.
             app.manage(alerts::AlertState::load(Arc::clone(&database)));
+
+            // Usage limits: opt-in third data source. Seed from last persisted snapshot
+            // so the UI renders immediately; the first poller tick (below) refreshes it.
+            let seed_db = db::DbState(Arc::clone(&database));
+            let usage_snapshot = usage_limits::seed_from_meta(&seed_db);
+            let usage_limits_state: usage_limits::UsageLimitsState =
+                Arc::new(std::sync::RwLock::new(usage_snapshot));
+            app.manage(usage_limits_state);
 
             // Ingest pipeline state: shared DB handle + counters, queryable
             // via `ingest_stats` (health view, task 2.5). The receiver
@@ -204,6 +213,32 @@ pub fn run() {
                     alerts::spawn_eval(&tick_app);
                 }
             });
+
+            // Usage limits poller: every 5 minutes. Self-gates: reads config on each
+            // tick and exits immediately when disabled. The in-flight guard (inside
+            // refresh) prevents concurrent fetches from overlapping triggers.
+            let usage_poll_app = app.handle().clone();
+            let usage_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                interval.tick().await; // consume the immediate first tick (already seeded above)
+                loop {
+                    interval.tick().await;
+                    if let (Some(state), Some(db)) = (
+                        usage_poll_app.try_state::<usage_limits::UsageLimitsState>(),
+                        usage_poll_app.try_state::<db::DbState>(),
+                    ) {
+                        usage_limits::refresh(
+                            Arc::clone(&usage_in_flight),
+                            &state,
+                            &db,
+                            &usage_poll_app,
+                        )
+                        .await;
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -241,7 +276,12 @@ pub fn run() {
             tray::open_main_window,
             budgets::budget_config_get,
             budgets::budget_config_set,
-            budgets::budget_status
+            budgets::budget_status,
+            usage_limits::usage_limits_status,
+            usage_limits::usage_limits_config_get,
+            usage_limits::usage_limits_config_set,
+            usage_limits::display_mode_get,
+            usage_limits::display_mode_set
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -26,6 +26,14 @@
     type BudgetStatus,
   } from "$lib/budgets";
   import { openMainWindow } from "$lib/window";
+  import {
+    getUsageLimitsConfig,
+    getUsageStatus,
+    onUsageUpdated,
+    onDisplayModeChanged,
+    formatResetIn,
+    type UsageSnapshot,
+  } from "$lib/usage";
   import { formatCost, formatTokens, projectName } from "$lib/format";
   // Same 128px downscale the sidebar uses; rendered at 18px here.
   import farthingIcon from "$lib/assets/farthing-icon.png";
@@ -51,6 +59,8 @@
   let errorMessage = $state("");
   /** Fetch + DOM update time of the last refresh (dev render budget check). */
   let renderMs = $state(0);
+  let usageSnapshot: UsageSnapshot | null = $state(null);
+  let usageEnabled = $state(false);
 
   async function refresh(days: number = sparklineDays) {
     const started = performance.now();
@@ -94,6 +104,16 @@
   /** Maps a band to its CSS class for bar fill + percent label. */
   function bandClass(band: Band): string {
     return `band-${band}`;
+  }
+
+  async function refreshUsage() {
+    try {
+      const [config, snapshot] = await Promise.all([getUsageLimitsConfig(), getUsageStatus()]);
+      usageEnabled = config.enabled;
+      usageSnapshot = snapshot;
+    } catch {
+      // fail silent — usage block just hides
+    }
   }
 
   async function refreshPaused() {
@@ -141,12 +161,14 @@
   $effect(() => {
     void refresh();
     void refreshPaused();
+    void refreshUsage();
     // The popover window is shown/hidden, never reloaded: refresh whenever
     // it regains focus (tray click), and live whenever the backend pushes
     // an ingest event (debounced; replaces the task-4.2 poll).
     const onFocus = () => {
       void refresh();
       void refreshPaused();
+      void refreshUsage();
     };
     window.addEventListener("focus", onFocus);
 
@@ -162,6 +184,12 @@
     // (covers month rollover); live spend is already covered by INGESTED.
     const unlistenBudgetConfig = listen(BUDGET_CONFIG_CHANGED, () => void refresh());
     const unlistenMetricsTick = listen(METRICS_TICK_EVENT, () => void refresh());
+    const unlistenUsage = onUsageUpdated((snap) => {
+      usageSnapshot = snap;
+    });
+    const unlistenMode = onDisplayModeChanged(() => {
+      void refreshUsage();
+    });
 
     // Keep the window sized to content across late layout (budget section
     // appearing, font/metric loads) so the footer is never clipped.
@@ -179,6 +207,8 @@
       void unlistenPaused.then((unlisten) => unlisten());
       void unlistenBudgetConfig.then((unlisten) => unlisten());
       void unlistenMetricsTick.then((unlisten) => unlisten());
+      void unlistenUsage.then((stop) => stop());
+      void unlistenMode.then((stop) => stop());
     };
   });
 </script>
@@ -210,6 +240,32 @@
       <span class="cost-value">{formatCost(metrics.cost_usd)}</span>
       <span class="cost-label muted">API-equivalent</span>
     </section>
+    {#if usageEnabled && usageSnapshot && (usageSnapshot.five_hour.percent !== null || usageSnapshot.seven_day.percent !== null)}
+      <section class="usage-windows">
+        <h2 class="muted">Plan usage</h2>
+        {#each [usageSnapshot.five_hour, usageSnapshot.seven_day] as win (win.label)}
+          {#if win.percent !== null}
+            {@const pct = win.percent}
+            {@const barClass =
+              pct > 90 ? "usage-fill-danger" : pct > 75 ? "usage-fill-warn" : "usage-fill-ok"}
+            <div class="usage-line">
+              <div class="usage-row-head">
+                <span class="usage-label">{win.label}</span>
+                <span class="usage-pct {pct > 75 ? 'usage-pct-warn' : 'muted'}"
+                  >{pct.toFixed(0)}%</span
+                >
+              </div>
+              <div class="usage-bar">
+                <div class="usage-fill {barClass}" style="width: {Math.min(pct, 100)}%"></div>
+              </div>
+              {#if win.resets_at_ms}
+                <span class="usage-reset muted">{formatResetIn(win.resets_at_ms)}</span>
+              {/if}
+            </div>
+          {/if}
+        {/each}
+      </section>
+    {/if}
     {#if metrics.unpriced_requests > 0}
       <p class="footnote">
         {metrics.unpriced_requests} request{metrics.unpriced_requests === 1 ? "" : "s"} with unknown pricing
@@ -678,6 +734,67 @@
     background: rgba(0, 0, 0, 0.1);
   }
 
+  .usage-windows {
+    margin-top: 0.85rem;
+  }
+
+  .usage-line {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .usage-row-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+
+  .usage-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6b6b6b;
+  }
+
+  .usage-pct {
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .usage-pct-warn {
+    color: #b42318;
+    font-weight: 700;
+  }
+
+  .usage-bar {
+    height: 5px;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.08);
+    overflow: hidden;
+  }
+
+  .usage-fill {
+    height: 100%;
+    border-radius: 3px;
+  }
+
+  .usage-fill-ok {
+    background: rgba(26, 127, 55, 0.6);
+  }
+  .usage-fill-warn {
+    background: rgba(180, 142, 10, 0.7);
+  }
+  .usage-fill-danger {
+    background: rgba(180, 35, 24, 0.7);
+  }
+
+  .usage-reset {
+    font-size: 0.66rem;
+  }
+
   @media (prefers-color-scheme: dark) {
     .popover {
       color: #f5f5f7;
@@ -775,6 +892,25 @@
 
     .open-app:hover {
       background: rgba(255, 255, 255, 0.16);
+    }
+
+    .usage-label {
+      color: #9b9b9f;
+    }
+    .usage-bar {
+      background: rgba(255, 255, 255, 0.12);
+    }
+    .usage-fill-ok {
+      background: rgba(126, 231, 135, 0.5);
+    }
+    .usage-fill-warn {
+      background: rgba(255, 181, 92, 0.6);
+    }
+    .usage-fill-danger {
+      background: rgba(255, 161, 152, 0.6);
+    }
+    .usage-pct-warn {
+      color: #ffa198;
     }
   }
 </style>

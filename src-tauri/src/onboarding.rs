@@ -77,6 +77,10 @@ pub struct OnboardingStatus {
     pub after: String,
     /// Line diff of `before` → `after`.
     pub diff: Vec<DiffLine>,
+    /// Whether the user has already saved a display-mode preference (API vs
+    /// Subscription). `false` on a fresh install so the onboarding flow can
+    /// show the mode-choice step; `true` means skip it (existing user / revisit).
+    pub mode_chosen: bool,
 }
 
 /// Read the settings file and compute the full preview: install state,
@@ -102,6 +106,7 @@ pub fn compute_status(settings_path: &Path) -> Result<OnboardingStatus, String> 
         before,
         after,
         diff,
+        mode_chosen: false, // filled in by onboarding_status with DB access
     })
 }
 
@@ -180,8 +185,13 @@ pub(crate) fn backup_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// Frontend query: current config state + merge preview. Read-only.
 #[tauri::command]
-pub fn onboarding_status(app: tauri::AppHandle) -> Result<OnboardingStatus, String> {
-    compute_status(&settings_path(&app)?)
+pub fn onboarding_status(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, crate::db::DbState>,
+) -> Result<OnboardingStatus, String> {
+    let mut status = compute_status(&settings_path(&app)?)?;
+    status.mode_chosen = crate::usage_limits::is_mode_chosen(&db);
+    Ok(status)
 }
 
 /// Frontend action: apply the merge (backup first, atomic write). Gated on
