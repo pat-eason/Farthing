@@ -183,7 +183,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DMG: ${{ steps.artifacts.outputs.dmg }}
         run: |
+          TAG_VERSION="${RELEASE_TAG#v}"
           {
+            # Extract this version's section from CHANGELOG.md
+            awk "/^## $TAG_VERSION\$/{found=1; next} found && /^## /{exit} found{print}" CHANGELOG.md \
+              | sed '/^[[:space:]]*$/d; $d' \
+              | sed 's/^[[:space:]]*//'
+            echo
+            echo "---"
+            echo
             echo "## Install"
             echo
             echo "Download the .dmg below, open it, and drag the app to /Applications."
